@@ -1,0 +1,50 @@
+{
+  "name": "@tunnelmindai/receipt-verify",
+  "version": "1.0.0",
+  "description": "Reference verifier for the TunnelMind Receipt Format v1.0. Offline Ed25519 + JCS verification, key-bundle resolution, and revocation checking against the well-known feed. Zero runtime dependencies; runs on Node ≥18, Cloudflare Workers, Deno, Bun.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test test/*.test.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "tunnelmind",
+    "receipt",
+    "ed25519",
+    "jcs",
+    "attestation",
+    "agent-trust",
+    "verifier"
+  ],
+  "author": "TunnelMind",
+  "license": "Apache-2.0",
+  "homepage": "https://tunnelmind.ai/standards/receipt-format/v1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TunnelMind/receipt-verify.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TunnelMind/receipt-verify/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}
