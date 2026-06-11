@@ -1,0 +1,34 @@
+name: Publish to npm (Trusted Publishing)
+
+# OIDC-based publish — no long-lived npm token. npm trusts this exact
+# repo+workflow via the "Trusted Publisher" config on npmjs.com for
+# @tunnelmindai/receipt-verify. TS package; prepublishOnly runs the build.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Use OIDC-capable npm
+        run: npm install -g npm@latest
+
+      - name: Publish @tunnelmindai/receipt-verify
+        run: |
+          npm install
+          npm publish --access public --provenance
