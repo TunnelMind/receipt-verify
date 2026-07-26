@@ -1,0 +1,21 @@
+name: osv-scan
+# Scans lockfiles against the OSV database for known-vulnerable dependencies.
+# Fails the run when a known vulnerability affects a locked version.
+on:
+  push:
+  schedule:
+    - cron: "43 6 * * 1"   # weekly, Monday 06:43 UTC
+permissions:
+  contents: read
+jobs:
+  osv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch osv-scanner
+        run: |
+          curl -sSL -o /usr/local/bin/osv-scanner \
+            https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64
+          chmod +x /usr/local/bin/osv-scanner
+      - name: Scan lockfiles
+        run: osv-scanner scan --recursive .
