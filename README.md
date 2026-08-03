@@ -136,6 +136,21 @@ node scripts/verify-log.mjs consistency <proof.json>
 
 `docs/OPA-INTEGRATION.md` shows how a PDP consumes the signed bundle.
 
+## Verifying a reconciliation verdict (`scripts/verify-verdict.mjs`)
+
+The standalone offline verifier for Reconciliation Verdict v1.0 receipts —
+re-derives the verdict from receipt bytes with no call to TunnelMind
+(signature, payload hash, log inclusion, witness cosignatures, verdict
+re-derivation):
+
+```
+curl -s https://data.tunnelmind.ai/v1/verdict/<key> \
+  | node scripts/verify-verdict.mjs -
+```
+
+Its pure dependency chain lives in `scripts/verdict-lib/` — those modules
+are the spec (the service runs the same code).
+
 ## Spec drift
 
 The JCS canonicalizer in `src/jcs.ts` is **bit-identical** to the issuer-side serializers in `scry-server/src/lib/receipt_v1.js` and `tunnelmind-data-api/api/utils/receipt-v1.js`. Any change to one MUST be mirrored across all three. The frozen wire vector lives in this package's `test/golden.test.js` to catch silent drift.
