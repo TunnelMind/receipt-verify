@@ -120,6 +120,22 @@ Receipts are designed to be verifiable by anyone — the public key is embedded 
 
 That said: the key bundle and revocation feed must be retrievable from a source you trust. The defaults point to `tunnelmind.ai`; for receipts issued by another producer, point `keysUrl` / `revocationsUrl` at the producer's well-known endpoints.
 
+## Verifying the transparency log (`scripts/verify-log.mjs`)
+
+The offline verifier for the receipt transparency log (RFC 6962 / RFC 9162
+algorithms; node builtins only, zero library code):
+
+```
+node scripts/verify-log.mjs sth         <sth.json> <public_key_b64>
+node scripts/verify-log.mjs inclusion   <proof.json> [sth.json]
+node scripts/verify-log.mjs consistency <proof.json>
+```
+
+`proof.json` / `sth.json` are exactly the `data` objects returned by
+`GET data.tunnelmind.ai/v1/receipts/log/{sth,proof,consistency}`.
+
+`docs/OPA-INTEGRATION.md` shows how a PDP consumes the signed bundle.
+
 ## Spec drift
 
 The JCS canonicalizer in `src/jcs.ts` is **bit-identical** to the issuer-side serializers in `scry-server/src/lib/receipt_v1.js` and `tunnelmind-data-api/api/utils/receipt-v1.js`. Any change to one MUST be mirrored across all three. The frozen wire vector lives in this package's `test/golden.test.js` to catch silent drift.
