@@ -105,10 +105,10 @@ export interface VerifyOptions {
    *  the bundle is never accepted. Use during rotation-overlap windows. */
   allowKeyMismatch?: boolean;
   /** The receipt this one claims to follow. When given, chain mismatches are
-   *  errors: `chain.previous_receipt_hash` must equal SHA-256 over the
-   *  JCS-canonical bytes of the WHOLE previous receipt, '0x'-prefixed hex (the
-   *  payload_hash format), and `chain.sequence` must be previous's + 1.
-   *  ASSUMPTION: the spec defines no previous_receipt_hash input; this is it. */
+   *  errors: `chain.previous_receipt_hash` must equal the SHA-256 of the
+   *  previous receipt's signature.value string (UTF-8), '0x'-prefixed hex;
+   *  this matches scry-server receipt_v1.js:203-205 and data-api
+   *  receipt-v1.js:135-137. `chain.sequence` must be previous's + 1. */
   previous?: Receipt;
   /** Custom fetch (e.g., for offline tests). */
   fetcher?: typeof fetch;
@@ -351,13 +351,16 @@ export async function verifyReceipt(
     if (!receipt.chain) {
       errors.push('previous supplied but receipt has no chain');
     } else {
-      try {
-        const expected = await sha256HexPrefixed(toAB(canonicalizeBytes(opts.previous as unknown as JsonValue)));
+      // The issuers link on the previous signature string, not the whole
+      // receipt: previous_receipt_hash = sha256(utf8(previous.signature.value)).
+      const prevSig = opts.previous.signature?.value;
+      if (typeof prevSig !== 'string') {
+        errors.push('previous receipt has no signature value');
+      } else {
+        const expected = await sha256HexPrefixed(toAB(new TextEncoder().encode(prevSig)));
         if (receipt.chain.previous_receipt_hash !== expected) {
           errors.push(`chain.previous_receipt_hash mismatch: computed ${expected}, claimed ${String(receipt.chain.previous_receipt_hash)}`);
         }
-      } catch (e) {
-        errors.push(`previous receipt canonicalization failed: ${(e as Error).message}`);
       }
       const prevSeq = opts.previous.chain?.sequence;
       if (typeof prevSeq !== 'number' || receipt.chain.sequence !== prevSeq + 1) {

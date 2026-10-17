@@ -48,7 +48,7 @@ if (result.valid) {
    - if `signature.key_id` (or the key that actually verified, see `allowKeyMismatch`) is revoked for `compromise`, reject whatever the receipt's timestamp
    - if it is revoked for another reason AND the receipt was signed after `revoked_at`, reject (signed before: warning)
    - if `receipt_id` is in `revoked_receipts`, reject
-7. **Chain sanity** — warn (not reject) if `chain.sequence` and `previous_receipt_hash` are inconsistent. Pass `previous` (the prior receipt) to make it a hard check: `previous_receipt_hash` must equal the `0x`-prefixed SHA-256 of the JCS-canonical previous receipt and `sequence` must be its sequence + 1
+7. **Chain sanity** — warn (not reject) if `chain.sequence` and `previous_receipt_hash` are inconsistent. Pass `previous` (the prior receipt) to make it a hard check: `previous_receipt_hash` must equal the SHA-256 of the previous receipt's `signature.value` (UTF-8 bytes), `0x`-prefixed and `sequence` must be its sequence + 1
 
 Checks 1-5 need no network by default: the key bundle is the pinned one unless you pass `keysUrl`. Check 6 fetches the revocation feed unless you pass `revocations`; it can only be turned off with `unsafeSkipRevocations`.
 

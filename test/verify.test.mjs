@@ -577,8 +577,9 @@ test('a lone surrogate in the payload is an error, not a throw', async () => {
 async function makeChainPair({ sequence = 1 } = {}) {
   const key = await makeEphemeralKey();
   const { receipt: prev, keyId } = await makeReceipt({ ...key, payload: { n: 0 } });
+  // Issuer contract: sha256 over the UTF-8 bytes of prev.signature.value.
   const previous_receipt_hash = '0x' + Buffer.from(
-    await webcrypto.subtle.digest('SHA-256', canonicalizeBytes(prev)),
+    await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(prev.signature.value)),
   ).toString('hex');
   const { receipt } = await makeReceipt({ ...key, payload: { n: 1 }, chain: { previous_receipt_hash, sequence } });
   const opts = {
@@ -595,12 +596,21 @@ test('previous: a matching previous receipt gives no chain error', async () => {
   assert.equal(result.valid, true, result.errors.join('; '));
 });
 
-test('previous: a tampered previous receipt is a hash mismatch error', async () => {
+test('previous: a tampered previous signature is a hash mismatch error', async () => {
   reset();
   const { prev, receipt, opts } = await makeChainPair();
-  const result = await verifyReceipt(receipt, { ...opts, previous: { ...prev, payload: { n: 'EVIL' } } });
+  const tampered = { ...prev, signature: { ...prev.signature, value: prev.signature.value + 'x' } };
+  const result = await verifyReceipt(receipt, { ...opts, previous: tampered });
   assert.equal(result.valid, false);
   assert.ok(result.errors.some((e) => e.includes('chain.previous_receipt_hash mismatch')), result.errors.join('; '));
+});
+
+test('previous: a previous receipt without a signature value is an error, not a throw', async () => {
+  reset();
+  const { prev, receipt, opts } = await makeChainPair();
+  const result = await verifyReceipt(receipt, { ...opts, previous: { ...prev, signature: {} } });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('previous receipt has no signature value')), result.errors.join('; '));
 });
 
 test('previous: a wrong sequence is an error', async () => {
