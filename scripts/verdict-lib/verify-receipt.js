@@ -2,19 +2,28 @@
  * api/roots/verify-receipt.js
  *
  * The pure, importable core of the standalone offline verdict verifier
- * (ADR-001 invariant 5). Given a reconciliation receipt + the witness public
- * keys carried INSIDE it, returns a per-check pass/fail report with no service
+ * (ADR-001 invariant 5). Given a reconciliation receipt + PINNED issuer, log and
+ * witness public keys, returns a per-check pass/fail report with no service
  * call. The CLI (scripts/verify-verdict.mjs) is just argv/IO around this; the
  * test suite imports it directly.
  *
+ * Trust anchors come only from the caller (V004): any public key carried inside
+ * the receipt is attacker-controlled — anyone can embed their own key and sign —
+ * so it is at most compared against a pinned key, never verified against.
+ * When the caller pins no witness or log key, both default to the usable
+ * (active/rotated) entries of the issuer bundle, matched by key_id.
+ *
  * Pure: uses globalThis.crypto + the same reconcile()/Merkle code the service
- * runs. No fetch, no env, no Worker bindings.
+ * runs. No fetch, no env, no Worker bindings. The default issuer bundle and the
+ * key-window rule come from the built package (dist/, `npm run build`).
  */
 
 import { reconcile } from './reconcile.js';
 import { verifyInclusion, leafHash } from './log.js';
 import { canonicalize, canonicalizeBytes } from './jcs.js';
 import { sha256HexPrefixed, b64ToBytes } from './hash.js';
+import { PINNED_KEY_BUNDLE } from '../../dist/pinned-keys.js';
+import { resolveKey, keyUsableAt } from '../../dist/keys.js';
 
 const subtle = globalThis.crypto.subtle;
 
@@ -27,12 +36,30 @@ async function ed25519Verify(pubB64, sigB64, messageBytes) {
 
 const sameCanonical = (a, b) => canonicalize(a) === canonicalize(b);
 
+// Pinned witness keys: base64 raw keys or { key_id, public_key } entries.
+const normWitness = (list) => (Array.isArray(list) ? list : [])
+  .map((k) => (typeof k === 'string' ? { public_key: k } : k))
+  .filter((k) => k && typeof k.public_key === 'string');
+
 /**
  * @param {object} receipt — a reconciliation receipt (with self_verification)
+ * @param {object} [opts]
+ * @param {object} [opts.keys] — issuer KeyBundle; defaults to the shipped pinned bundle
+ * @param {string} [opts.logKey] — base64 raw Ed25519 key; only used when the
+ *   checkpoint carries its own `signature` (the witness cosig is the checkpoint proof).
+ *   Default: the usable `keys` entries whose key_id equals signature.key_id.
+ * @param {Array<string|{key_id?:string,public_key:string}>} [opts.witnessKeys]
+ *   Default: the usable `keys` entries, matched by cosig key_id. An explicit
+ *   value (even []) replaces the default.
  * @returns {Promise<{ ok: boolean, checks: Array<{check,pass,detail}> }>}
  */
-export async function verifyReceipt(receipt) {
+export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey, witnessKeys } = {}) {
   const checks = [];
+  // Default log/witness trust anchors: the bundle's usable entries (status
+  // active or rotated; missing = active, as keyUsableAt). Revoked keys never count.
+  const defaultPinned = (keys && Array.isArray(keys.keys) ? keys.keys : [])
+    .filter((k) => k && typeof k.public_key === 'string' && ['active', 'rotated'].includes(k.status ?? 'active'))
+    .map((k) => ({ key_id: k.key_id, public_key: k.public_key }));
   const add = (check, pass, detail) => checks.push({ check, pass, detail });
 
   if (!receipt || typeof receipt !== 'object' || !receipt.signature) {
@@ -42,16 +69,27 @@ export async function verifyReceipt(receipt) {
 
   // 1. receipt signature — over canonical(receipt minus payload & self_verification),
   //    signature.value blank (mirrors wrapReceipt's signing object exactly).
+  //    Verified against the BUNDLE key for signature.key_id (same rules as
+  //    src/index.ts verifyReceipt: usable status + [created_at, rotation_after]
+  //    window); the embedded public_key must equal it or the check fails.
   const sig = receipt.signature;
-  if (sig.value && sig.public_key) {
+  const entry = keys && Array.isArray(keys.keys) && typeof sig.key_id === 'string'
+    ? resolveKey(keys, sig.key_id) : null;
+  if (!sig.value || sig.algorithm !== 'Ed25519') {
+    add('receipt_signature', false, 'unsigned or not Ed25519');
+  } else if (!entry) {
+    add('receipt_signature', false, `key_id ${sig.key_id} not in pinned key bundle`);
+  } else if (sig.public_key !== undefined && sig.public_key !== entry.public_key) {
+    add('receipt_signature', false, `embedded public_key does not match pinned key ${sig.key_id}`);
+  } else {
+    const ts = Date.parse(receipt.timestamp);
+    const why = Number.isFinite(ts) ? keyUsableAt(entry, ts) : `timestamp not a valid date: ${receipt.timestamp}`;
     const signingObject = { ...receipt };
     delete signingObject.payload;
     delete signingObject.self_verification;
     signingObject.signature = { algorithm: sig.algorithm, key_id: sig.key_id, public_key: sig.public_key };
-    const okSig = await ed25519Verify(sig.public_key, sig.value, canonicalizeBytes(signingObject));
-    add('receipt_signature', okSig, okSig ? `key_id=${sig.key_id}` : 'Ed25519 signature does not verify');
-  } else {
-    add('receipt_signature', false, 'unsigned (signature.value/public_key missing)');
+    const okSig = !why && await ed25519Verify(entry.public_key, sig.value, canonicalizeBytes(signingObject));
+    add('receipt_signature', okSig, why || (okSig ? `key_id=${sig.key_id}` : 'Ed25519 signature does not verify against pinned key'));
   }
 
   // 2. payload integrity.
@@ -72,17 +110,52 @@ export async function verifyReceipt(receipt) {
     const okIncl = await verifyInclusion(leaf, leaf_index, tree_size, audit_path || [], sv.checkpoint.root_hash);
     add('log_inclusion', okIncl, okIncl ? `tree_size=${tree_size}` : 'leaf does not resolve to checkpoint root');
 
+    // The issuer (tunnelmind-data-api api/roots/log.js + verdict.js) puts no
+    // signature on the checkpoint itself: the root is signed by the witness
+    // cosignatures below, made over canonical(checkpoint) incl. root_hash.
+    // That pinned-witness check is the checkpoint proof and always runs. A
+    // checkpoint that DOES carry its own signature (the STH scheme of
+    // scripts/verify-log.mjs verifySth: Ed25519 over JCS(checkpoint minus
+    // `signature`)) must also verify against the pinned --log-key, or by
+    // default a usable bundle key with the signature's key_id.
+    const cp = sv.checkpoint;
+    if (cp.signature !== undefined) {
+      const { signature, ...cpBody } = cp;
+      const logKeys = logKey !== undefined ? [logKey].filter(Boolean)
+        : defaultPinned.filter((k) => !signature?.key_id || k.key_id === signature.key_id).map((k) => k.public_key);
+      if (logKeys.length === 0) {
+        add('checkpoint_signature', false, 'checkpoint is signed but no pinned log key');
+      } else if (!signature || signature.algorithm !== 'Ed25519' || !signature.value) {
+        add('checkpoint_signature', false, 'checkpoint signature malformed');
+      } else {
+        let okCp = false;
+        for (const k of logKeys) {
+          if (await ed25519Verify(k, signature.value, canonicalizeBytes(cpBody))) { okCp = true; break; }
+        }
+        add('checkpoint_signature', okCp, okCp ? undefined : 'does not verify against pinned log key');
+      }
+    }
+
+    // Witness cosignatures: each must verify under a PINNED witness key (by
+    // key_id when the cosig names one; a pinned key without key_id matches any).
+    const pinned = witnessKeys === undefined ? defaultPinned : normWitness(witnessKeys);
     const cosigs = Array.isArray(sv.witness_cosignatures) ? sv.witness_cosignatures : [];
-    const cpBytes = canonicalizeBytes(sv.checkpoint);
-    if (cosigs.length === 0) {
+    const cpBytes = canonicalizeBytes(cp);
+    if (pinned.length === 0) {
+      add('witness_cosignatures', false, 'no pinned witness keys');
+    } else if (cosigs.length === 0) {
       add('witness_cosignatures', false, 'none present');
     } else {
       let allOk = true;
       for (const c of cosigs) {
-        const okc = !!(c.public_key && c.value) && await ed25519Verify(c.public_key, c.value, cpBytes);
+        const cands = pinned.filter((k) => !c.key_id || !k.key_id || k.key_id === c.key_id);
+        let okc = false;
+        for (const k of cands) {
+          if (c.value && await ed25519Verify(k.public_key, c.value, cpBytes)) { okc = true; break; }
+        }
         if (!okc) allOk = false;
       }
-      add('witness_cosignatures', allOk, `${cosigs.length} cosig(s)`);
+      add('witness_cosignatures', allOk, `${cosigs.length} cosig(s)${allOk ? '' : '; not all verify against pinned witness keys'}`);
     }
   } else {
     add('self_verification', false, 'inclusion_proof / checkpoint missing');

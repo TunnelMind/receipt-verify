@@ -12,15 +12,24 @@
 // asserted mechanically in api/lib/receipt-log.test.js.
 //
 // Usage:
-//   node scripts/verify-log.mjs inclusion   <proof.json> [sth.json]
+//   node scripts/verify-log.mjs inclusion   <proof.json> [sth.json] --key <public_key_b64> --receipt <receipt.json>
 //   node scripts/verify-log.mjs consistency <proof.json>
 //   node scripts/verify-log.mjs sth         <sth.json> <public_key_b64>
 //
 // proof.json shapes are exactly what GET /v1/receipts/log/proof and
 // /v1/receipts/log/consistency return (the `data` object).
+//
+// inclusion trusts nothing the proof carries: the STH (arg 2, else proof.sth)
+// must verify under the pinned --key (never sth.signature.public_key) and match
+// the proof's root_hash/tree_size, and the leaf is recomputed from the receipt
+// bytes, leafHash(jcs(receipt)) — the receipt exactly as supplied, nothing
+// stripped, matching the sequencer's `leaf = SHA-256(0x00 || JCS(receipt))`
+// (verdict receipts are logged with their self-verification triple) — the proof's
+// leaf_hash is ignored. Missing --key, --receipt or an STH exits 2.
 
 import { createHash, verify as edVerify, createPublicKey } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { parseArgs } from 'node:util';
 
 // ── primitives (deliberately re-implemented) ─────────────────────────────────
 const sha256 = (...parts) => {
@@ -33,8 +42,9 @@ const eq = (a, b) => a.length === b.length && a.equals(b);
 const LEAF = Buffer.from([0x00]);
 const NODE = Buffer.from([0x01]);
 
-// Own RFC 8785 canonicalization for the STH body (JSON subset: no exotic
-// numbers in an STH — tree_size is an integer, everything else strings).
+// Own RFC 8785 canonicalization for the STH body and the receipt leaf (JSON
+// subset: ES number/string serialization, which is what RFC 8785 specifies for
+// the finite numbers and well-formed strings these documents carry).
 export function jcs(v) {
   if (v === null || typeof v !== 'object') return JSON.stringify(v);
   if (Array.isArray(v)) return `[${v.map(jcs).join(',')}]`;
@@ -112,23 +122,39 @@ export function verifySth(sth, publicKeyB64) {
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
+const USAGE = 'usage: verify-log.mjs inclusion <proof.json> [sth.json] --key <b64> --receipt <receipt.json>'
+  + ' | consistency <proof.json> | sth <sth.json> <public_key_b64>';
+
 function main() {
-  const [mode, ...args] = process.argv.slice(2);
+  let values, positionals;
+  try {
+    ({ values, positionals } = parseArgs({
+      options: { key: { type: 'string' }, receipt: { type: 'string' } },
+      allowPositionals: true,
+    }));
+  } catch (e) { console.error(`${e.message}\n${USAGE}`); process.exit(2); }
+  const [mode, ...args] = positionals;
   const load = (p) => JSON.parse(readFileSync(p, 'utf8'));
   const unwrap = (j) => (j && j.ok === true && j.data ? j.data : j);
 
   if (mode === 'inclusion') {
     const p = unwrap(load(args[0]));
+    const sth = args[1] ? unwrap(load(args[1])) : p.sth;
+    if (!values.key || !values.receipt || !sth) {
+      console.error('inclusion requires --key <public_key_b64>, --receipt <receipt.json> and an STH (arg 2 or proof.sth)');
+      process.exit(2);
+    }
+    // Accept a bare receipt, a { receipt }, or a /v1/verdict-style response.
+    let receipt = unwrap(load(values.receipt));
+    if (receipt.receipt) receipt = receipt.receipt;
     const okIncl = verifyInclusion({
       leafIndex: p.leaf_index, treeSize: p.tree_size,
-      leaf: unhex(p.leaf_hash), path: p.audit_path.map(unhex), root: unhex(p.root_hash),
+      leaf: leafHash(Buffer.from(jcs(receipt))), path: p.audit_path.map(unhex), root: unhex(p.root_hash),
     });
-    let okSig = null;
-    const sth = args[1] ? unwrap(load(args[1])) : p.sth;
-    if (sth && sth.signature?.public_key) okSig = verifySth(sth, sth.signature.public_key)
+    const okSig = verifySth(sth, values.key)
       && sth.root_hash === p.root_hash && sth.tree_size === p.tree_size;
     console.log(JSON.stringify({ inclusion: okIncl, sth_signature: okSig }));
-    process.exit(okIncl && okSig !== false ? 0 : 1);
+    process.exit(okIncl && okSig ? 0 : 1);
   }
   if (mode === 'consistency') {
     const p = unwrap(load(args[0]));
@@ -145,7 +171,7 @@ function main() {
     console.log(JSON.stringify({ sth_signature: oks }));
     process.exit(oks ? 0 : 1);
   }
-  console.error('usage: verify-log.mjs inclusion|consistency|sth <files…>');
+  console.error(USAGE);
   process.exit(2);
 }
 if (import.meta.url === `file://${process.argv[1]}`) main();

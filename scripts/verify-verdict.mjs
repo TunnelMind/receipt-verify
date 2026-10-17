@@ -9,36 +9,68 @@
  *
  * Phase 2.3 — the STANDALONE, OFFLINE verdict verifier CLI (ADR-001 invariant 5).
  *
- * Given a reconciliation receipt's bytes + the witness public keys carried INSIDE
- * it, re-derive and check the verdict with NO call to TunnelMind. The actual
+ * Given a reconciliation receipt's bytes + PINNED issuer, log and witness public
+ * keys (never keys carried inside the receipt), re-derive and check the verdict
+ * with NO call to TunnelMind. The actual
  * checks live in api/roots/verify-receipt.js (pure, importable, also unit-tested);
  * this file is only argv/IO around it. That module imports the SAME reconcile()
  * and Merkle verifier the service runs — the verifier IS the spec.
  *
  * Usage:
- *   node scripts/verify-verdict.mjs <receipt.json>
+ *   node scripts/verify-verdict.mjs [--keys <bundle.json>] [--log-key <b64>] \
+ *     [--witness-keys <keys.json | b64,b64,…>] <receipt.json>
  *   curl -s https://data.tunnelmind.ai/v1/verdict/<key>?subject=<d> \
  *     | node scripts/verify-verdict.mjs -
+ *
+ *   --keys          issuer KeyBundle JSON; default = the bundle shipped in
+ *                   dist/pinned-keys.js (run `npm run build` first)
+ *   --log-key       base64 raw Ed25519 key; only used when the checkpoint
+ *                   carries its own `signature`
+ *   --witness-keys  JSON file (array of b64 keys or {key_id, public_key}) or a
+ *                   comma-separated list of b64 keys
+ * The witness cosignature over the canonical checkpoint (root_hash included)
+ * is the proof the checkpoint root is signed. When absent, --witness-keys and
+ * --log-key default to the active/rotated entries of --keys (the shipped
+ * bundle by default), matched by key_id; explicit flags override.
  *
  * Exit 0 = all checks pass; 1 = a check failed; 2 = bad usage.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
+import { parseArgs } from 'node:util';
 import { verifyReceipt } from './verdict-lib/verify-receipt.js';
 
+const USAGE = 'usage: node scripts/verify-verdict.mjs [--keys <bundle.json>] [--log-key <b64>]'
+  + ' [--witness-keys <file.json | b64,b64>] <receipt.json | ->';
+const usage = (why) => { console.error(`${why ? why + '\n' : ''}${USAGE}`); process.exit(2); };
+
 async function main() {
-  const arg = process.argv[2];
-  if (!arg) {
-    console.error('usage: node scripts/verify-verdict.mjs <receipt.json | ->');
-    process.exit(2);
+  let values, positionals;
+  try {
+    ({ values, positionals } = parseArgs({
+      options: { keys: { type: 'string' }, 'log-key': { type: 'string' }, 'witness-keys': { type: 'string' } },
+      allowPositionals: true,
+    }));
+  } catch (e) { usage(e.message); }
+  const arg = positionals[0];
+  if (!arg || positionals.length > 1) usage();
+
+  const opts = { logKey: values['log-key'] };
+  if (values.keys) {
+    opts.keys = JSON.parse(readFileSync(values.keys, 'utf8'));
+    if (!opts.keys || !Array.isArray(opts.keys.keys)) usage(`--keys ${values.keys}: not a key bundle (no keys array)`);
   }
+  const wk = values['witness-keys'];
+  if (wk) opts.witnessKeys = existsSync(wk) ? JSON.parse(readFileSync(wk, 'utf8')) : wk.split(',').filter(Boolean);
+  if (wk && !Array.isArray(opts.witnessKeys)) usage(`--witness-keys ${wk}: expected a JSON array`);
+
   const text = arg === '-' ? readFileSync(0, 'utf8') : readFileSync(arg, 'utf8');
   let obj = JSON.parse(text);
   // Accept a bare receipt, a { receipt }, or the full /v1/verdict response.
   if (obj.data && obj.data.receipt) obj = obj.data.receipt;
   else if (obj.receipt) obj = obj.receipt;
 
-  const { ok, checks } = await verifyReceipt(obj);
+  const { ok, checks } = await verifyReceipt(obj, opts);
   for (const c of checks) {
     console.log(`${c.pass ? 'PASS' : 'FAIL'}  ${c.check}${c.detail ? '  — ' + c.detail : ''}`);
   }

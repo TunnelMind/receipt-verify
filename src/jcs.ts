@@ -15,6 +15,10 @@ function encodeString(s: string): string {
   let out = '"';
   for (const ch of s) {
     const cp = ch.codePointAt(0)!;
+    // The iterator yields valid pairs as one code point > 0xFFFF, so a cp in
+    // this range is a lone surrogate. TextEncoder would map it to U+FFFD and
+    // two different strings would canonicalize to the same bytes.
+    if (cp >= 0xd800 && cp <= 0xdfff) throw new Error('JCS: lone surrogate in string');
     if (cp === 0x22 || cp === 0x5c) out += '\\' + ch;
     else if (cp === 0x08) out += '\\b';
     else if (cp === 0x09) out += '\\t';

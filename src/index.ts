@@ -8,9 +8,12 @@
 // §8 (Revocation) lookups. Zero runtime dependencies. Targets WebCrypto
 // SubtleCrypto + fetch — runs on Node ≥18, Cloudflare Workers, Deno, Bun.
 //
-// The verifier is deliberately STRICT-by-default. Pass `allowKeyMismatch`
-// to convert a key-bundle mismatch into a warning instead of an error
-// (useful when verifying receipts during a key-rotation overlap window).
+// The verifier is deliberately STRICT-by-default. Every key that signs must
+// come from the key bundle and be usable at the receipt's timestamp (status
+// active/rotated, inside [created_at, rotation_after]). `allowKeyMismatch`
+// only lets a receipt whose embedded public_key belongs to a DIFFERENT
+// usable key in the same bundle verify against that key, with a warning
+// (key-rotation overlap). The embedded public_key is never verified against.
 
 import { canonicalize, canonicalizeBytes, type JsonValue } from './jcs.js';
 import {
@@ -18,8 +21,10 @@ import {
   resolveKey,
   type KeyBundle,
   type SigningKeyEntry,
+  keyUsableAt,
   type AttestationStrength,
 } from './keys.js';
+import { PINNED_KEY_BUNDLE } from './pinned-keys.js';
 import {
   fetchRevocations,
   isKeyRevoked,
@@ -74,23 +79,37 @@ export interface Receipt {
 }
 
 export interface VerifyOptions {
-  /** Provide a pre-fetched key bundle. If omitted and `noFetchKeys` is false,
-   *  the verifier fetches https://tunnelmind.ai/.well-known/receipt-signing-key.json. */
+  /** Provide a pre-fetched key bundle. If omitted, the verifier fetches
+   *  `keysUrl` when given, else uses the pinned PINNED_KEY_BUNDLE. */
   keys?: KeyBundle;
-  /** Skip key-bundle resolution entirely (verify only against the embedded public_key). */
+  /** Never fetch `keysUrl`; fall back to the pinned bundle. The embedded
+   *  public_key is never trusted on its own. */
   noFetchKeys?: boolean;
-  /** Override the well-known keys URL (e.g., self-hosted issuer). */
+  /** Fetch the key bundle from this URL (e.g., self-hosted issuer). */
   keysUrl?: string;
-  /** Provide a pre-fetched revocations feed. If omitted and `noFetchRevocations` is
-   *  false, the verifier fetches https://tunnelmind.ai/.well-known/receipt-revocations.json. */
+  /** Provide a pre-fetched revocations feed. If omitted, the verifier fetches
+   *  `revocationsUrl` (default https://tunnelmind.ai/.well-known/receipt-revocations.json);
+   *  a failed fetch makes the receipt invalid. Offline callers pass this. */
   revocations?: RevocationFeed;
-  /** Skip revocation check entirely (offline mode). */
-  noFetchRevocations?: boolean;
+  /** UNSAFE: disables revocation checking, so a receipt signed by a revoked
+   *  or compromised key verifies. Offline callers should pass `revocations`
+   *  instead. */
+  unsafeSkipRevocations?: boolean;
   /** Override the well-known revocations URL. */
   revocationsUrl?: string;
-  /** When true, key-bundle public_key mismatch is a warning, not an error.
-   *  Use during rotation-overlap windows when both old + new key are valid. */
+  /** When the receipt's embedded public_key differs from the bundle key for
+   *  its key_id, accept it (with a warning) only if that public_key is
+   *  another key in the same bundle that is active or rotated and whose
+   *  [created_at, rotation_after] window covers the receipt timestamp; the
+   *  signature is then verified against that bundle key. A key absent from
+   *  the bundle is never accepted. Use during rotation-overlap windows. */
   allowKeyMismatch?: boolean;
+  /** The receipt this one claims to follow. When given, chain mismatches are
+   *  errors: `chain.previous_receipt_hash` must equal the SHA-256 of the
+   *  previous receipt's signature.value string (UTF-8), '0x'-prefixed hex;
+   *  this matches scry-server receipt_v1.js:203-205 and data-api
+   *  receipt-v1.js:135-137. `chain.sequence` must be previous's + 1. */
+  previous?: Receipt;
   /** Custom fetch (e.g., for offline tests). */
   fetcher?: typeof fetch;
 }
@@ -148,11 +167,13 @@ function buildSigningObject(receipt: Receipt): JsonValue {
  * Performs:
  *   1. version check
  *   2. payload_hash recompute
- *   3. signature reconstruction + Ed25519 verify against embedded public_key
- *   4. optional key-bundle resolution + match
+ *   3. key_id resolution against the key bundle (keys > keysUrl > pinned),
+ *      plus the key's status + [created_at, rotation_after] window check
+ *   4. signature reconstruction + Ed25519 verify against the bundle's public_key
  *   5. attestation-strength ceiling rule
  *   6. optional revocation check (key + receipt)
- *   7. chain sequence sanity (warn-only)
+ *   7. chain sequence sanity (warn-only); with opts.previous, the hash link
+ *      and sequence+1 are checked and mismatches are errors
  */
 export async function verifyReceipt(
   receipt: Receipt,
@@ -189,14 +210,71 @@ export async function verifyReceipt(
     errors.push(`payload canonicalization failed: ${(e as Error).message}`);
   }
 
-  // 3. Signature
-  if (!receipt.signature?.algorithm || receipt.signature.algorithm !== 'Ed25519') {
-    errors.push(`unsupported signature algorithm: ${String(receipt.signature?.algorithm)}`);
+  // 3. Key resolution. The signature is bound to the KEY BUNDLE, never to the
+  // receipt's embedded public_key: anyone can embed their own key and sign,
+  // so trusting it would accept any self-signed forgery. Bundle precedence:
+  // opts.keys > fetched opts.keysUrl > the pinned bundle shipped with the
+  // package (so the default path needs no network).
+  const keyId = receipt.signature?.key_id;
+  let bundle: KeyBundle | null = null;
+  let resolvedKey: SigningKeyEntry | null = null;
+  if (typeof keyId !== 'string' || keyId === '') {
+    errors.push('signature.key_id: required non-empty string');
   } else {
     try {
-      const pubBytes = b64ToBytes(receipt.signature.public_key);
+      bundle = opts.keys
+        ?? (opts.keysUrl && !opts.noFetchKeys
+          ? await fetchKeyBundle({ url: opts.keysUrl, fetcher: opts.fetcher })
+          : PINNED_KEY_BUNDLE);
+      resolvedKey = resolveKey(bundle, keyId);
+      // allowKeyMismatch never rescues an unresolved key_id.
+      if (!resolvedKey) errors.push(`signature.key_id ${keyId} not present in key bundle`);
+    } catch (e) {
+      errors.push(`key bundle fetch failed: ${(e as Error).message}`);
+    }
+  }
+  // The key used for steps 4–5: the resolved bundle key, or under
+  // allowKeyMismatch another bundle entry matched by public_key; never the
+  // embedded key. Errors above don't clear it, so the signature is still
+  // checked and reported against the bundle key.
+  let signingKey: SigningKeyEntry | null = resolvedKey;
+  const tsMs = Date.parse(receipt.timestamp);
+  if (resolvedKey && bundle) {
+    if (!Number.isFinite(tsMs)) {
+      errors.push(`timestamp: not a valid date: ${String(receipt.timestamp)}`);
+    } else if (receipt.signature.public_key !== undefined
+        && receipt.signature.public_key !== resolvedKey.public_key) {
+      // The named key A's status/window is deliberately not checked here: B is the signer.
+      const embedded = receipt.signature.public_key;
+      const alt = opts.allowKeyMismatch
+        ? bundle.keys.find((k) => k.key_id !== keyId && k.public_key === embedded
+            && keyUsableAt(k, tsMs) === null)
+        : undefined;
+      if (alt) {
+        signingKey = alt;
+        warnings.push(
+          `receipt names key_id ${keyId} but its public_key is bundle key ${alt.key_id}; verified against ${alt.key_id}`,
+        );
+      } else {
+        errors.push(
+          `key bundle public_key for ${keyId} does not match the receipt's embedded public_key`,
+        );
+      }
+    } else {
+      // Window check applies to the key the receipt resolves to, flag or not.
+      const why = keyUsableAt(resolvedKey, tsMs);
+      if (why) errors.push(why);
+    }
+  }
+
+  // 4. Signature, verified against the selected bundle key only.
+  if (!receipt.signature?.algorithm || receipt.signature.algorithm !== 'Ed25519') {
+    errors.push(`unsupported signature algorithm: ${String(receipt.signature?.algorithm)}`);
+  } else if (signingKey) {
+    try {
+      const pubBytes = b64ToBytes(signingKey.public_key);
       if (pubBytes.length !== 32) {
-        errors.push(`signature.public_key: expected 32 raw bytes, got ${pubBytes.length}`);
+        errors.push(`key bundle public_key: expected 32 raw bytes, got ${pubBytes.length}`);
       } else {
         const pubKey = await subtle.importKey(
           'raw', pubBytes,
@@ -215,61 +293,43 @@ export async function verifyReceipt(
     }
   }
 
-  // 4. Key bundle resolution
-  let resolvedKey: SigningKeyEntry | null = null;
-  if (!opts.noFetchKeys && receipt.signature?.key_id) {
-    try {
-      const bundle = await fetchKeyBundle({
-        bundle: opts.keys,
-        url:    opts.keysUrl,
-        fetcher: opts.fetcher,
-      });
-      resolvedKey = resolveKey(bundle, receipt.signature.key_id);
-      if (!resolvedKey) {
-        const msg = `signature.key_id ${receipt.signature.key_id} not present in key bundle`;
-        if (opts.allowKeyMismatch) warnings.push(msg);
-        else errors.push(msg);
-      } else if (resolvedKey.public_key !== receipt.signature.public_key) {
-        const msg =
-          `key bundle public_key for ${receipt.signature.key_id} does not match the receipt's embedded public_key`;
-        if (opts.allowKeyMismatch) warnings.push(msg);
-        else errors.push(msg);
-      }
-    } catch (e) {
-      warnings.push(`key bundle fetch failed (verification continues against embedded key): ${(e as Error).message}`);
-    }
-  }
-
   // 5. Attestation-strength ceiling
-  if (resolvedKey?.attestation_strength) {
+  if (signingKey?.attestation_strength) {
     const tokenRank = STRENGTH_RANK[receipt.attestation_strength] ?? -1;
-    const keyRank   = STRENGTH_RANK[resolvedKey.attestation_strength] ?? -1;
+    const keyRank   = STRENGTH_RANK[signingKey.attestation_strength] ?? -1;
     if (tokenRank > keyRank) {
       errors.push(
-        `attestation_strength ceiling violated: receipt=${receipt.attestation_strength} > key=${resolvedKey.attestation_strength}`,
+        `attestation_strength ceiling violated: receipt=${receipt.attestation_strength} > key=${signingKey.attestation_strength}`,
       );
     }
   }
 
   // 6. Revocation
-  if (!opts.noFetchRevocations) {
+  if (!opts.unsafeSkipRevocations) {
     try {
       const feed = await fetchRevocations({
         feed:    opts.revocations,
         url:     opts.revocationsUrl,
         fetcher: opts.fetcher,
       });
-      if (receipt.signature?.key_id) {
-        const k = isKeyRevoked(feed, receipt.signature.key_id);
+      // Check the named key_id AND the key that actually verified: under
+      // allowKeyMismatch they differ, and a feed-revoked signer must not
+      // slip through by naming another bundle key.
+      const ids = new Set([receipt.signature?.key_id, signingKey?.key_id]);
+      for (const id of ids) {
+        if (!id) continue;
+        const k = isKeyRevoked(feed, id);
         if (k.revoked) {
           // Per spec §8.3 step 3: receipts signed AFTER revoked_at must be rejected;
-          // receipts signed before that can survive with a warning.
+          // receipts signed before that can survive with a warning. Not for a
+          // compromised key: receipt.timestamp is signed by whoever holds the
+          // key, so an attacker can backdate it past revoked_at.
           const issued = Date.parse(receipt.timestamp);
           const revoked = Date.parse(k.revoked_at ?? '');
-          if (Number.isFinite(issued) && Number.isFinite(revoked) && issued < revoked) {
+          if (k.reason !== 'compromise' && Number.isFinite(issued) && Number.isFinite(revoked) && issued < revoked) {
             warnings.push(`signing key was rotated out of service at ${k.revoked_at} (receipt predates rotation); reason: ${k.reason}`);
           } else {
-            errors.push(`signing key ${receipt.signature.key_id} revoked at ${k.revoked_at}: ${k.reason}`);
+            errors.push(`signing key ${id} revoked at ${k.revoked_at}: ${k.reason}`);
           }
         }
       }
@@ -280,11 +340,34 @@ export async function verifyReceipt(
         }
       }
     } catch (e) {
-      warnings.push(`revocation feed fetch failed (verification continues): ${(e as Error).message}`);
+      // Fail closed: an attacker who can block the feed must not thereby
+      // un-revoke a key. The remaining checks still run for diagnostics.
+      errors.push(`revocation feed fetch failed: ${(e as Error).message}`);
     }
   }
 
-  // 7. Chain sequence sanity (warn-only)
+  // 7. Chain: hard link check against opts.previous, else sanity (warn-only)
+  if (opts.previous) {
+    if (!receipt.chain) {
+      errors.push('previous supplied but receipt has no chain');
+    } else {
+      // The issuers link on the previous signature string, not the whole
+      // receipt: previous_receipt_hash = sha256(utf8(previous.signature.value)).
+      const prevSig = opts.previous.signature?.value;
+      if (typeof prevSig !== 'string') {
+        errors.push('previous receipt has no signature value');
+      } else {
+        const expected = await sha256HexPrefixed(toAB(new TextEncoder().encode(prevSig)));
+        if (receipt.chain.previous_receipt_hash !== expected) {
+          errors.push(`chain.previous_receipt_hash mismatch: computed ${expected}, claimed ${String(receipt.chain.previous_receipt_hash)}`);
+        }
+      }
+      const prevSeq = opts.previous.chain?.sequence;
+      if (typeof prevSeq !== 'number' || receipt.chain.sequence !== prevSeq + 1) {
+        errors.push(`chain.sequence mismatch: expected ${typeof prevSeq === 'number' ? prevSeq + 1 : '(previous has no chain)'}, got ${receipt.chain.sequence}`);
+      }
+    }
+  }
   if (receipt.chain) {
     if (receipt.chain.previous_receipt_hash && receipt.chain.sequence === 0) {
       warnings.push('chain.sequence is 0 but previous_receipt_hash is non-null');
@@ -302,12 +385,16 @@ export async function verifyReceipt(
 export { canonicalize, canonicalizeBytes };
 export {
   DEFAULT_KEYS_URL,
+  KEY_BUNDLE_CACHE_TTL_MS,
   fetchKeyBundle,
   resolveKey,
+  keyUsableAt,
   clearKeyCache,
 } from './keys.js';
+export { PINNED_KEY_BUNDLE, PINNED_KEYS_FETCHED_AT } from './pinned-keys.js';
 export {
   DEFAULT_REVOCATIONS_URL,
+  REVOCATION_CACHE_TTL_MS,
   fetchRevocations,
   isKeyRevoked,
   isReceiptRevoked,
