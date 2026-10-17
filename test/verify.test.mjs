@@ -4,6 +4,7 @@ import { webcrypto } from 'node:crypto';
 import { canonicalizeBytes } from '../dist/jcs.js';
 import {
   verifyReceipt,
+  fetchRevocations,
   clearKeyCache,
   clearRevocationCache,
   PINNED_KEY_BUNDLE,
@@ -166,12 +167,12 @@ test('rejects when receipt_id is in revoked_receipts', async () => {
 
 // V001 (PoC E): offline mode used to verify against the embedded key, so any
 // self-signed receipt passed. It now resolves against the pinned bundle.
-test('offline mode (noFetchKeys + noFetchRevocations) rejects a self-signed receipt', async () => {
+test('offline mode (noFetchKeys + supplied revocations) rejects a self-signed receipt', async () => {
   reset();
   const { receipt } = await makeReceipt();
   const result = await verifyReceipt(receipt, {
     noFetchKeys: true,
-    noFetchRevocations: true,
+    revocations: makeRevocations(),
   });
   assert.equal(result.valid, false);
   assert.ok(result.errors.some((e) => e.includes('not present in key bundle')));
@@ -235,7 +236,7 @@ test('PoC E: self-signed receipt claiming the real key_id fails offline against 
   const { receipt } = await makeReceipt({ keyId: PINNED_KEY_ID });
   const result = await verifyReceipt(receipt, {
     noFetchKeys: true,
-    noFetchRevocations: true,
+    revocations: makeRevocations(),
     fetcher: failingFetcher(),
   });
   assert.equal(result.valid, false);
@@ -466,4 +467,84 @@ test('allowKeyMismatch=true rejects when the other key is revoked in the feed', 
   });
   assert.equal(result.valid, false);
   assert.ok(result.errors.some((e) => e.includes('signing key key-b revoked')), result.errors.join('; '));
+});
+
+// ── V005: revocation fails closed ────────────────────────────────────────────
+
+async function pinnedLocalCase(opts) {
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt();
+  const keys = makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64 }]);
+  return verifyReceipt(receipt, { keys, ...opts });
+}
+
+test('a failed revocation feed fetch is an error, not a warning', async () => {
+  reset();
+  const result = await pinnedLocalCase({ fetcher: failingFetcher() });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('revocation feed fetch failed')), result.errors.join('; '));
+  assert.ok(!result.warnings.some((w) => w.includes('revocation')));
+});
+
+test('unsafeSkipRevocations skips the check without fetching', async () => {
+  reset();
+  let calls = 0;
+  const result = await pinnedLocalCase({
+    unsafeSkipRevocations: true,
+    fetcher: async () => { calls++; throw new Error('network must not be touched'); },
+  });
+  assert.equal(result.valid, true, result.errors.join('; '));
+  assert.equal(calls, 0);
+});
+
+async function futureRevocationCase(reason) {
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt();
+  // revoked_at is AFTER the (signer-chosen) receipt timestamp.
+  const revokedAt = new Date(Date.parse(receipt.timestamp) + 3600_000).toISOString();
+  return verifyReceipt(receipt, {
+    keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64 }]),
+    revocations: makeRevocations({ revoked_keys: [{ key_id: keyId, revoked_at: revokedAt, reason }] }),
+  });
+}
+
+test('a compromised key rejects even a receipt dated before revoked_at', async () => {
+  reset();
+  const result = await futureRevocationCase('compromise');
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('revoked at') && e.includes('compromise')), result.errors.join('; '));
+});
+
+test('a rotated key still accepts a receipt dated before revoked_at, with a warning', async () => {
+  reset();
+  const result = await futureRevocationCase('rotation');
+  assert.equal(result.valid, true, result.errors.join('; '));
+  assert.ok(result.warnings.some((w) => w.includes('rotated out of service')));
+});
+
+function countingFetcher() {
+  const urls = [];
+  const fetcher = async (url) => {
+    urls.push(url);
+    return new Response(JSON.stringify(makeRevocations()), { status: 200 });
+  };
+  return { urls, fetcher };
+}
+
+test('revocation cache is keyed by URL', async () => {
+  reset();
+  const { urls, fetcher } = countingFetcher();
+  await fetchRevocations({ url: 'https://a.example/rev.json', fetcher });
+  await fetchRevocations({ url: 'https://b.example/rev.json', fetcher });
+  await fetchRevocations({ url: 'https://a.example/rev.json', fetcher });
+  assert.deepEqual(urls, ['https://a.example/rev.json', 'https://b.example/rev.json']);
+  clearRevocationCache();
+  await fetchRevocations({ url: 'https://a.example/rev.json', fetcher });
+  assert.equal(urls.length, 3);
+});
+
+test('revocation cache entries expire after ttlMs', async () => {
+  reset();
+  const { urls, fetcher } = countingFetcher();
+  await fetchRevocations({ url: 'https://a.example/rev.json', fetcher, ttlMs: 0 });
+  await fetchRevocations({ url: 'https://a.example/rev.json', fetcher, ttlMs: 0 });
+  assert.equal(urls.length, 2);
 });

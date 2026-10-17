@@ -87,11 +87,14 @@ export interface VerifyOptions {
   noFetchKeys?: boolean;
   /** Fetch the key bundle from this URL (e.g., self-hosted issuer). */
   keysUrl?: string;
-  /** Provide a pre-fetched revocations feed. If omitted and `noFetchRevocations` is
-   *  false, the verifier fetches https://tunnelmind.ai/.well-known/receipt-revocations.json. */
+  /** Provide a pre-fetched revocations feed. If omitted, the verifier fetches
+   *  `revocationsUrl` (default https://tunnelmind.ai/.well-known/receipt-revocations.json);
+   *  a failed fetch makes the receipt invalid. Offline callers pass this. */
   revocations?: RevocationFeed;
-  /** Skip revocation check entirely (offline mode). */
-  noFetchRevocations?: boolean;
+  /** UNSAFE: disables revocation checking, so a receipt signed by a revoked
+   *  or compromised key verifies. Offline callers should pass `revocations`
+   *  instead. */
+  unsafeSkipRevocations?: boolean;
   /** Override the well-known revocations URL. */
   revocationsUrl?: string;
   /** When the receipt's embedded public_key differs from the bundle key for
@@ -295,7 +298,7 @@ export async function verifyReceipt(
   }
 
   // 6. Revocation
-  if (!opts.noFetchRevocations) {
+  if (!opts.unsafeSkipRevocations) {
     try {
       const feed = await fetchRevocations({
         feed:    opts.revocations,
@@ -311,10 +314,12 @@ export async function verifyReceipt(
         const k = isKeyRevoked(feed, id);
         if (k.revoked) {
           // Per spec §8.3 step 3: receipts signed AFTER revoked_at must be rejected;
-          // receipts signed before that can survive with a warning.
+          // receipts signed before that can survive with a warning. Not for a
+          // compromised key: receipt.timestamp is signed by whoever holds the
+          // key, so an attacker can backdate it past revoked_at.
           const issued = Date.parse(receipt.timestamp);
           const revoked = Date.parse(k.revoked_at ?? '');
-          if (Number.isFinite(issued) && Number.isFinite(revoked) && issued < revoked) {
+          if (k.reason !== 'compromise' && Number.isFinite(issued) && Number.isFinite(revoked) && issued < revoked) {
             warnings.push(`signing key was rotated out of service at ${k.revoked_at} (receipt predates rotation); reason: ${k.reason}`);
           } else {
             errors.push(`signing key ${id} revoked at ${k.revoked_at}: ${k.reason}`);
@@ -328,7 +333,9 @@ export async function verifyReceipt(
         }
       }
     } catch (e) {
-      warnings.push(`revocation feed fetch failed (verification continues): ${(e as Error).message}`);
+      // Fail closed: an attacker who can block the feed must not thereby
+      // un-revoke a key. The remaining checks still run for diagnostics.
+      errors.push(`revocation feed fetch failed: ${(e as Error).message}`);
     }
   }
 
@@ -358,6 +365,7 @@ export {
 export { PINNED_KEY_BUNDLE, PINNED_KEYS_FETCHED_AT } from './pinned-keys.js';
 export {
   DEFAULT_REVOCATIONS_URL,
+  REVOCATION_CACHE_TTL_MS,
   fetchRevocations,
   isKeyRevoked,
   isReceiptRevoked,

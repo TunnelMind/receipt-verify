@@ -31,19 +31,25 @@ export interface RevocationFeed {
   revoked_receipts: RevokedReceipt[];
 }
 
-let _cache: { feed: RevocationFeed; fetchedAt: number } | null = null;
+// Keyed by URL so a feed from one issuer is never served for another; entries
+// expire so a newly published revocation is seen within the TTL.
+export const REVOCATION_CACHE_TTL_MS = 5 * 60 * 1000;
+const _cache = new Map<string, { feed: RevocationFeed; fetchedAt: number }>();
 
 export interface FetchRevocationsOptions {
   url?: string;
   noCache?: boolean;
+  /** Max age of a cached feed; default REVOCATION_CACHE_TTL_MS. */
+  ttlMs?: number;
   feed?: RevocationFeed;
   fetcher?: typeof fetch;
 }
 
 export async function fetchRevocations(opts: FetchRevocationsOptions = {}): Promise<RevocationFeed> {
   if (opts.feed) return opts.feed;
-  if (!opts.noCache && _cache) return _cache.feed;
   const url = opts.url ?? DEFAULT_REVOCATIONS_URL;
+  const hit = _cache.get(url);
+  if (!opts.noCache && hit && Date.now() - hit.fetchedAt < (opts.ttlMs ?? REVOCATION_CACHE_TTL_MS)) return hit.feed;
   const f = opts.fetcher ?? fetch;
   const r = await f(url);
   if (!r.ok) throw new Error(`fetchRevocations: ${url} returned ${r.status}`);
@@ -54,7 +60,7 @@ export async function fetchRevocations(opts: FetchRevocationsOptions = {}): Prom
     revoked_keys:     Array.isArray(j.revoked_keys)     ? j.revoked_keys     : [],
     revoked_receipts: Array.isArray(j.revoked_receipts) ? j.revoked_receipts : [],
   };
-  _cache = { feed: normalized, fetchedAt: Date.now() };
+  _cache.set(url, { feed: normalized, fetchedAt: Date.now() });
   return normalized;
 }
 
@@ -89,5 +95,5 @@ export function isReceiptRevoked(feed: RevocationFeed, receiptId: string): Recei
 }
 
 export function clearRevocationCache(): void {
-  _cache = null;
+  _cache.clear();
 }
