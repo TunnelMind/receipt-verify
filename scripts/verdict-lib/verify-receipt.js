@@ -43,7 +43,8 @@ const normWitness = (list) => (Array.isArray(list) ? list : [])
  * @param {object} receipt — a reconciliation receipt (with self_verification)
  * @param {object} [opts]
  * @param {object} [opts.keys] — issuer KeyBundle; defaults to the shipped pinned bundle
- * @param {string} [opts.logKey] — base64 raw Ed25519 key that signs checkpoints
+ * @param {string} [opts.logKey] — base64 raw Ed25519 key; only used when the
+ *   checkpoint carries its own `signature` (the witness cosig is the checkpoint proof)
  * @param {Array<string|{key_id?:string,public_key:string}>} [opts.witnessKeys]
  * @returns {Promise<{ ok: boolean, checks: Array<{check,pass,detail}> }>}
  */
@@ -99,17 +100,24 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
     const okIncl = await verifyInclusion(leaf, leaf_index, tree_size, audit_path || [], sv.checkpoint.root_hash);
     add('log_inclusion', okIncl, okIncl ? `tree_size=${tree_size}` : 'leaf does not resolve to checkpoint root');
 
-    // Checkpoint signature: the STH scheme of scripts/verify-log.mjs verifySth —
-    // Ed25519 over JCS(checkpoint minus `signature`), by the pinned log key.
+    // The issuer (tunnelmind-data-api api/roots/log.js + verdict.js) puts no
+    // signature on the checkpoint itself: the root is signed by the witness
+    // cosignatures below, made over canonical(checkpoint) incl. root_hash.
+    // That pinned-witness check is the checkpoint proof and always runs. A
+    // checkpoint that DOES carry its own signature (the STH scheme of
+    // scripts/verify-log.mjs verifySth: Ed25519 over JCS(checkpoint minus
+    // `signature`)) must also verify against the pinned --log-key.
     const cp = sv.checkpoint;
-    if (!logKey) {
-      add('checkpoint_signature', false, 'no pinned log key');
-    } else if (!cp.signature || cp.signature.algorithm !== 'Ed25519' || !cp.signature.value) {
-      add('checkpoint_signature', false, 'checkpoint unsigned');
-    } else {
+    if (cp.signature !== undefined) {
       const { signature, ...cpBody } = cp;
-      const okCp = await ed25519Verify(logKey, signature.value, canonicalizeBytes(cpBody));
-      add('checkpoint_signature', okCp, okCp ? undefined : 'does not verify against pinned log key');
+      if (!logKey) {
+        add('checkpoint_signature', false, 'checkpoint is signed but no pinned log key');
+      } else if (!signature || signature.algorithm !== 'Ed25519' || !signature.value) {
+        add('checkpoint_signature', false, 'checkpoint signature malformed');
+      } else {
+        const okCp = await ed25519Verify(logKey, signature.value, canonicalizeBytes(cpBody));
+        add('checkpoint_signature', okCp, okCp ? undefined : 'does not verify against pinned log key');
+      }
     }
 
     // Witness cosignatures: each must verify under a PINNED witness key (by

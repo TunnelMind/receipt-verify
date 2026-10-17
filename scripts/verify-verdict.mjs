@@ -17,18 +17,20 @@
  * and Merkle verifier the service runs — the verifier IS the spec.
  *
  * Usage:
- *   node scripts/verify-verdict.mjs [--keys <bundle.json>] --log-key <b64> \
+ *   node scripts/verify-verdict.mjs [--keys <bundle.json>] [--log-key <b64>] \
  *     --witness-keys <keys.json | b64,b64,…> <receipt.json>
  *   curl -s https://data.tunnelmind.ai/v1/verdict/<key>?subject=<d> \
- *     | node scripts/verify-verdict.mjs --log-key <b64> --witness-keys <…> -
+ *     | node scripts/verify-verdict.mjs --witness-keys <…> -
  *
  *   --keys          issuer KeyBundle JSON; default = the bundle shipped in
  *                   dist/pinned-keys.js (run `npm run build` first)
- *   --log-key       base64 raw Ed25519 key that signs log checkpoints
+ *   --log-key       optional base64 raw Ed25519 key; only used when the
+ *                   checkpoint carries its own `signature` (then required)
  *   --witness-keys  JSON file (array of b64 keys or {key_id, public_key}) or a
  *                   comma-separated list of b64 keys
- * Without --log-key / --witness-keys those checks FAIL: there is nothing
- * pinned to verify them against.
+ * The witness cosignature over the canonical checkpoint (root_hash included)
+ * is the proof the checkpoint root is signed. Without --witness-keys that
+ * check FAILS: there is nothing pinned to verify it against.
  *
  * Exit 0 = all checks pass; 1 = a check failed; 2 = bad usage.
  */
