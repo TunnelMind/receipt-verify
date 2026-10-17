@@ -20,6 +20,7 @@ import {
   type SigningKeyEntry,
   type AttestationStrength,
 } from './keys.js';
+import { PINNED_KEY_BUNDLE } from './pinned-keys.js';
 import {
   fetchRevocations,
   isKeyRevoked,
@@ -74,12 +75,13 @@ export interface Receipt {
 }
 
 export interface VerifyOptions {
-  /** Provide a pre-fetched key bundle. If omitted and `noFetchKeys` is false,
-   *  the verifier fetches https://tunnelmind.ai/.well-known/receipt-signing-key.json. */
+  /** Provide a pre-fetched key bundle. If omitted, the verifier fetches
+   *  `keysUrl` when given, else uses the pinned PINNED_KEY_BUNDLE. */
   keys?: KeyBundle;
-  /** Skip key-bundle resolution entirely (verify only against the embedded public_key). */
+  /** Never fetch `keysUrl`; fall back to the pinned bundle. The embedded
+   *  public_key is never trusted on its own. */
   noFetchKeys?: boolean;
-  /** Override the well-known keys URL (e.g., self-hosted issuer). */
+  /** Fetch the key bundle from this URL (e.g., self-hosted issuer). */
   keysUrl?: string;
   /** Provide a pre-fetched revocations feed. If omitted and `noFetchRevocations` is
    *  false, the verifier fetches https://tunnelmind.ai/.well-known/receipt-revocations.json. */
@@ -148,8 +150,8 @@ function buildSigningObject(receipt: Receipt): JsonValue {
  * Performs:
  *   1. version check
  *   2. payload_hash recompute
- *   3. signature reconstruction + Ed25519 verify against embedded public_key
- *   4. optional key-bundle resolution + match
+ *   3. key_id resolution against the key bundle (keys > keysUrl > pinned)
+ *   4. signature reconstruction + Ed25519 verify against the bundle's public_key
  *   5. attestation-strength ceiling rule
  *   6. optional revocation check (key + receipt)
  *   7. chain sequence sanity (warn-only)
@@ -189,14 +191,44 @@ export async function verifyReceipt(
     errors.push(`payload canonicalization failed: ${(e as Error).message}`);
   }
 
-  // 3. Signature
-  if (!receipt.signature?.algorithm || receipt.signature.algorithm !== 'Ed25519') {
-    errors.push(`unsupported signature algorithm: ${String(receipt.signature?.algorithm)}`);
+  // 3. Key resolution. The signature is bound to the KEY BUNDLE, never to the
+  // receipt's embedded public_key: anyone can embed their own key and sign,
+  // so trusting it would accept any self-signed forgery. Bundle precedence:
+  // opts.keys > fetched opts.keysUrl > the pinned bundle shipped with the
+  // package (so the default path needs no network).
+  const keyId = receipt.signature?.key_id;
+  let resolvedKey: SigningKeyEntry | null = null;
+  if (typeof keyId !== 'string' || keyId === '') {
+    errors.push('signature.key_id: required non-empty string');
   } else {
     try {
-      const pubBytes = b64ToBytes(receipt.signature.public_key);
+      const bundle = opts.keys
+        ?? (opts.keysUrl && !opts.noFetchKeys
+          ? await fetchKeyBundle({ url: opts.keysUrl, fetcher: opts.fetcher })
+          : PINNED_KEY_BUNDLE);
+      resolvedKey = resolveKey(bundle, keyId);
+      // ponytail: allowKeyMismatch never rescues an unresolved key_id (V003 redefines it).
+      if (!resolvedKey) errors.push(`signature.key_id ${keyId} not present in key bundle`);
+    } catch (e) {
+      errors.push(`key bundle fetch failed: ${(e as Error).message}`);
+    }
+  }
+  if (resolvedKey && receipt.signature.public_key !== undefined
+      && receipt.signature.public_key !== resolvedKey.public_key) {
+    const msg =
+      `key bundle public_key for ${keyId} does not match the receipt's embedded public_key`;
+    if (opts.allowKeyMismatch) warnings.push(msg);
+    else errors.push(msg);
+  }
+
+  // 4. Signature, verified against the resolved bundle key only.
+  if (!receipt.signature?.algorithm || receipt.signature.algorithm !== 'Ed25519') {
+    errors.push(`unsupported signature algorithm: ${String(receipt.signature?.algorithm)}`);
+  } else if (resolvedKey) {
+    try {
+      const pubBytes = b64ToBytes(resolvedKey.public_key);
       if (pubBytes.length !== 32) {
-        errors.push(`signature.public_key: expected 32 raw bytes, got ${pubBytes.length}`);
+        errors.push(`key bundle public_key: expected 32 raw bytes, got ${pubBytes.length}`);
       } else {
         const pubKey = await subtle.importKey(
           'raw', pubBytes,
@@ -212,31 +244,6 @@ export async function verifyReceipt(
       }
     } catch (e) {
       errors.push(`signature verification failed: ${(e as Error).message}`);
-    }
-  }
-
-  // 4. Key bundle resolution
-  let resolvedKey: SigningKeyEntry | null = null;
-  if (!opts.noFetchKeys && receipt.signature?.key_id) {
-    try {
-      const bundle = await fetchKeyBundle({
-        bundle: opts.keys,
-        url:    opts.keysUrl,
-        fetcher: opts.fetcher,
-      });
-      resolvedKey = resolveKey(bundle, receipt.signature.key_id);
-      if (!resolvedKey) {
-        const msg = `signature.key_id ${receipt.signature.key_id} not present in key bundle`;
-        if (opts.allowKeyMismatch) warnings.push(msg);
-        else errors.push(msg);
-      } else if (resolvedKey.public_key !== receipt.signature.public_key) {
-        const msg =
-          `key bundle public_key for ${receipt.signature.key_id} does not match the receipt's embedded public_key`;
-        if (opts.allowKeyMismatch) warnings.push(msg);
-        else errors.push(msg);
-      }
-    } catch (e) {
-      warnings.push(`key bundle fetch failed (verification continues against embedded key): ${(e as Error).message}`);
     }
   }
 
@@ -306,6 +313,7 @@ export {
   resolveKey,
   clearKeyCache,
 } from './keys.js';
+export { PINNED_KEY_BUNDLE, PINNED_KEYS_FETCHED_AT } from './pinned-keys.js';
 export {
   DEFAULT_REVOCATIONS_URL,
   fetchRevocations,

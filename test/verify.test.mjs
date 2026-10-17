@@ -1,9 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { webcrypto } from 'node:crypto';
+import { canonicalizeBytes } from '../dist/jcs.js';
 import {
   verifyReceipt,
   clearKeyCache,
   clearRevocationCache,
+  PINNED_KEY_BUNDLE,
+  PINNED_KEYS_FETCHED_AT,
 } from '../dist/index.js';
 import {
   makeReceipt,
@@ -72,7 +76,9 @@ test('rejects when key_id is missing from bundle (default strict)', async () => 
   assert.ok(result.errors.some((e) => e.includes('not present in key bundle')));
 });
 
-test('demotes key_id mismatch to warning when allowKeyMismatch=true', async () => {
+// V001: an unresolved key_id used to become a warning here and the receipt
+// verified against its own embedded key. allowKeyMismatch no longer rescues it.
+test('allowKeyMismatch=true does not rescue a key_id missing from the bundle', async () => {
   reset();
   const { receipt } = await makeReceipt();
   const result = await verifyReceipt(receipt, {
@@ -80,8 +86,8 @@ test('demotes key_id mismatch to warning when allowKeyMismatch=true', async () =
     revocations: makeRevocations(),
     allowKeyMismatch: true,
   });
-  assert.equal(result.valid, true, result.errors.join('; '));
-  assert.ok(result.warnings.some((w) => w.includes('not present in key bundle')));
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('not present in key bundle')));
 });
 
 test('rejects when key_bundle public_key disagrees with embedded public_key', async () => {
@@ -158,13 +164,137 @@ test('rejects when receipt_id is in revoked_receipts', async () => {
   assert.ok(result.errors.some((e) => e.includes('revoked at')));
 });
 
-test('offline mode (noFetchKeys + noFetchRevocations) verifies pure crypto only', async () => {
+// V001 (PoC E): offline mode used to verify against the embedded key, so any
+// self-signed receipt passed. It now resolves against the pinned bundle.
+test('offline mode (noFetchKeys + noFetchRevocations) rejects a self-signed receipt', async () => {
   reset();
   const { receipt } = await makeReceipt();
   const result = await verifyReceipt(receipt, {
     noFetchKeys: true,
     noFetchRevocations: true,
   });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('not present in key bundle')));
+});
+
+// ── V001: key binding (forgeries from the audit PoC) ─────────────────────────
+
+const PINNED_KEY_ID = PINNED_KEY_BUNDLE.keys[0].key_id;
+
+// Re-sign after editing the signature block (makeReceipt always sets key_id).
+async function resign(receipt, kp) {
+  const { payload: _p, ...rest } = receipt;
+  const { value: _v, ...sig } = receipt.signature;
+  const bytes = canonicalizeBytes({ ...rest, signature: sig });
+  receipt.signature.value = Buffer.from(
+    await webcrypto.subtle.sign('Ed25519', kp.privateKey, bytes),
+  ).toString('base64');
+  return receipt;
+}
+
+function failingFetcher() {
+  return async () => { throw new Error('network must not be touched'); };
+}
+
+test('pinned bundle ships the published key with a fetch date', () => {
+  assert.equal(PINNED_KEY_ID, 'tm-receipt-2026-05');
+  assert.equal(Buffer.from(PINNED_KEY_BUNDLE.keys[0].public_key, 'base64').length, 32);
+  assert.ok(Number.isFinite(Date.parse(PINNED_KEYS_FETCHED_AT)));
+});
+
+test('PoC A: self-signed receipt with no key_id is invalid', async () => {
+  reset();
+  const { kp, publicKeyB64 } = await makeEphemeralKey();
+  const { receipt } = await makeReceipt({ kp, publicKeyB64, attestationStrength: 'silicon-root' });
+  delete receipt.signature.key_id;
+  await resign(receipt, kp);
+  const result = await verifyReceipt(receipt, {
+    keys: PINNED_KEY_BUNDLE,
+    revocations: makeRevocations(),
+    fetcher: failingFetcher(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('key_id')));
+});
+
+test('PoC B: self-signed receipt with key_id "" is invalid', async () => {
+  reset();
+  const { kp, publicKeyB64 } = await makeEphemeralKey();
+  const { receipt } = await makeReceipt({ kp, publicKeyB64, keyId: '', attestationStrength: 'silicon-root' });
+  const result = await verifyReceipt(receipt, {
+    keys: PINNED_KEY_BUNDLE,
+    revocations: makeRevocations(),
+    fetcher: failingFetcher(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('key_id')));
+});
+
+test('PoC E: self-signed receipt claiming the real key_id fails offline against the pinned bundle', async () => {
+  reset();
+  const { receipt } = await makeReceipt({ keyId: PINNED_KEY_ID });
+  const result = await verifyReceipt(receipt, {
+    noFetchKeys: true,
+    noFetchRevocations: true,
+    fetcher: failingFetcher(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('does not match')));
+  assert.ok(result.errors.some((e) => e.includes('signature did not verify')));
+});
+
+test('default path (no keys, no keysUrl) uses the pinned bundle without fetching', async () => {
+  reset();
+  const { receipt } = await makeReceipt({ keyId: PINNED_KEY_ID });
+  const result = await verifyReceipt(receipt, {
+    revocations: makeRevocations(),
+    fetcher: failingFetcher(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(!result.errors.some((e) => e.includes('fetch')), result.errors.join('; '));
+  assert.ok(result.errors.some((e) => e.includes('signature did not verify')));
+});
+
+test('embedded public_key differing from the bundle is an error even if the signature is the bundle key\'s', async () => {
+  reset();
+  const signer = await makeEphemeralKey();
+  const other = await makeEphemeralKey();
+  const { receipt, keyId } = await makeReceipt({ kp: signer.kp, publicKeyB64: other.publicKeyB64 });
+  const result = await verifyReceipt(receipt, {
+    keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: signer.publicKeyB64 }]),
+    revocations: makeRevocations(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('does not match')));
+  assert.ok(!result.errors.some((e) => e.includes('signature did not verify')), result.errors.join('; '));
+});
+
+test('TunnelMind-shaped receipt signed by a key in an injected bundle verifies', async () => {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt({
+    keyId: PINNED_KEY_ID,
+    lens: 'sigil',
+    endpoint: '/v1/sigil/verify',
+  });
+  const result = await verifyReceipt(receipt, {
+    keys: makeKeyBundle([
+      { key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, status: 'active', attestation_strength: 'software' },
+    ]),
+    revocations: makeRevocations(),
+    fetcher: failingFetcher(),
+  });
   assert.equal(result.valid, true, result.errors.join('; '));
   assert.deepEqual(result.warnings, []);
+});
+
+test('keysUrl is fetched through the injected fetcher', async () => {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt();
+  const bundle = makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64 }]);
+  const result = await verifyReceipt(receipt, {
+    keysUrl: 'https://issuer.example/keys.json',
+    fetcher: async () => new Response(JSON.stringify(bundle)),
+    revocations: makeRevocations(),
+  });
+  assert.equal(result.valid, true, result.errors.join('; '));
 });
