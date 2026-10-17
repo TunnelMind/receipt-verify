@@ -548,3 +548,74 @@ test('revocation cache entries expire after ttlMs', async () => {
   await fetchRevocations({ url: 'https://a.example/rev.json', fetcher, ttlMs: 0 });
   assert.equal(urls.length, 2);
 });
+
+// ── V006: JCS lone surrogates + opts.previous chain check ─────────────────────
+
+test('canonicalize rejects lone surrogates in values and keys, accepts valid pairs', async () => {
+  const { canonicalize } = await import('../dist/jcs.js');
+  assert.throws(() => canonicalize('a\uD800b'), /lone surrogate/);
+  assert.throws(() => canonicalize('a\uDC00b'), /lone surrogate/);
+  assert.throws(() => canonicalize({ '\uDC00': 1 }), /lone surrogate/);
+  assert.equal(canonicalize('😀'), '"😀"');
+  assert.equal(canonicalize({ '😀': 1 }), '{"😀":1}');
+});
+
+test('a lone surrogate in the payload is an error, not a throw', async () => {
+  reset();
+  // Sign over U+FFFD, then swap in the lone surrogate TextEncoder would map to
+  // it: without the guard the hash still matches and the receipt verifies.
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt({ payload: { s: 'a�b' } });
+  receipt.payload = { s: 'a\uD800b' };
+  const result = await verifyReceipt(receipt, {
+    keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64 }]),
+    revocations: makeRevocations(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('payload canonicalization failed')), result.errors.join('; '));
+});
+
+async function makeChainPair({ sequence = 1 } = {}) {
+  const key = await makeEphemeralKey();
+  const { receipt: prev, keyId } = await makeReceipt({ ...key, payload: { n: 0 } });
+  const previous_receipt_hash = '0x' + Buffer.from(
+    await webcrypto.subtle.digest('SHA-256', canonicalizeBytes(prev)),
+  ).toString('hex');
+  const { receipt } = await makeReceipt({ ...key, payload: { n: 1 }, chain: { previous_receipt_hash, sequence } });
+  const opts = {
+    keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: key.publicKeyB64 }]),
+    revocations: makeRevocations(),
+  };
+  return { prev, receipt, opts };
+}
+
+test('previous: a matching previous receipt gives no chain error', async () => {
+  reset();
+  const { prev, receipt, opts } = await makeChainPair();
+  const result = await verifyReceipt(receipt, { ...opts, previous: prev });
+  assert.equal(result.valid, true, result.errors.join('; '));
+});
+
+test('previous: a tampered previous receipt is a hash mismatch error', async () => {
+  reset();
+  const { prev, receipt, opts } = await makeChainPair();
+  const result = await verifyReceipt(receipt, { ...opts, previous: { ...prev, payload: { n: 'EVIL' } } });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('chain.previous_receipt_hash mismatch')), result.errors.join('; '));
+});
+
+test('previous: a wrong sequence is an error', async () => {
+  reset();
+  const { prev, receipt, opts } = await makeChainPair({ sequence: 2 });
+  const result = await verifyReceipt(receipt, { ...opts, previous: prev });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('chain.sequence mismatch')), result.errors.join('; '));
+});
+
+test('previous: a receipt with no chain is an error', async () => {
+  reset();
+  const { prev, receipt, opts } = await makeChainPair();
+  delete receipt.chain;
+  const result = await verifyReceipt(receipt, { ...opts, previous: prev });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('previous supplied but receipt has no chain')), result.errors.join('; '));
+});

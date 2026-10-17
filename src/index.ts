@@ -104,6 +104,12 @@ export interface VerifyOptions {
    *  signature is then verified against that bundle key. A key absent from
    *  the bundle is never accepted. Use during rotation-overlap windows. */
   allowKeyMismatch?: boolean;
+  /** The receipt this one claims to follow. When given, chain mismatches are
+   *  errors: `chain.previous_receipt_hash` must equal SHA-256 over the
+   *  JCS-canonical bytes of the WHOLE previous receipt, '0x'-prefixed hex (the
+   *  payload_hash format), and `chain.sequence` must be previous's + 1.
+   *  ASSUMPTION: the spec defines no previous_receipt_hash input; this is it. */
+  previous?: Receipt;
   /** Custom fetch (e.g., for offline tests). */
   fetcher?: typeof fetch;
 }
@@ -166,7 +172,8 @@ function buildSigningObject(receipt: Receipt): JsonValue {
  *   4. signature reconstruction + Ed25519 verify against the bundle's public_key
  *   5. attestation-strength ceiling rule
  *   6. optional revocation check (key + receipt)
- *   7. chain sequence sanity (warn-only)
+ *   7. chain sequence sanity (warn-only); with opts.previous, the hash link
+ *      and sequence+1 are checked and mismatches are errors
  */
 export async function verifyReceipt(
   receipt: Receipt,
@@ -339,7 +346,25 @@ export async function verifyReceipt(
     }
   }
 
-  // 7. Chain sequence sanity (warn-only)
+  // 7. Chain: hard link check against opts.previous, else sanity (warn-only)
+  if (opts.previous) {
+    if (!receipt.chain) {
+      errors.push('previous supplied but receipt has no chain');
+    } else {
+      try {
+        const expected = await sha256HexPrefixed(toAB(canonicalizeBytes(opts.previous as unknown as JsonValue)));
+        if (receipt.chain.previous_receipt_hash !== expected) {
+          errors.push(`chain.previous_receipt_hash mismatch: computed ${expected}, claimed ${String(receipt.chain.previous_receipt_hash)}`);
+        }
+      } catch (e) {
+        errors.push(`previous receipt canonicalization failed: ${(e as Error).message}`);
+      }
+      const prevSeq = opts.previous.chain?.sequence;
+      if (typeof prevSeq !== 'number' || receipt.chain.sequence !== prevSeq + 1) {
+        errors.push(`chain.sequence mismatch: expected ${typeof prevSeq === 'number' ? prevSeq + 1 : '(previous has no chain)'}, got ${receipt.chain.sequence}`);
+      }
+    }
+  }
   if (receipt.chain) {
     if (receipt.chain.previous_receipt_hash && receipt.chain.sequence === 0) {
       warnings.push('chain.sequence is 0 but previous_receipt_hash is non-null');

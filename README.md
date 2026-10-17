@@ -47,7 +47,7 @@ if (result.valid) {
 6. **Revocation** — fetch `https://tunnelmind.ai/.well-known/receipt-revocations.json`:
    - if `signature.key_id` is revoked AND the receipt was signed after `revoked_at`, reject
    - if `receipt_id` is in `revoked_receipts`, reject
-7. **Chain sanity** — warn (not reject) if `chain.sequence` and `previous_receipt_hash` are inconsistent
+7. **Chain sanity** — warn (not reject) if `chain.sequence` and `previous_receipt_hash` are inconsistent. Pass `previous` (the prior receipt) to make it a hard check: `previous_receipt_hash` must equal the `0x`-prefixed SHA-256 of the JCS-canonical previous receipt and `sequence` must be its sequence + 1
 
 The first 3 checks are pure-crypto and require no network. Checks 4-6 fetch well-known feeds, which can be disabled or pre-loaded.
 

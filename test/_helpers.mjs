@@ -48,6 +48,7 @@ export async function makeReceipt({
   lens    = 'tracker',
   endpoint = '/v1/test/echo',
   attestationStrength = 'software',
+  chain = { previous_receipt_hash: null, sequence: 0 },
   kp,
   publicKeyB64,
 } = {}) {
@@ -66,7 +67,7 @@ export async function makeReceipt({
     attestation_strength: attestationStrength,
     payload_hash,
     payload,
-    chain: { previous_receipt_hash: null, sequence: 0 },
+    chain,
     signature: {
       algorithm: 'Ed25519',
       key_id: keyId,
