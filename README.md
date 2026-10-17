@@ -127,12 +127,14 @@ algorithms; node builtins only, zero library code):
 
 ```
 node scripts/verify-log.mjs sth         <sth.json> <public_key_b64>
-node scripts/verify-log.mjs inclusion   <proof.json> [sth.json]
+node scripts/verify-log.mjs inclusion   <proof.json> [sth.json] --key <b64> --receipt <receipt.json>
 node scripts/verify-log.mjs consistency <proof.json>
 ```
 
 `proof.json` / `sth.json` are exactly the `data` objects returned by
 `GET data.tunnelmind.ai/v1/receipts/log/{sth,proof,consistency}`.
+`inclusion` verifies the STH against the pinned `--key` (never the key the
+STH carries) and recomputes the leaf from the `--receipt` bytes.
 
 `docs/OPA-INTEGRATION.md` shows how a PDP consumes the signed bundle.
 
@@ -144,9 +146,15 @@ re-derives the verdict from receipt bytes with no call to TunnelMind
 re-derivation):
 
 ```
+node scripts/verify-verdict.mjs [--keys <bundle.json>] --log-key <b64> \
+  --witness-keys <file.json|b64,b64> <receipt.json|->
 curl -s https://data.tunnelmind.ai/v1/verdict/<key> \
-  | node scripts/verify-verdict.mjs -
+  | node scripts/verify-verdict.mjs --log-key <b64> --witness-keys <b64,b64> -
 ```
+
+Only pinned keys are trusted: `--keys` defaults to the bundle shipped in
+`dist/pinned-keys.js` (run `npm run build` first), and the checkpoint and
+witness checks fail unless `--log-key` / `--witness-keys` pin their keys.
 
 Its pure dependency chain lives in `scripts/verdict-lib/` — those modules
 are the spec (the service runs the same code).
