@@ -7,6 +7,7 @@ import {
   fetchRevocations,
   clearKeyCache,
   clearRevocationCache,
+  fetchKeyBundle,
   PINNED_KEY_BUNDLE,
   PINNED_KEYS_FETCHED_AT,
 } from '../dist/index.js';
@@ -298,6 +299,38 @@ test('keysUrl is fetched through the injected fetcher', async () => {
     revocations: makeRevocations(),
   });
   assert.equal(result.valid, true, result.errors.join('; '));
+});
+
+// ── R002: the key-bundle cache is per URL with a TTL ──
+
+test('two keysUrls served through one fetcher each verify against their own bundle', async () => {
+  reset();
+  const a = await makeReceipt();
+  const b = await makeReceipt();
+  const bundles = {
+    'https://a.example/keys.json': makeKeyBundle([{ key_id: a.keyId, algorithm: 'Ed25519', public_key: a.publicKeyB64 }]),
+    'https://b.example/keys.json': makeKeyBundle([{ key_id: b.keyId, algorithm: 'Ed25519', public_key: b.publicKeyB64 }]),
+  };
+  const fetcher = async (url) => new Response(JSON.stringify(bundles[url]));
+  for (const [url, { receipt }] of [['https://a.example/keys.json', a], ['https://b.example/keys.json', b]]) {
+    const result = await verifyReceipt(receipt, { keysUrl: url, fetcher, revocations: makeRevocations() });
+    assert.equal(result.valid, true, `${url}: ${result.errors.join('; ')}`);
+  }
+});
+
+test('ttlMs: 0 refetches the key bundle; the default TTL serves the cache', async () => {
+  reset();
+  let calls = 0;
+  const fetcher = async () => { calls++; return new Response(JSON.stringify(makeKeyBundle([]))); };
+  const url = 'https://ttl.example/keys.json';
+  await fetchKeyBundle({ url, fetcher, ttlMs: 0 });
+  await fetchKeyBundle({ url, fetcher, ttlMs: 0 });
+  assert.equal(calls, 2);
+  reset();
+  calls = 0;
+  await fetchKeyBundle({ url, fetcher });
+  await fetchKeyBundle({ url, fetcher });
+  assert.equal(calls, 1);
 });
 
 // ── V002: a failed bundle fetch is an error; offline uses the pinned bundle ──

@@ -385,6 +385,7 @@ export async function verifyReceipt(
 export { canonicalize, canonicalizeBytes };
 export {
   DEFAULT_KEYS_URL,
+  KEY_BUNDLE_CACHE_TTL_MS,
   fetchKeyBundle,
   resolveKey,
   keyUsableAt,

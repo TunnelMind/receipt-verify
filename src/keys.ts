@@ -2,8 +2,8 @@
 // fetch the well-known bundle, find the key whose key_id matches the
 // receipt's, and confirm its public_key equals the receipt's.
 //
-// This module fetches once per process and caches; pass `noCache: true`
-// to force a re-fetch. Production verifiers should mirror the well-known
+// Fetched bundles are cached per URL for KEY_BUNDLE_CACHE_TTL_MS (5 min);
+// pass `noCache: true` to force a re-fetch. Production verifiers should mirror the well-known
 // feed locally rather than hitting the network on every verify.
 
 export const DEFAULT_KEYS_URL =
@@ -37,13 +37,18 @@ export interface KeyBundle {
   rotation_policy?: unknown;
 }
 
-let _cache: { bundle: KeyBundle; fetchedAt: number } | null = null;
+// Keyed by URL so one issuer's bundle is never served for another; entries
+// expire so a rotated key is picked up within the TTL.
+export const KEY_BUNDLE_CACHE_TTL_MS = 5 * 60 * 1000;
+const _cache = new Map<string, { bundle: KeyBundle; fetchedAt: number }>();
 
 export interface ResolveKeyOptions {
   /** Override the well-known URL (e.g., for self-hosted issuers). */
   url?: string;
   /** If true, bypass the in-memory cache and re-fetch. */
   noCache?: boolean;
+  /** Max age of a cached bundle; default KEY_BUNDLE_CACHE_TTL_MS. */
+  ttlMs?: number;
   /** Provide a pre-fetched bundle (skip network entirely). */
   bundle?: KeyBundle;
   /** Custom fetch (e.g., for offline tests). */
@@ -52,8 +57,9 @@ export interface ResolveKeyOptions {
 
 export async function fetchKeyBundle(opts: ResolveKeyOptions = {}): Promise<KeyBundle> {
   if (opts.bundle) return opts.bundle;
-  if (!opts.noCache && _cache) return _cache.bundle;
   const url = opts.url ?? DEFAULT_KEYS_URL;
+  const hit = _cache.get(url);
+  if (!opts.noCache && hit && Date.now() - hit.fetchedAt < (opts.ttlMs ?? KEY_BUNDLE_CACHE_TTL_MS)) return hit.bundle;
   const f = opts.fetcher ?? fetch;
   const r = await f(url);
   if (!r.ok) throw new Error(`fetchKeyBundle: ${url} returned ${r.status}`);
@@ -61,7 +67,7 @@ export async function fetchKeyBundle(opts: ResolveKeyOptions = {}): Promise<KeyB
   if (!j || !Array.isArray(j.keys)) {
     throw new Error('fetchKeyBundle: response missing `keys` array');
   }
-  _cache = { bundle: j, fetchedAt: Date.now() };
+  _cache.set(url, { bundle: j, fetchedAt: Date.now() });
   return j;
 }
 
@@ -72,7 +78,7 @@ export function resolveKey(bundle: KeyBundle, keyId: string): SigningKeyEntry | 
 /** Reset the module-level key cache. Useful for tests + long-lived workers
  *  doing scheduled key refresh. */
 export function clearKeyCache(): void {
-  _cache = null;
+  _cache.clear();
 }
 
 /** Why `entry` may not sign a receipt issued at `tsMs`, or null if it may.
