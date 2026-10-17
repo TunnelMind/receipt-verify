@@ -41,17 +41,29 @@ if (result.valid) {
 
 1. **Version** — `receipt_version === "1.0"` (verifiers MUST reject unknown majors)
 2. **Payload hash** — recompute `0x + hex(SHA-256(JCS(payload)))`, compare to `payload_hash`
-3. **Signature** — reconstruct the signing object (§3 step 2), JCS-canonicalize, verify Ed25519 against the embedded `signature.public_key`
-4. **Key bundle resolution** — fetch `https://tunnelmind.ai/.well-known/receipt-signing-key.json`, confirm the resolved key's `public_key` matches the receipt's
-5. **Attestation-strength ceiling** — reject if `receipt.attestation_strength` exceeds the resolved key's declared strength
-6. **Revocation** — fetch `https://tunnelmind.ai/.well-known/receipt-revocations.json`:
-   - if `signature.key_id` is revoked AND the receipt was signed after `revoked_at`, reject
+3. **Key resolution** — `signature.key_id` must be a non-empty string. It is looked up in a key bundle: `opts.keys` if given, else a fetch of `keysUrl` if given, else the pinned bundle `PINNED_KEY_BUNDLE` shipped in `dist/pinned-keys.js`. An unknown `key_id` or a failed bundle fetch is an error. The key must be `active` or `rotated` and the receipt's `timestamp` must fall inside its `[created_at, rotation_after]` window. The receipt's embedded `signature.public_key` is only compared against the bundle key (a mismatch is an error); it is never used to verify
+4. **Signature** — reconstruct the signing object (§3 step 2), JCS-canonicalize, verify Ed25519 against the bundle key from step 3
+5. **Attestation-strength ceiling** — reject if `receipt.attestation_strength` exceeds the bundle key's declared strength
+6. **Revocation** — use `opts.revocations`, else fetch `https://tunnelmind.ai/.well-known/receipt-revocations.json` (a failed fetch is an error):
+   - if `signature.key_id` (or the key that actually verified, see `allowKeyMismatch`) is revoked for `compromise`, reject whatever the receipt's timestamp
+   - if it is revoked for another reason AND the receipt was signed after `revoked_at`, reject (signed before: warning)
    - if `receipt_id` is in `revoked_receipts`, reject
 7. **Chain sanity** — warn (not reject) if `chain.sequence` and `previous_receipt_hash` are inconsistent. Pass `previous` (the prior receipt) to make it a hard check: `previous_receipt_hash` must equal the `0x`-prefixed SHA-256 of the JCS-canonical previous receipt and `sequence` must be its sequence + 1
 
-The first 3 checks are pure-crypto and require no network. Checks 4-6 fetch well-known feeds, which can be disabled or pre-loaded.
+Checks 1-5 need no network by default: the key bundle is the pinned one unless you pass `keysUrl`. Check 6 fetches the revocation feed unless you pass `revocations`; it can only be turned off with `unsafeSkipRevocations`.
 
 ## Offline + pinned modes
+
+### Key pinning
+
+Trust comes only from pinned keys, never from a key the receipt (or log
+checkpoint, or cosignature) carries. The pinned keys are:
+
+- the bundle shipped with the package (`PINNED_KEY_BUNDLE` in `dist/pinned-keys.js`), used by default;
+- a bundle you pass as `opts.keys` (or fetch from a `keysUrl` you choose);
+- for the CLIs: `--keys` (`verify-verdict.mjs`, defaults to the shipped bundle), `--key` (`verify-log.mjs inclusion`), `--log-key` and `--witness-keys` (`verify-verdict.mjs`).
+
+### Pre-fetched feeds
 
 For high-throughput or air-gapped verifiers, pre-fetch the well-known feeds and pass them in:
 
@@ -63,18 +75,25 @@ const [keys, revocations] = await Promise.all([fetchKeyBundle(), fetchRevocation
 const result = await verifyReceipt(receipt, { keys, revocations });
 ```
 
-For fully-offline verification (pure crypto + embedded public_key only):
+### Fully offline
+
+`noFetchKeys: true` uses the pinned bundle (or `opts.keys`) and never touches
+the network for keys. Revocation still needs a feed: pass one you fetched
+earlier.
 
 ```ts
 const result = await verifyReceipt(receipt, {
   noFetchKeys: true,
-  noFetchRevocations: true,
+  revocations, // pre-fetched RevocationFeed
 });
 ```
 
+`unsafeSkipRevocations: true` turns revocation checking off instead. It is
+**unsafe**: a receipt signed by a revoked or compromised key then verifies.
+
 ## Rotation-overlap mode
 
-When the issuer rotates a key, both the old and new key are live for ~24h. During that window, accept a key-bundle mismatch as a warning:
+When the issuer rotates a key, both the old and new key are live for ~24h. A receipt may then name one `key_id` while embedding the other key's `public_key`. `allowKeyMismatch` accepts that (with a warning naming both key_ids) only if the embedded `public_key` is another entry in the same bundle that is `active`/`rotated` and whose `[created_at, rotation_after]` window covers the receipt's timestamp; the signature is verified against that bundle entry. It never rescues a `key_id` missing from the bundle, and never accepts a key that is not in the bundle. The revocation check covers both the named `key_id` and the key that actually verified:
 
 ```ts
 const result = await verifyReceipt(receipt, { allowKeyMismatch: true });
@@ -101,13 +120,14 @@ interface VerifyResult {
 
 | Option | Default | Purpose |
 |---|---|---|
-| `keys` | (fetched) | Pre-fetched `KeyBundle` to skip the network |
-| `noFetchKeys` | `false` | Skip key-bundle resolution entirely |
-| `keysUrl` | `tunnelmind.ai/.well-known/receipt-signing-key.json` | Self-hosted issuer override |
-| `revocations` | (fetched) | Pre-fetched `RevocationFeed` |
-| `noFetchRevocations` | `false` | Skip revocation check entirely |
-| `revocationsUrl` | `tunnelmind.ai/.well-known/receipt-revocations.json` | Self-hosted issuer override |
-| `allowKeyMismatch` | `false` | Demote key-mismatch error → warning |
+| `keys` | `PINNED_KEY_BUNDLE` | Key bundle to resolve `key_id` against; takes precedence over `keysUrl` |
+| `noFetchKeys` | `false` | Never fetch `keysUrl`; fall back to the pinned bundle (or `keys`) |
+| `keysUrl` | (none: pinned bundle) | Fetch the key bundle from this URL (e.g., self-hosted issuer); a failed fetch is an error |
+| `revocations` | (fetched) | Pre-fetched `RevocationFeed`; offline callers pass this |
+| `unsafeSkipRevocations` | `false` | **UNSAFE**: disable revocation checking, so revoked or compromised keys verify |
+| `revocationsUrl` | `tunnelmind.ai/.well-known/receipt-revocations.json` | Self-hosted issuer override; a failed fetch is an error |
+| `allowKeyMismatch` | `false` | Accept (with a warning) an embedded `public_key` that is another usable entry in the same bundle; see Rotation-overlap mode |
+| `previous` | (none) | The prior receipt; makes the chain check hard (hash link + `sequence` + 1) |
 | `fetcher` | `globalThis.fetch` | Custom fetch (e.g., for tests) |
 
 ### Lower-level exports
@@ -116,9 +136,9 @@ interface VerifyResult {
 
 ## Verifying receipts you didn't issue
 
-Receipts are designed to be verifiable by anyone — the public key is embedded in the receipt and validated against TunnelMind's published key bundle. You don't need credentials, an account, or any prior relationship with the issuer.
+Receipts are designed to be verifiable by anyone — the receipt names its signing key by `key_id`, and the verifier checks the signature against that key in a pinned bundle (the receipt's embedded public key is only compared, never trusted). You don't need credentials, an account, or any prior relationship with the issuer.
 
-That said: the key bundle and revocation feed must be retrievable from a source you trust. The defaults point to `tunnelmind.ai`; for receipts issued by another producer, point `keysUrl` / `revocationsUrl` at the producer's well-known endpoints.
+That said: the key bundle and revocation feed must come from a source you trust. The defaults are the bundle pinned in this package and the `tunnelmind.ai` revocation feed; for receipts issued by another producer, pass their bundle as `keys` (or point `keysUrl` / `revocationsUrl` at the producer's well-known endpoints).
 
 ## Verifying the transparency log (`scripts/verify-log.mjs`)
 
@@ -161,7 +181,21 @@ are the spec (the service runs the same code).
 
 ## Spec drift
 
-The JCS canonicalizer in `src/jcs.ts` is **bit-identical** to the issuer-side serializers in `scry-server/src/lib/receipt_v1.js` and `tunnelmind-data-api/api/utils/receipt-v1.js`. Any change to one MUST be mirrored across all three. The frozen wire vector lives in this package's `test/golden.test.js` to catch silent drift.
+The JCS canonicalizer in `src/jcs.ts` is **bit-identical** to the issuer-side serializers in `scry-server/src/lib/receipt_v1.js` and `tunnelmind-data-api/api/utils/receipt-v1.js`. Any change to one MUST be mirrored across all three. The JCS tests live in `test/verify.test.mjs` (with the shared helpers in `test/_helpers.mjs`); there is no frozen cross-implementation wire vector yet.
+
+## Migrating from 1.x to 2.0.0
+
+2.0.0 closes trust gaps; each item below can turn a receipt that 1.x accepted
+into a rejection. See `CHANGELOG.md`.
+
+- **The key is looked up by `key_id` and pinned.** `signature.key_id` is required. The signature is verified against the bundle key (`keys` > `keysUrl` > the shipped `PINNED_KEY_BUNDLE`), which must be active/rotated and inside its validity window. The embedded `public_key` is no longer verified against; a mismatch is an error.
+- **A failed key-bundle fetch is an error**, not a warning.
+- **`allowKeyMismatch` is narrower**: it only accepts another usable entry of the same bundle, matched by `public_key`.
+- **The 1.x option that skipped the revocation fetch is now `unsafeSkipRevocations`** (named for what it does). Offline callers should pass `revocations` instead.
+- **A failed revocation-feed fetch is an error.** A key revoked for `compromise` rejects regardless of the receipt's timestamp.
+- **The CLIs trust pinned keys only.** `verify-log.mjs inclusion` requires `--key`, `--receipt` and an STH; `verify-verdict.mjs` needs `--log-key` and `--witness-keys` for the checkpoint and witness checks, and verifies the issuer against `--keys` (default: the shipped bundle).
+- **JCS rejects lone surrogates** (1.x silently mapped them to U+FFFD); such a payload fails canonicalization.
+- **New: `previous` makes a hard chain check** (opt-in): with it, `previous_receipt_hash` and `sequence` mismatches are errors; without it the chain checks stay warnings.
 
 ## License
 

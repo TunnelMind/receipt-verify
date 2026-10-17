@@ -1,6 +1,6 @@
 {
   "name": "@tunnelmindai/receipt-verify",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Reference verifier for the TunnelMind Receipt Format v1.0. Offline Ed25519 + JCS verification, key-bundle resolution, and revocation checking against the well-known feed. Zero runtime dependencies; runs on Node ≥18, Cloudflare Workers, Deno, Bun.",
   "type": "module",
   "main": "./dist/index.js",
@@ -15,6 +15,7 @@
     "dist",
     "src",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
