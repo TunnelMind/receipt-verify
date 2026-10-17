@@ -172,8 +172,7 @@ test('CLIs: self-signed verdict exits 1; inclusion needs a pinned key; forged ST
   assert.equal(run('scripts/verify-verdict.mjs', ['--bogus', rPath]), 2);
   assert.equal(run('scripts/verify-verdict.mjs', []), 2);
 
-  const { self_verification, ...bare } = v.receipt;
-  const root = leafHash(Buffer.from(jcs(bare))).toString('hex');
+  const root = leafHash(Buffer.from(jcs(v.receipt))).toString('hex');
   const proof = { leaf_index: 0, tree_size: 1, audit_path: [], root_hash: root, leaf_hash: root };
   const pinned = await makeEphemeralKey();
   const attacker = await makeEphemeralKey();
@@ -191,4 +190,21 @@ test('CLIs: self-signed verdict exits 1; inclusion needs a pinned key; forged ST
   const lying = { leaf_index: 0, tree_size: 1, audit_path: [], root_hash: other, leaf_hash: other };
   const lyingPath = f('lying.json', { ...lying, sth: await makeSth(pinned, lying) });
   assert.equal(run('scripts/verify-log.mjs', ['inclusion', lyingPath, '--key', pinned.publicKeyB64, '--receipt', rPath]), 1);
+});
+
+// R004 — the ledger leaf is JCS of the exact logged document, and verdict
+// receipts are logged carrying self_verification. Nothing may be stripped.
+test('CLI inclusion hashes the receipt as supplied, self_verification included', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cli-test-'));
+  const f = (name, obj) => { const p = join(dir, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+  const { receipt } = await makeVerdict();
+  assert.ok(receipt.self_verification);
+  const root = leafHash(Buffer.from(jcs(receipt))).toString('hex');
+  const proof = { leaf_index: 0, tree_size: 1, audit_path: [], root_hash: root, leaf_hash: root };
+  const pinned = await makeEphemeralKey();
+  const proofPath = f('proof.json', { ...proof, sth: await makeSth(pinned, proof) });
+  const { self_verification, ...bare } = receipt;
+  const incl = (r) => run('scripts/verify-log.mjs', ['inclusion', proofPath, '--key', pinned.publicKeyB64, '--receipt', r]);
+  assert.equal(incl(f('full.json', receipt)), 0);
+  assert.equal(incl(f('bare.json', bare)), 1);
 });

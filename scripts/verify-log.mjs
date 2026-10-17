@@ -22,7 +22,9 @@
 // inclusion trusts nothing the proof carries: the STH (arg 2, else proof.sth)
 // must verify under the pinned --key (never sth.signature.public_key) and match
 // the proof's root_hash/tree_size, and the leaf is recomputed from the receipt
-// bytes, leafHash(jcs(receipt minus self_verification)) — the proof's
+// bytes, leafHash(jcs(receipt)) — the receipt exactly as supplied, nothing
+// stripped, matching the sequencer's `leaf = SHA-256(0x00 || JCS(receipt))`
+// (verdict receipts are logged with their self-verification triple) — the proof's
 // leaf_hash is ignored. Missing --key, --receipt or an STH exits 2.
 
 import { createHash, verify as edVerify, createPublicKey } from 'node:crypto';
@@ -145,10 +147,9 @@ function main() {
     // Accept a bare receipt, a { receipt }, or a /v1/verdict-style response.
     let receipt = unwrap(load(values.receipt));
     if (receipt.receipt) receipt = receipt.receipt;
-    const { self_verification, ...bare } = receipt;
     const okIncl = verifyInclusion({
       leafIndex: p.leaf_index, treeSize: p.tree_size,
-      leaf: leafHash(Buffer.from(jcs(bare))), path: p.audit_path.map(unhex), root: unhex(p.root_hash),
+      leaf: leafHash(Buffer.from(jcs(receipt))), path: p.audit_path.map(unhex), root: unhex(p.root_hash),
     });
     const okSig = verifySth(sth, values.key)
       && sth.root_hash === p.root_hash && sth.tree_size === p.tree_size;
