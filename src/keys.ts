@@ -74,3 +74,27 @@ export function resolveKey(bundle: KeyBundle, keyId: string): SigningKeyEntry | 
 export function clearKeyCache(): void {
   _cache = null;
 }
+
+/** Why `entry` may not sign a receipt issued at `tsMs`, or null if it may.
+ *  A usable key has status active or rotated (a missing status counts as
+ *  active, so bare pinned/test bundles keep working) and a window
+ *  [created_at, rotation_after] covering the timestamp; a missing bound is
+ *  unbounded on that side. Past rotation_after is rejected even for a
+ *  'rotated' key: the window, not the status, says when it signed. */
+export function keyUsableAt(entry: SigningKeyEntry, tsMs: number): string | null {
+  const status = entry.status ?? 'active';
+  if (status !== 'active' && status !== 'rotated') {
+    return `key ${entry.key_id} status is ${status}`;
+  }
+  if (entry.created_at !== undefined) {
+    const from = Date.parse(entry.created_at);
+    if (!Number.isFinite(from)) return `key ${entry.key_id} created_at is not a valid date`;
+    if (tsMs < from) return `receipt timestamp precedes key ${entry.key_id} created_at ${entry.created_at}`;
+  }
+  if (entry.rotation_after !== undefined) {
+    const until = Date.parse(entry.rotation_after);
+    if (!Number.isFinite(until)) return `key ${entry.key_id} rotation_after is not a valid date`;
+    if (tsMs > until) return `receipt timestamp is after key ${entry.key_id} rotation_after ${entry.rotation_after}`;
+  }
+  return null;
+}

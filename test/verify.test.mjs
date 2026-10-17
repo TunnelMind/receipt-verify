@@ -343,3 +343,127 @@ test('noFetchKeys with keysUrl never calls the fetcher and resolves against the 
   assert.ok(result.errors.some((e) => e.includes('does not match')));
   assert.ok(result.errors.some((e) => e.includes('signature did not verify')));
 });
+
+// V003: allowKeyMismatch only switches to ANOTHER usable key in the bundle,
+// matched by the receipt's embedded public_key; key windows always apply.
+const DAY = 24 * 3600 * 1000;
+const iso = (ms) => new Date(ms).toISOString();
+
+async function mismatchCase(bEntryExtra = {}, { includeB = true, revocations = makeRevocations() } = {}) {
+  const a = await makeEphemeralKey();
+  const b = await makeEphemeralKey();
+  // Signed by B, embeds B's public_key, but names key A.
+  const { receipt } = await makeReceipt({ keyId: 'key-a', kp: b.kp, publicKeyB64: b.publicKeyB64 });
+  const keys = [{ key_id: 'key-a', algorithm: 'Ed25519', public_key: a.publicKeyB64 }];
+  if (includeB) {
+    keys.push({ key_id: 'key-b', algorithm: 'Ed25519', public_key: b.publicKeyB64, status: 'active', ...bEntryExtra });
+  }
+  return verifyReceipt(receipt, {
+    keys: makeKeyBundle(keys),
+    revocations,
+    allowKeyMismatch: true,
+  });
+}
+
+test('allowKeyMismatch=true accepts a receipt whose public_key is another active bundle key, with a warning', async () => {
+  reset();
+  const result = await mismatchCase({
+    created_at: iso(Date.now() - DAY),
+    rotation_after: iso(Date.now() + DAY),
+  });
+  assert.equal(result.valid, true, result.errors.join('; '));
+  assert.ok(result.warnings.some((w) => w.includes('key-a') && w.includes('key-b')), result.warnings.join('; '));
+});
+
+test('allowKeyMismatch=true rejects when the other bundle key is revoked', async () => {
+  reset();
+  const result = await mismatchCase({ status: 'revoked' });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('does not match')));
+});
+
+test('allowKeyMismatch=true rejects when the other key\'s window ended before the receipt', async () => {
+  reset();
+  const result = await mismatchCase({ status: 'rotated', rotation_after: iso(Date.now() - DAY) });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('does not match')));
+});
+
+test('allowKeyMismatch=true rejects when the other key\'s window starts after the receipt', async () => {
+  reset();
+  const result = await mismatchCase({ created_at: iso(Date.now() + DAY) });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('does not match')));
+});
+
+test('allowKeyMismatch=true rejects an embedded public_key absent from the bundle', async () => {
+  reset();
+  const result = await mismatchCase({}, { includeB: false });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('does not match')));
+  assert.deepEqual(result.warnings, []);
+});
+
+async function windowCase(entryExtra) {
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt();
+  return verifyReceipt(receipt, {
+    keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, ...entryExtra }]),
+    revocations: makeRevocations(),
+  });
+}
+
+test('rejects a receipt issued before its key\'s created_at', async () => {
+  reset();
+  const result = await windowCase({ created_at: iso(Date.now() + DAY) });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('precedes')), result.errors.join('; '));
+});
+
+test('rejects a receipt issued after its key\'s rotation_after', async () => {
+  reset();
+  const result = await windowCase({ status: 'rotated', rotation_after: iso(Date.now() - DAY) });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('rotation_after')), result.errors.join('; '));
+});
+
+test('rejects a receipt signed by a key whose bundle status is revoked', async () => {
+  reset();
+  const result = await windowCase({ status: 'revoked' });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('status is revoked')), result.errors.join('; '));
+});
+
+test('a key whose window covers the receipt verifies (active and rotated)', async () => {
+  reset();
+  for (const status of ['active', 'rotated']) {
+    const result = await windowCase({
+      status,
+      created_at: iso(Date.now() - DAY),
+      rotation_after: iso(Date.now() + DAY),
+    });
+    assert.equal(result.valid, true, `${status}: ${result.errors.join('; ')}`);
+  }
+});
+
+test('rejects a receipt with an unparseable timestamp', async () => {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt();
+  receipt.timestamp = 'not-a-date';
+  const result = await verifyReceipt(receipt, {
+    keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64 }]),
+    revocations: makeRevocations(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('timestamp')));
+});
+
+test('allowKeyMismatch=true rejects when the other key is revoked in the feed', async () => {
+  reset();
+  const result = await mismatchCase({}, {
+    revocations: makeRevocations({
+      revoked_keys: [{ key_id: 'key-b', revoked_at: iso(Date.now() - DAY), reason: 'compromised' }],
+    }),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('signing key key-b revoked')), result.errors.join('; '));
+});
