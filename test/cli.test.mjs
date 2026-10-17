@@ -118,9 +118,86 @@ test('(e) cosigs that verify only against their embedded public_key fail', async
   const opts = { keys: v.keys };
   let r = await verifyReceipt(v.receipt, { ...opts, witnessKeys: [pinnedWitness.publicKeyB64] });
   assert.equal(check(r, 'witness_cosignatures').pass, false);
+  // No witnessKeys: defaults to the bundle, which holds only the issuer key.
   r = await verifyReceipt(v.receipt, opts);
   assert.equal(check(r, 'witness_cosignatures').pass, false);
+  r = await verifyReceipt(v.receipt, { ...opts, witnessKeys: [] });
+  assert.equal(check(r, 'witness_cosignatures').pass, false);
   assert.equal(check(r, 'witness_cosignatures').detail, 'no pinned witness keys');
+});
+
+// R005 — with no witnessKeys / logKey, the usable `keys` entries are the default
+// pins, matched by key_id. Keys carried in the receipt still count for nothing.
+const withWitness = (v, entry) => makeKeyBundle([...v.keys.keys,
+  { key_id: 'w1', algorithm: 'Ed25519', public_key: v.witness.publicKeyB64, ...entry }]);
+
+test('R005: witness key defaults to a usable bundle entry with the cosig key_id', async () => {
+  const v = await makeVerdict();
+  const r = await verifyReceipt(v.receipt, { keys: withWitness(v) });
+  assert.equal(r.ok, true, JSON.stringify(r.checks));
+  // An explicit pin still wins over the default.
+  const attacker = await makeEphemeralKey();
+  const r2 = await verifyReceipt(v.receipt, { keys: withWitness(v), witnessKeys: [attacker.publicKeyB64] });
+  assert.equal(check(r2, 'witness_cosignatures').pass, false);
+});
+
+test('R005: a cosigner not in the bundle, or under a bundle key_id it does not own, fails by default', async () => {
+  const v = await makeVerdict();
+  const attacker = await makeEphemeralKey();
+  // Forged cosig: attacker signs, names key_id w1, embeds their own key.
+  const cosig = v.receipt.self_verification.witness_cosignatures[0];
+  cosig.public_key = attacker.publicKeyB64;
+  cosig.value = await sign(attacker.kp, canonicalizeBytes(v.receipt.self_verification.checkpoint));
+  let r = await verifyReceipt(v.receipt, { keys: withWitness(v) });
+  assert.equal(check(r, 'witness_cosignatures').pass, false);
+  // Bundle without the witness: the real cosig fails too.
+  r = await verifyReceipt((await makeVerdict()).receipt, { keys: v.keys });
+  assert.equal(check(r, 'witness_cosignatures').pass, false);
+});
+
+test('R005: revoked / expired-status bundle entries are not default pins', async () => {
+  for (const status of ['revoked', 'expired']) {
+    const v = await makeVerdict();
+    const r = await verifyReceipt(v.receipt, { keys: withWitness(v, { status }) });
+    assert.equal(check(r, 'witness_cosignatures').pass, false, status);
+  }
+  const v = await makeVerdict();
+  const r = await verifyReceipt(v.receipt, { keys: withWitness(v, { status: 'rotated' }) });
+  assert.equal(check(r, 'witness_cosignatures').pass, true);
+});
+
+test('R005: checkpoint signature defaults to the bundle key with its key_id', async () => {
+  const signCp = async (v, signer, key_id, status) => {
+    const sv = v.receipt.self_verification;
+    const cpBody = sv.checkpoint;
+    sv.checkpoint = { ...cpBody, signature: { algorithm: 'Ed25519', key_id, value: await sign(signer.kp, canonicalizeBytes(cpBody)) } };
+    sv.witness_cosignatures[0].value = await sign(v.witness.kp, canonicalizeBytes(sv.checkpoint));
+    return makeKeyBundle([...withWitness(v).keys,
+      { key_id: 'log1', algorithm: 'Ed25519', public_key: log.publicKeyB64, ...(status && { status }) }]);
+  };
+  const log = await makeEphemeralKey();
+  const attacker = await makeEphemeralKey();
+  let v = await makeVerdict();
+  let keys = await signCp(v, log, 'log1');
+  let r = await verifyReceipt(v.receipt, { keys });
+  assert.equal(r.ok, true, JSON.stringify(r.checks));
+  // An explicit logKey overrides the default.
+  r = await verifyReceipt(v.receipt, { keys, logKey: attacker.publicKeyB64 });
+  assert.equal(check(r, 'checkpoint_signature').pass, false);
+  // Signer outside the bundle, claiming the bundle's key_id or an unknown one.
+  for (const kid of ['log1', 'nope', undefined]) {
+    v = await makeVerdict();
+    keys = await signCp(v, attacker, kid);
+    r = await verifyReceipt(v.receipt, { keys });
+    assert.equal(check(r, 'checkpoint_signature').pass, false, String(kid));
+    assert.equal(r.ok, false);
+  }
+  // A revoked log key is not a default pin.
+  v = await makeVerdict();
+  keys = await signCp(v, log, 'log1', 'revoked');
+  r = await verifyReceipt(v.receipt, { keys });
+  assert.equal(check(r, 'checkpoint_signature').pass, false);
+  assert.equal(check(r, 'checkpoint_signature').detail, 'checkpoint is signed but no pinned log key');
 });
 
 // ── verify-log.mjs ───────────────────────────────────────────────────────────

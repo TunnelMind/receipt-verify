@@ -10,6 +10,8 @@
  * Trust anchors come only from the caller (V004): any public key carried inside
  * the receipt is attacker-controlled — anyone can embed their own key and sign —
  * so it is at most compared against a pinned key, never verified against.
+ * When the caller pins no witness or log key, both default to the usable
+ * (active/rotated) entries of the issuer bundle, matched by key_id.
  *
  * Pure: uses globalThis.crypto + the same reconcile()/Merkle code the service
  * runs. No fetch, no env, no Worker bindings. The default issuer bundle and the
@@ -44,12 +46,20 @@ const normWitness = (list) => (Array.isArray(list) ? list : [])
  * @param {object} [opts]
  * @param {object} [opts.keys] — issuer KeyBundle; defaults to the shipped pinned bundle
  * @param {string} [opts.logKey] — base64 raw Ed25519 key; only used when the
- *   checkpoint carries its own `signature` (the witness cosig is the checkpoint proof)
+ *   checkpoint carries its own `signature` (the witness cosig is the checkpoint proof).
+ *   Default: the usable `keys` entries whose key_id equals signature.key_id.
  * @param {Array<string|{key_id?:string,public_key:string}>} [opts.witnessKeys]
+ *   Default: the usable `keys` entries, matched by cosig key_id. An explicit
+ *   value (even []) replaces the default.
  * @returns {Promise<{ ok: boolean, checks: Array<{check,pass,detail}> }>}
  */
 export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey, witnessKeys } = {}) {
   const checks = [];
+  // Default log/witness trust anchors: the bundle's usable entries (status
+  // active or rotated; missing = active, as keyUsableAt). Revoked keys never count.
+  const defaultPinned = (keys && Array.isArray(keys.keys) ? keys.keys : [])
+    .filter((k) => k && typeof k.public_key === 'string' && ['active', 'rotated'].includes(k.status ?? 'active'))
+    .map((k) => ({ key_id: k.key_id, public_key: k.public_key }));
   const add = (check, pass, detail) => checks.push({ check, pass, detail });
 
   if (!receipt || typeof receipt !== 'object' || !receipt.signature) {
@@ -106,23 +116,29 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
     // That pinned-witness check is the checkpoint proof and always runs. A
     // checkpoint that DOES carry its own signature (the STH scheme of
     // scripts/verify-log.mjs verifySth: Ed25519 over JCS(checkpoint minus
-    // `signature`)) must also verify against the pinned --log-key.
+    // `signature`)) must also verify against the pinned --log-key, or by
+    // default a usable bundle key with the signature's key_id.
     const cp = sv.checkpoint;
     if (cp.signature !== undefined) {
       const { signature, ...cpBody } = cp;
-      if (!logKey) {
+      const logKeys = logKey !== undefined ? [logKey].filter(Boolean)
+        : defaultPinned.filter((k) => !signature?.key_id || k.key_id === signature.key_id).map((k) => k.public_key);
+      if (logKeys.length === 0) {
         add('checkpoint_signature', false, 'checkpoint is signed but no pinned log key');
       } else if (!signature || signature.algorithm !== 'Ed25519' || !signature.value) {
         add('checkpoint_signature', false, 'checkpoint signature malformed');
       } else {
-        const okCp = await ed25519Verify(logKey, signature.value, canonicalizeBytes(cpBody));
+        let okCp = false;
+        for (const k of logKeys) {
+          if (await ed25519Verify(k, signature.value, canonicalizeBytes(cpBody))) { okCp = true; break; }
+        }
         add('checkpoint_signature', okCp, okCp ? undefined : 'does not verify against pinned log key');
       }
     }
 
     // Witness cosignatures: each must verify under a PINNED witness key (by
     // key_id when the cosig names one; a pinned key without key_id matches any).
-    const pinned = normWitness(witnessKeys);
+    const pinned = witnessKeys === undefined ? defaultPinned : normWitness(witnessKeys);
     const cosigs = Array.isArray(sv.witness_cosignatures) ? sv.witness_cosignatures : [];
     const cpBytes = canonicalizeBytes(cp);
     if (pinned.length === 0) {

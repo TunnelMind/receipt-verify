@@ -61,7 +61,7 @@ checkpoint, or cosignature) carries. The pinned keys are:
 
 - the bundle shipped with the package (`PINNED_KEY_BUNDLE` in `dist/pinned-keys.js`), used by default;
 - a bundle you pass as `opts.keys` (or fetch from a `keysUrl` you choose);
-- for the CLIs: `--keys` (`verify-verdict.mjs`, defaults to the shipped bundle), `--key` (`verify-log.mjs inclusion`), `--witness-keys` and the optional `--log-key` (`verify-verdict.mjs`).
+- for the CLIs: `--keys` (`verify-verdict.mjs`, defaults to the shipped bundle), `--key` (`verify-log.mjs inclusion`), `--witness-keys` and `--log-key` (`verify-verdict.mjs`, both default to the active/rotated entries of `--keys`, matched by `key_id`).
 
 ### Pre-fetched feeds
 
@@ -167,16 +167,18 @@ re-derivation):
 
 ```
 node scripts/verify-verdict.mjs [--keys <bundle.json>] [--log-key <b64>] \
-  --witness-keys <file.json|b64,b64> <receipt.json|->
+  [--witness-keys <file.json|b64,b64>] <receipt.json|->
 curl -s https://data.tunnelmind.ai/v1/verdict/<key> \
-  | node scripts/verify-verdict.mjs --witness-keys <b64,b64> -
+  | node scripts/verify-verdict.mjs -
 ```
 
 Only pinned keys are trusted: `--keys` defaults to the bundle shipped in
 `dist/pinned-keys.js` (run `npm run build` first). The checkpoint root is
-proven by the witness cosignature over the canonical checkpoint, which fails
-unless `--witness-keys` pins the witness key. `--log-key` is optional: it is
-only used (and then required) when the checkpoint carries its own `signature`.
+proven by the witness cosignature over the canonical checkpoint. When absent,
+`--witness-keys` and `--log-key` default to the active/rotated entries of
+`--keys` (the shipped bundle by default), matched by `key_id`; explicit flags
+override. A cosigner or checkpoint signer outside them fails. The log key is
+only used when the checkpoint carries its own `signature`.
 
 Its pure dependency chain lives in `scripts/verdict-lib/` — those modules
 are the spec (the service runs the same code).
@@ -195,7 +197,7 @@ into a rejection. See `CHANGELOG.md`.
 - **`allowKeyMismatch` is narrower**: it only accepts another usable entry of the same bundle, matched by `public_key`.
 - **The 1.x option that skipped the revocation fetch is now `unsafeSkipRevocations`** (named for what it does). Offline callers should pass `revocations` instead.
 - **A failed revocation-feed fetch is an error.** A key revoked for `compromise` rejects regardless of the receipt's timestamp.
-- **The CLIs trust pinned keys only.** `verify-log.mjs inclusion` requires `--key`, `--receipt` and an STH; `verify-verdict.mjs` needs `--witness-keys` (the witness cosignature is the checkpoint proof; `--log-key` only when the checkpoint carries its own signature), and verifies the issuer against `--keys` (default: the shipped bundle).
+- **The CLIs trust pinned keys only.** `verify-log.mjs inclusion` requires `--key`, `--receipt` and an STH; `verify-verdict.mjs` verifies the issuer against `--keys` (default: the shipped bundle) and the witness cosignature (the checkpoint proof) and any checkpoint signature against `--witness-keys` / `--log-key`, which default to the active/rotated `--keys` entries matched by `key_id`.
 - **JCS rejects lone surrogates** (1.x silently mapped them to U+FFFD); such a payload fails canonicalization.
 - **New: `previous` makes a hard chain check** (opt-in): with it, `previous_receipt_hash` and `sequence` mismatches are errors; without it the chain checks stay warnings.
 
