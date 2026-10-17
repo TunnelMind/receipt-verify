@@ -298,3 +298,48 @@ test('keysUrl is fetched through the injected fetcher', async () => {
   });
   assert.equal(result.valid, true, result.errors.join('; '));
 });
+
+// ── V002: a failed bundle fetch is an error; offline uses the pinned bundle ──
+
+test('PoC C: keysUrl fetch that throws makes the receipt invalid (error, not warning)', async () => {
+  reset();
+  const { receipt } = await makeReceipt({ keyId: PINNED_KEY_ID });
+  const result = await verifyReceipt(receipt, {
+    keysUrl: 'https://example.test/k.json',
+    fetcher: async () => { throw new Error('boom'); },
+    revocations: makeRevocations(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('key bundle fetch failed') && e.includes('boom')),
+    result.errors.join('; '));
+  assert.ok(!result.warnings.some((w) => w.includes('fetch')), result.warnings.join('; '));
+});
+
+test('keysUrl returning HTTP 500 makes the receipt invalid', async () => {
+  reset();
+  const { receipt } = await makeReceipt({ keyId: PINNED_KEY_ID });
+  const result = await verifyReceipt(receipt, {
+    keysUrl: 'https://example.test/k.json',
+    fetcher: async () => new Response('', { status: 500 }),
+    revocations: makeRevocations(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.includes('key bundle fetch failed') && e.includes('500')),
+    result.errors.join('; '));
+  assert.ok(!result.warnings.some((w) => w.includes('fetch')), result.warnings.join('; '));
+});
+
+test('noFetchKeys with keysUrl never calls the fetcher and resolves against the pinned bundle', async () => {
+  reset();
+  const { receipt } = await makeReceipt({ keyId: PINNED_KEY_ID });
+  const result = await verifyReceipt(receipt, {
+    keysUrl: 'https://example.test/k.json',
+    noFetchKeys: true,
+    fetcher: failingFetcher(),
+    revocations: makeRevocations(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(!result.errors.some((e) => e.includes('fetch')), result.errors.join('; '));
+  assert.ok(result.errors.some((e) => e.includes('does not match')));
+  assert.ok(result.errors.some((e) => e.includes('signature did not verify')));
+});
