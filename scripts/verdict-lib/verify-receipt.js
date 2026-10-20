@@ -23,7 +23,7 @@ import { verifyInclusion, leafHash } from './log.js';
 import { canonicalize, canonicalizeBytes } from './jcs.js';
 import { sha256HexPrefixed, b64ToBytes } from './hash.js';
 import { PINNED_KEY_BUNDLE } from '../../dist/pinned-keys.js';
-import { resolveKey, keyUsableAt } from '../../dist/keys.js';
+import { verifyReceipt as verifyEnvelope } from '../../dist/index.js';
 
 const subtle = globalThis.crypto.subtle;
 
@@ -67,30 +67,19 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
     return { ok: false, checks };
   }
 
-  // 1. receipt signature — over canonical(receipt minus payload & self_verification),
-  //    signature.value blank (mirrors wrapReceipt's signing object exactly).
-  //    Verified against the BUNDLE key for signature.key_id (same rules as
-  //    src/index.ts verifyReceipt: usable status + [created_at, rotation_after]
-  //    window); the embedded public_key must equal it or the check fails.
+  // 1. receipt signature — the package's verifyReceipt (src/index.ts), the one
+  //    verifier of the envelope (this was a second copy of its steps 1–4 until
+  //    2026-10-19): key_id resolved against the BUNDLE, usable status +
+  //    [created_at, rotation_after] window, embedded public_key equal to it,
+  //    Ed25519 over canonical(receipt minus payload and signature.value).
+  //    self_verification is not part of the signed envelope. As before, no
+  //    revocation feed and no strength ceiling here. payload_hash is check 2's:
+  //    the package reports it as the only errors that start with "payload".
   const sig = receipt.signature;
-  const entry = keys && Array.isArray(keys.keys) && typeof sig.key_id === 'string'
-    ? resolveKey(keys, sig.key_id) : null;
-  if (!sig.value || sig.algorithm !== 'Ed25519') {
-    add('receipt_signature', false, 'unsigned or not Ed25519');
-  } else if (!entry) {
-    add('receipt_signature', false, `key_id ${sig.key_id} not in pinned key bundle`);
-  } else if (sig.public_key !== undefined && sig.public_key !== entry.public_key) {
-    add('receipt_signature', false, `embedded public_key does not match pinned key ${sig.key_id}`);
-  } else {
-    const ts = Date.parse(receipt.timestamp);
-    const why = Number.isFinite(ts) ? keyUsableAt(entry, ts) : `timestamp not a valid date: ${receipt.timestamp}`;
-    const signingObject = { ...receipt };
-    delete signingObject.payload;
-    delete signingObject.self_verification;
-    signingObject.signature = { algorithm: sig.algorithm, key_id: sig.key_id, public_key: sig.public_key };
-    const okSig = !why && await ed25519Verify(entry.public_key, sig.value, canonicalizeBytes(signingObject));
-    add('receipt_signature', okSig, why || (okSig ? `key_id=${sig.key_id}` : 'Ed25519 signature does not verify against pinned key'));
-  }
+  const { self_verification: _sv, ...envelope } = receipt;
+  const env = await verifyEnvelope(envelope, { keys, unsafeSkipRevocations: true, unsafeSkipStrengthCeiling: true });
+  const sigErrors = env.errors.filter((e) => !e.startsWith('payload'));
+  add('receipt_signature', sigErrors.length === 0, sigErrors.length ? sigErrors.join('; ') : `key_id=${sig.key_id}`);
 
   // 2. payload integrity.
   if (receipt.payload !== undefined && receipt.payload_hash) {

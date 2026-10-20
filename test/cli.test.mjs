@@ -302,3 +302,17 @@ test('a base64url cosig fails against the pinned witness key', async () => {
   assert.equal(check(r, 'witness_cosignatures').pass, false);
   assert.throws(() => b64ToBytes('AbC-_w'));
 });
+
+// F3 (2026-10-19): check 1 is the package's verifyReceipt; as before the
+// kernel applies no strength ceiling and reads no revocation feed.
+test('receipt_signature passes with no ceiling, and names the package error when it fails', async () => {
+  const v = await makeVerdict();
+  const keys = makeKeyBundle([{ ...v.keys.keys[0], attestation_strength: 'self-asserted' }]);
+  const r = await verifyReceipt({ ...v.receipt, attestation_strength: 'silicon-root' }, { keys, witnessKeys: [v.witness.publicKeyB64] });
+  // The strength is signed, so re-labelling it breaks the signature, not the ceiling.
+  assert.equal(check(r, 'receipt_signature').pass, false);
+  assert.equal(check(r, 'receipt_signature').detail, 'Ed25519 signature did not verify');
+  const ok = await verifyReceipt(v.receipt, { keys, witnessKeys: [v.witness.publicKeyB64] });
+  assert.equal(check(ok, 'receipt_signature').pass, true, JSON.stringify(ok.checks));
+  assert.equal(check(ok, 'receipt_signature').detail, `key_id=${v.receipt.signature.key_id}`);
+});

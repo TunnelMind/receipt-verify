@@ -679,3 +679,18 @@ test('a base64url signature.value is invalid', async () => {
   assert.equal(result.valid, false);
   assert.ok(result.errors.some((e) => e.startsWith('signature verification failed')), result.errors.join('; '));
 });
+
+// F3 (2026-10-19): the ceiling can be switched off for scripts/verdict-lib.
+test('unsafeSkipStrengthCeiling: a receipt above its key strength verifies only with the flag', async () => {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt({ attestationStrength: 'silicon-root' });
+  const opts = {
+    keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' }]),
+    revocations: makeRevocations(),
+  };
+  const strict = await verifyReceipt(receipt, opts);
+  assert.equal(strict.valid, false);
+  assert.ok(strict.errors.some((e) => e.includes('ceiling violated')), strict.errors.join('; '));
+  const lax = await verifyReceipt(receipt, { ...opts, unsafeSkipStrengthCeiling: true });
+  assert.equal(lax.valid, true, lax.errors.join('; '));
+});

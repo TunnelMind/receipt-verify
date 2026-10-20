@@ -95,6 +95,10 @@ export interface VerifyOptions {
    *  or compromised key verifies. Offline callers should pass `revocations`
    *  instead. */
   unsafeSkipRevocations?: boolean;
+  /** UNSAFE: disables the attestation-strength ceiling (§4 step 5), so a
+   *  receipt claiming a strength above its signing key's verifies. Exists
+   *  for scripts/verdict-lib, which never enforced it (2026-10-19). */
+  unsafeSkipStrengthCeiling?: boolean;
   /** Override the well-known revocations URL. */
   revocationsUrl?: string;
   /** When the receipt's embedded public_key differs from the bundle key for
@@ -294,7 +298,7 @@ export async function verifyReceipt(
   }
 
   // 5. Attestation-strength ceiling
-  if (signingKey?.attestation_strength) {
+  if (signingKey?.attestation_strength && !opts.unsafeSkipStrengthCeiling) {
     const tokenRank = STRENGTH_RANK[receipt.attestation_strength] ?? -1;
     const keyRank   = STRENGTH_RANK[signingKey.attestation_strength] ?? -1;
     if (tokenRank > keyRank) {
