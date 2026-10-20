@@ -12,6 +12,7 @@ import { canonicalizeBytes } from '../dist/jcs.js';
 import { verifyReceipt } from '../scripts/verdict-lib/verify-receipt.js';
 import { reconcile } from '../scripts/verdict-lib/reconcile.js';
 import { leafHash as libLeafHash } from '../scripts/verdict-lib/log.js';
+import { b64ToBytes } from '../scripts/verdict-lib/hash.js';
 import { verifySth, verifyInclusion, leafHash, jcs } from '../scripts/verify-log.mjs';
 import { makeReceipt, makeEphemeralKey, makeKeyBundle } from './_helpers.mjs';
 
@@ -284,4 +285,20 @@ test('CLI inclusion hashes the receipt as supplied, self_verification included',
   const incl = (r) => run('scripts/verify-log.mjs', ['inclusion', proofPath, '--key', pinned.publicKeyB64, '--receipt', r]);
   assert.equal(incl(f('full.json', receipt)), 0);
   assert.equal(incl(f('bare.json', bare)), 1);
+});
+
+// F2 (2026-10-19): the kernel decodes standard base64 only, as the package
+// does, so one receipt cannot pass here and fail verifyReceipt().
+test('a base64url cosig fails against the pinned witness key', async () => {
+  const toUrl = (s) => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  let v = await makeVerdict();
+  // A signature with no + or / is the same string in both alphabets.
+  while (!/[+/]/.test(v.receipt.self_verification.witness_cosignatures[0].value)) v = await makeVerdict();
+  const sv = v.receipt.self_verification;
+  const cosig = { ...sv.witness_cosignatures[0], value: toUrl(sv.witness_cosignatures[0].value) };
+  const r = await verifyReceipt({ ...v.receipt, self_verification: { ...sv, witness_cosignatures: [cosig] } }, {
+    keys: v.keys, witnessKeys: [v.witness.publicKeyB64],
+  });
+  assert.equal(check(r, 'witness_cosignatures').pass, false);
+  assert.throws(() => b64ToBytes('AbC-_w'));
 });

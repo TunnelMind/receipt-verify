@@ -662,3 +662,20 @@ test('previous: a receipt with no chain is an error', async () => {
   assert.equal(result.valid, false);
   assert.ok(result.errors.some((e) => e.includes('previous supplied but receipt has no chain')), result.errors.join('; '));
 });
+
+// F2 (2026-10-19): the signature is standard base64 (spec §3); base64url is
+// not accepted, here or in scripts/verdict-lib (which decoded both).
+test('a base64url signature.value is invalid', async () => {
+  reset();
+  let made = await makeReceipt();
+  // A signature with no + or / is the same string in both alphabets.
+  while (!/[+/]/.test(made.receipt.signature.value)) made = await makeReceipt();
+  const { receipt, keyId, publicKeyB64 } = made;
+  receipt.signature.value = receipt.signature.value.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const result = await verifyReceipt(receipt, {
+    keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64 }]),
+    revocations: makeRevocations(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.startsWith('signature verification failed')), result.errors.join('; '));
+});

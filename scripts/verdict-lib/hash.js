@@ -79,16 +79,15 @@ export function timingSafeEqual(a, b) {
 }
 
 /**
- * Tolerant base64 / base64url → bytes. Accepts either alphabet, restores
- * padding. Formerly duplicated in roots/ed25519-self.js and
- * roots/verify-receipt.js.
+ * Standard base64 → bytes, exactly as the package's src/index.ts decodes
+ * signatures and keys (2026-10-19; was tolerant of base64url, so a receipt
+ * could pass this kernel and fail verifyReceipt()). The spec says base64;
+ * a `-` or `_` throws.
  * @param {string} s
  * @returns {Uint8Array}
  */
 export function b64ToBytes(s) {
-  let b64 = String(s).replace(/-/g, '+').replace(/_/g, '/');
-  b64 += '='.repeat((4 - (b64.length % 4)) % 4);
-  const bin = atob(b64);
+  const bin = atob(s);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
