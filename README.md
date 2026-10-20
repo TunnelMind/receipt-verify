@@ -185,7 +185,7 @@ are the spec (the service runs the same code).
 
 ## Spec drift
 
-The JCS canonicalizer in `src/jcs.ts` is **bit-identical** to the issuer-side serializers in `scry-server/src/lib/receipt_v1.js` and `tunnelmind-data-api/api/utils/receipt-v1.js`. Any change to one MUST be mirrored across all three. The JCS tests live in `test/verify.test.mjs` (with the shared helpers in `test/_helpers.mjs`); there is no frozen cross-implementation wire vector yet.
+The JCS canonicalizer in `src/jcs.ts` is **bit-identical** to the issuer-side serializers in `scry-server/src/lib/receipt_v1.js` and `tunnelmind-data-api/api/utils/receipt-v1.js`. Any change to one MUST be mirrored across all three. The JCS tests live in `test/verify.test.mjs` (with the shared helpers in `test/_helpers.mjs`); the frozen cross-implementation wire vectors are `test/vectors/jcs.json`, run here against `src/jcs.ts`, `scripts/verdict-lib/jcs.js` and `scripts/verify-log.mjs` (`test/jcs-vectors.test.mjs`) and vendored byte-identical into tollbooth and atap.
 
 ## Migrating from 1.x to 2.0.0
 

@@ -13,3 +13,7 @@ verifies the issuer signature against the bundle key for `signature.key_id`
 the checkpoint signature against `logKey`, and witness cosignatures against
 `witnessKeys`. Public keys embedded in the receipt, checkpoint or cosigs are
 never used to verify; without `logKey` / `witnessKeys` those checks fail.
+
+Diverges from the service copy (2026-10-19): `jcs.js` refuses a lone
+surrogate as `src/jcs.ts` does (V006); the service copy still maps it to
+U+FFFD. Both are pinned by `test/vectors/jcs.json` (`test/jcs-vectors.test.mjs`).

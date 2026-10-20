@@ -19,9 +19,12 @@ const ESC = { '"': '\\"', '\\': '\\\\', '\b': '\\b', '\f': '\\f', '\n': '\\n', '
 
 function encodeString(s) {
   let out = '"';
-  for (let i = 0; i < s.length; i++) {
-    const ch = s.charAt(i);
-    const code = s.charCodeAt(i);
+  for (const ch of s) {
+    const code = ch.codePointAt(0);
+    // Same guard as src/jcs.ts (V006, 2026-10-19): the iterator yields valid
+    // pairs as one code point > 0xFFFF, so a code here is a lone surrogate,
+    // which TextEncoder would map to U+FFFD and collide two strings' bytes.
+    if (code >= 0xd800 && code <= 0xdfff) throw new Error('JCS: lone surrogate in string');
     if (ch in ESC) out += ESC[ch];
     else if (code < 0x20) out += '\\u' + code.toString(16).padStart(4, '0');
     else out += ch;

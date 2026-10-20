@@ -44,11 +44,20 @@ const NODE = Buffer.from([0x01]);
 
 // Own RFC 8785 canonicalization for the STH body and the receipt leaf (JSON
 // subset: ES number/string serialization, which is what RFC 8785 specifies for
-// the finite numbers and well-formed strings these documents carry).
+// the finite numbers and well-formed strings these documents carry). A lone
+// surrogate is refused as the package's src/jcs.ts refuses it (2026-10-19):
+// JSON.stringify would escape it to \uDxxx and this leaf would differ from
+// every other canonicalizer's bytes for the same document.
 export function jcs(v) {
+  if (typeof v === 'string') {
+    for (const ch of v) {
+      const cp = ch.codePointAt(0);
+      if (cp >= 0xd800 && cp <= 0xdfff) throw new Error('JCS: lone surrogate in string');
+    }
+  }
   if (v === null || typeof v !== 'object') return JSON.stringify(v);
   if (Array.isArray(v)) return `[${v.map(jcs).join(',')}]`;
-  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${jcs(v[k])}`).join(',')}}`;
+  return `{${Object.keys(v).sort().map((k) => `${jcs(k)}:${jcs(v[k])}`).join(',')}}`;
 }
 
 /** RFC 6962 leaf hash of canonical content bytes. */
