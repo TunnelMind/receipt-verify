@@ -381,8 +381,9 @@ export async function verifyReceipt(
   return out;
 }
 
-// Re-exports for advanced consumers
-export { canonicalize, canonicalizeBytes };
+// Re-exports for advanced consumers. bytesToHex / sha256HexPrefixed are the
+// one copy for scripts/verdict-lib and the test helpers too (2026-10-19).
+export { canonicalize, canonicalizeBytes, bytesToHex, sha256HexPrefixed };
 export {
   DEFAULT_KEYS_URL,
   KEY_BUNDLE_CACHE_TTL_MS,

@@ -4,14 +4,14 @@
  * SHA-256 + byte↔hex helpers — THE single home for these primitives.
  * (bytesToHex/hexToBytes were formerly re-rolled in ~12 files; fix here once.)
  * Uses the Web Crypto API available in Cloudflare Workers and Node ≥19.
+ *
+ * In this repo bytesToHex and sha256HexPrefixed are the package's own
+ * (dist/index.js, `npm run build` first) and re-exported here, so the
+ * kernel and the verifier hash with one copy (2026-10-19).
  */
 
-/** Bytes (ArrayBuffer or TypedArray) → lowercase hex. */
-export function bytesToHex(buf) {
-  return Array.from(new Uint8Array(buf))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-}
+import { bytesToHex, sha256HexPrefixed } from '../../dist/index.js';
+export { bytesToHex, sha256HexPrefixed };
 
 /** Hex string (`0x`-prefix tolerated) → raw bytes. */
 export function hexToBytes(h) {
@@ -36,11 +36,6 @@ export function randomHex(nBytes) {
 export async function sha256Hex(input) {
   const data = new TextEncoder().encode(input);
   return bytesToHex(await crypto.subtle.digest('SHA-256', data));
-}
-
-/** SHA-256 of raw bytes, `0x`-prefixed hex (the receipt/ATAP convention). */
-export async function sha256HexPrefixed(bytes) {
-  return '0x' + bytesToHex(await crypto.subtle.digest('SHA-256', bytes));
 }
 
 /** HMAC-SHA256 over `message` keyed by `secret`, lowercase hex (webhook-signature convention). */
