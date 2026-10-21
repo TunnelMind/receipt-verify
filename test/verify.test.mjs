@@ -694,3 +694,21 @@ test('unsafeSkipStrengthCeiling: a receipt above its key strength verifies only 
   const lax = await verifyReceipt(receipt, { ...opts, unsafeSkipStrengthCeiling: true });
   assert.equal(lax.valid, true, lax.errors.join('; '));
 });
+
+// 2026-10-21: attestation_strength is validated as one of the four tiers. A
+// bare rank lookup let an unknown value sit below every ceiling, and a
+// prototype name rank as a function no ceiling exceeds.
+test('attestation_strength must be one of the four tiers', async () => {
+  reset();
+  for (const bogus of ['constructor', '__proto__', 'silicon-root-plus', undefined, 3]) {
+    const { receipt, keyId, publicKeyB64 } = await makeReceipt();
+    const claimed = { ...receipt, attestation_strength: bogus };
+    const result = await verifyReceipt(claimed, {
+      keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' }]),
+      revocations: makeRevocations(),
+      unsafeSkipStrengthCeiling: true,
+    });
+    assert.equal(result.valid, false, String(bogus));
+    assert.ok(result.errors.some((e) => e.startsWith('attestation_strength: unrecognized value')), `${String(bogus)}: ${result.errors.join('; ')}`);
+  }
+});

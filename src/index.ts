@@ -297,10 +297,18 @@ export async function verifyReceipt(
     }
   }
 
-  // 5. Attestation-strength ceiling
-  if (signingKey?.attestation_strength && !opts.unsafeSkipStrengthCeiling) {
-    const tokenRank = STRENGTH_RANK[receipt.attestation_strength] ?? -1;
-    const keyRank   = STRENGTH_RANK[signingKey.attestation_strength] ?? -1;
+  // 5. Attestation-strength ceiling. The receipt's value must be one of the
+  // four tiers: a bare STRENGTH_RANK[x] lookup let an unknown value rank -1
+  // (below every ceiling) and a prototype name ("constructor") rank as a
+  // function, which no ceiling exceeds (2026-10-21).
+  const claimedStrength: unknown = receipt.attestation_strength;
+  const rankOf = (s: unknown): number =>
+    typeof s === 'string' && Object.hasOwn(STRENGTH_RANK, s) ? STRENGTH_RANK[s as AttestationStrength] : -1;
+  if (rankOf(claimedStrength) < 0) {
+    errors.push(`attestation_strength: unrecognized value ${String(claimedStrength)}`);
+  } else if (signingKey?.attestation_strength && !opts.unsafeSkipStrengthCeiling) {
+    const tokenRank = rankOf(claimedStrength);
+    const keyRank   = rankOf(signingKey.attestation_strength);
     if (tokenRank > keyRank) {
       errors.push(
         `attestation_strength ceiling violated: receipt=${receipt.attestation_strength} > key=${signingKey.attestation_strength}`,
