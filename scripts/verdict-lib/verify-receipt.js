@@ -1,5 +1,5 @@
 /**
- * api/roots/verify-receipt.js
+ * verdict-lib/verify-receipt.js (from tunnelmind-data-api api/roots/verify-receipt.js)
  *
  * The pure, importable core of the standalone offline verdict verifier
  * (ADR-001 invariant 5). Given a reconciliation receipt + PINNED issuer, log and
@@ -135,7 +135,10 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
     // Witness cosignatures: each must verify under a PINNED witness key (by
     // key_id when the cosig names one; a pinned key without key_id matches any).
     const pinned = witnessKeys === undefined ? defaultPinned : normWitness(witnessKeys);
-    const cosigs = Array.isArray(sv.witness_cosignatures) ? sv.witness_cosignatures : [];
+    // A cosig entry that is not an object (null, a string) is not a cosig:
+    // reading .key_id off it would throw, and the kernel reports, never throws.
+    const cosigs = (Array.isArray(sv.witness_cosignatures) ? sv.witness_cosignatures : [])
+      .filter((c) => c && typeof c === 'object');
     const cpBytes = canonicalizeBytes(cp);
     if (pinned.length === 0) {
       add('witness_cosignatures', false, 'no pinned witness keys');
@@ -166,9 +169,16 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
       key_control_proven: payload.claim.key_control_proven,
     };
     const conduct = payload.conduct && payload.conduct.available !== false ? payload.conduct : null;
-    const rederived = reconcile(claimSide, conduct);
-    const okRd = sameCanonical(rederived, payload.reconciliation);
-    add('verdict_rederivation', okRd, okRd ? `verdict.tier=${rederived.verdict.tier}` : 'reconcile() differs from published');
+    // reconcile() iterates claim.roots and canonicalize() refuses a lone
+    // surrogate: a payload shaped to throw is a failed check, not a crash.
+    let okRd = false;
+    let rdDetail;
+    try {
+      const rederived = reconcile(claimSide, conduct);
+      okRd = sameCanonical(rederived, payload.reconciliation);
+      rdDetail = okRd ? `verdict.tier=${rederived.verdict.tier}` : 'reconcile() differs from published';
+    } catch (e) { rdDetail = e.message; }
+    add('verdict_rederivation', okRd, rdDetail);
   } else {
     add('verdict_rederivation', false, 'payload.claim / payload.reconciliation missing');
   }
