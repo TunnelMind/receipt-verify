@@ -1,11 +1,12 @@
 /**
- * api/roots/log.js
+ * verdict-lib/log.js (from tunnelmind-data-api api/roots/log.js)
  *
  * RFC 6962-style Merkle primitives for the self-verification triple (ADR-001 §3).
- * Pure + zero-dep: leaf/node hashing, single-leaf checkpoint construction, and an
- * inclusion-proof verifier. The verifier is the half that matters for invariant 5
- * — `scripts/verify-verdict.mjs` re-derives a verdict offline using exactly this
- * code path, with only the receipt bytes + witness keys.
+ * Pure + zero-dep: leaf/node hashing and an inclusion-proof verifier — the
+ * verifier half, which is what matters for invariant 5: `scripts/verify-verdict.mjs`
+ * re-derives a verdict offline using exactly this code path, with only the
+ * receipt bytes + witness keys. The service file's checkpoint builder (the
+ * publisher's half) had no caller here and was dropped 2026-10-21.
  *
  * Domain-separated hashing (RFC 6962 §2.1):
  *   leaf hash  = SHA-256(0x00 || data)
@@ -37,29 +38,6 @@ export async function leafHash(data) {
 export async function nodeHash(leftHex, rightHex) {
   const body = concat(new Uint8Array([0x01]), concat(hexToBytes(leftHex), hexToBytes(rightHex)));
   return '0x' + hex(await sha256(body));
-}
-
-/**
- * Build the self-verification inclusion proof + checkpoint for a single record.
- * Bootstrap: a 1-leaf tree. Returns the {inclusion_proof, checkpoint} shape
- * ADR-001 §3 specifies (minus the witness cosignature, which needs the signing
- * key and is added by the publish layer).
- *
- * @param {Uint8Array} canonicalBytes — the canonical receipt body bytes
- * @param {string} treeId — log id (env-configured; never hardcoded by callers)
- */
-export async function buildSingleLeafCheckpoint(canonicalBytes, treeId) {
-  const leaf = await leafHash(canonicalBytes);
-  return {
-    inclusion_proof: { leaf_index: 0, tree_size: 1, audit_path: [] },
-    checkpoint: {
-      tree_id:   treeId,
-      tree_size: 1,
-      root_hash: leaf,                 // 1-leaf tree: root == leaf hash
-      signed_at: new Date().toISOString(),
-    },
-    _leaf_hash: leaf,                  // convenience for the publisher; not part of the wire shape
-  };
 }
 
 /**

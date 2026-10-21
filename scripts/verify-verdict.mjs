@@ -3,7 +3,8 @@
 // (research-house shift follow-up): the standalone verdict verifier and its
 // pure dependency chain (scripts/verdict-lib/) are public kernel material —
 // the site has always claimed the reconciliation core and offline verifier
-// are open. Byte-identical to the originals except import paths.
+// are open. Where verdict-lib now differs from the service copies, its
+// README says how.
 /**
  * scripts/verify-verdict.mjs
  *
@@ -11,9 +12,9 @@
  *
  * Given a reconciliation receipt's bytes + PINNED issuer, log and witness public
  * keys (never keys carried inside the receipt), re-derive and check the verdict
- * with NO call to TunnelMind. The actual
- * checks live in api/roots/verify-receipt.js (pure, importable, also unit-tested);
- * this file is only argv/IO around it. That module imports the SAME reconcile()
+ * with NO call to TunnelMind. The actual checks live in
+ * verdict-lib/verify-receipt.js (pure, importable, also unit-tested); this
+ * file is only argv/IO around it. That module imports the SAME reconcile()
  * and Merkle verifier the service runs — the verifier IS the spec.
  *
  * Usage:

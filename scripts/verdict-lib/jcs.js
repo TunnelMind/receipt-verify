@@ -1,16 +1,9 @@
 /**
- * api/utils/jcs.js
+ * verdict-lib/jcs.js (from tunnelmind-data-api api/utils/jcs.js)
  *
- * RFC 8785 JSON Canonicalization Scheme — THE single implementation.
- * Formerly duplicated byte-for-byte in receipt-v1.js and atap-witness.js
- * (both re-export from here, so their importers and wire bytes are unchanged).
- *
- * NOT the same as api/lib/ghostroute/signing.js `canonicalJson` — that is a
- * different, already-deployed wire format (sortKeys + JSON.stringify) with
- * receipts persisted in Supabase; it must not be merged into this one.
- *
- * uuidv7 (RFC 9562 §5.7) rides along: its only consumers are the two receipt
- * modules that canonicalize with this file.
+ * RFC 8785 JSON Canonicalization Scheme, the verdict kernel's copy; pinned to
+ * src/jcs.ts by test/vectors/jcs.json. uuidv7 (RFC 9562 §5.7) rides along for
+ * the test helpers, which mint receipt ids with it.
  */
 
 import { bytesToHex } from './hash.js';
