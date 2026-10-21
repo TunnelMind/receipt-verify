@@ -7,10 +7,10 @@ import type { KeyBundle } from './keys.js';
 
 export const PINNED_KEYS_FETCHED_AT = '2026-10-17';
 
-// `as KeyBundle`: the published JSON carries extra fields ($schema,
-// verification) that the KeyBundle type does not model; kept for fidelity.
+// The published JSON carries an extra field (verification) that the
+// KeyBundle type does not model; kept for fidelity. No `$schema`: the live
+// file dropped it (site c25edae) and the URL it named was never published.
 export const PINNED_KEY_BUNDLE: KeyBundle = {
-  "$schema": "https://tunnelmind.ai/standards/receipt-format/v1/keys-schema.json",
   "service": "TunnelMind Receipt Format v1.0",
   "spec": "https://tunnelmind.ai/standards/receipt-format/v1",
   "format_version": "1.0",
