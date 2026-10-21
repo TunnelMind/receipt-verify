@@ -118,10 +118,16 @@ export function verifyConsistency({ first, second, firstRoot, secondRoot, proof 
   return sn === 0 && eq(fr, firstRoot) && eq(sr, secondRoot);
 }
 
+// Standard base64 only: Buffer.from(s, 'base64') also takes the base64url
+// alphabet and skips junk, so a signature the package's atob() refuses would
+// verify here (review 2026-10-20 P1).
+const isB64 = (s) => typeof s === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(s);
+
 /** Verify an STH document's Ed25519 signature against a raw 32-byte b64 key. */
 export function verifySth(sth, publicKeyB64) {
   const { signature, ...body } = sth;
   if (!signature || signature.algorithm !== 'Ed25519') return false;
+  if (!isB64(signature.value) || !isB64(publicKeyB64)) return false;
   const raw = Buffer.from(publicKeyB64, 'base64');
   if (raw.length !== 32) return false;
   // Wrap the raw key in SPKI DER (RFC 8410 prefix) for node:crypto.

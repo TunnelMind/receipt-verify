@@ -220,6 +220,22 @@ test('(c) forged STH carrying the attacker key fails against the pinned log key'
   assert.equal(verifySth(genuine, pinned.publicKeyB64), true);
 });
 
+// Review 2026-10-20 P1: Buffer.from(s, 'base64') also takes base64url, so a
+// signature the package refuses would verify here. Standard base64 only.
+test('(c) an STH signature or key in base64url does not verify', async () => {
+  const toUrl = (s) => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  // A string with no + or / is the same in both alphabets: pick a key and a
+  // signature that carry one.
+  let pinned = await makeEphemeralKey();
+  while (!/[+/]/.test(pinned.publicKeyB64)) pinned = await makeEphemeralKey();
+  let sth = await makeSth(pinned, { root_hash: 'ab'.repeat(32), tree_size: 1 });
+  while (!/[+/]/.test(sth.signature.value)) sth = await makeSth(pinned, { root_hash: 'ab'.repeat(32), tree_size: 1 });
+  assert.equal(verifySth(sth, pinned.publicKeyB64), true);
+  assert.equal(verifySth({ ...sth, signature: { ...sth.signature, value: toUrl(sth.signature.value) } }, pinned.publicKeyB64), false);
+  assert.equal(verifySth(sth, toUrl(pinned.publicKeyB64)), false);
+  assert.equal(verifySth({ ...sth, signature: { ...sth.signature, value: 42 } }, pinned.publicKeyB64), false);
+});
+
 test('(d) a lying proof leaf_hash does not help: the leaf comes from receipt bytes', async () => {
   const { receipt } = await makeVerdict();
   const { self_verification, ...bare } = receipt;
