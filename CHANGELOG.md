@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- `attestation_strength` must be one of `self-asserted`, `software`, `tee-tpm`, `silicon-root`: a receipt without the field or with any other value (an unknown tier ranked below every ceiling; a prototype name such as `constructor` ranked as a function) now fails with `attestation_strength: unrecognized value ...`, under `unsafeSkipStrengthCeiling` too (2026-10-21).
+
 ## 2.0.0 - 2026-10-17
 
 ### Breaking

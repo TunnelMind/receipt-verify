@@ -125,6 +125,7 @@ const isB64 = (s) => typeof s === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(s);
 
 /** Verify an STH document's Ed25519 signature against a raw 32-byte b64 key. */
 export function verifySth(sth, publicKeyB64) {
+  if (!sth || typeof sth !== 'object') return false;
   const { signature, ...body } = sth;
   if (!signature || signature.algorithm !== 'Ed25519') return false;
   if (!isB64(signature.value) || !isB64(publicKeyB64)) return false;

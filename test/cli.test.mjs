@@ -234,6 +234,7 @@ test('(c) an STH signature or key in base64url does not verify', async () => {
   assert.equal(verifySth({ ...sth, signature: { ...sth.signature, value: toUrl(sth.signature.value) } }, pinned.publicKeyB64), false);
   assert.equal(verifySth(sth, toUrl(pinned.publicKeyB64)), false);
   assert.equal(verifySth({ ...sth, signature: { ...sth.signature, value: 42 } }, pinned.publicKeyB64), false);
+  assert.equal(verifySth(null, pinned.publicKeyB64), false);
 });
 
 test('(d) a lying proof leaf_hash does not help: the leaf comes from receipt bytes', async () => {

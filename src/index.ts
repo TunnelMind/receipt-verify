@@ -70,6 +70,7 @@ export interface Receipt {
   timestamp_proof?: { method: string; [k: string]: unknown };
   source: ReceiptSource;
   subject?: string;
+  /** Required and validated: one of the four tiers, or the receipt is invalid. */
   attestation_strength: AttestationStrength;
   payload_hash: string;
   payload: JsonValue;

@@ -43,7 +43,7 @@ if (result.valid) {
 2. **Payload hash** — recompute `0x + hex(SHA-256(JCS(payload)))`, compare to `payload_hash`
 3. **Key resolution** — `signature.key_id` must be a non-empty string. It is looked up in a key bundle: `opts.keys` if given, else a fetch of `keysUrl` if given, else the pinned bundle `PINNED_KEY_BUNDLE` shipped in `dist/pinned-keys.js`. An unknown `key_id` or a failed bundle fetch is an error. The key must be `active` or `rotated` and the receipt's `timestamp` must fall inside its `[created_at, rotation_after]` window. The receipt's embedded `signature.public_key` is only compared against the bundle key (a mismatch is an error); it is never used to verify
 4. **Signature** — reconstruct the signing object (§3 step 2), JCS-canonicalize, verify Ed25519 against the bundle key from step 3
-5. **Attestation-strength ceiling** — reject if `receipt.attestation_strength` exceeds the bundle key's declared strength
+5. **Attestation strength** — `receipt.attestation_strength` must be one of `self-asserted`, `software`, `tee-tpm`, `silicon-root` (missing or anything else is an error); reject if it exceeds the bundle key's declared strength
 6. **Revocation** — use `opts.revocations`, else fetch `https://tunnelmind.ai/.well-known/receipt-revocations.json` (a failed fetch is an error):
    - if `signature.key_id` (or the key that actually verified, see `allowKeyMismatch`) is revoked for `compromise`, reject whatever the receipt's timestamp
    - if it is revoked for another reason AND the receipt was signed after `revoked_at`, reject (signed before: warning)
