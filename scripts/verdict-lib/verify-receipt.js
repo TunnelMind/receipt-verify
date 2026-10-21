@@ -83,8 +83,10 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
 
   // 2. payload integrity.
   if (receipt.payload !== undefined && receipt.payload_hash) {
-    const h = await sha256HexPrefixed(canonicalizeBytes(receipt.payload));
-    add('payload_hash', h === receipt.payload_hash, h === receipt.payload_hash ? undefined : `recomputed ${h}`);
+    // canonicalizeBytes throws on a lone surrogate; the kernel reports, never throws.
+    let h;
+    try { h = await sha256HexPrefixed(canonicalizeBytes(receipt.payload)); } catch (e) { add('payload_hash', false, e.message); h = null; }
+    if (h !== null) add('payload_hash', h === receipt.payload_hash, h === receipt.payload_hash ? undefined : `recomputed ${h}`);
   } else {
     add('payload_hash', false, 'payload or payload_hash missing');
   }
@@ -94,10 +96,15 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
   if (sv && sv.inclusion_proof && sv.checkpoint) {
     const bare = { ...receipt };
     delete bare.self_verification;
-    const leaf = await leafHash(canonicalizeBytes(bare));
     const { leaf_index, tree_size, audit_path } = sv.inclusion_proof;
-    const okIncl = await verifyInclusion(leaf, leaf_index, tree_size, audit_path || [], sv.checkpoint.root_hash);
-    add('log_inclusion', okIncl, okIncl ? `tree_size=${tree_size}` : 'leaf does not resolve to checkpoint root');
+    let okIncl = false;
+    let inclDetail;
+    try { // canonicalizeBytes throws on a lone surrogate; the kernel reports, never throws
+      const leaf = await leafHash(canonicalizeBytes(bare));
+      okIncl = await verifyInclusion(leaf, leaf_index, tree_size, audit_path || [], sv.checkpoint.root_hash);
+      inclDetail = okIncl ? `tree_size=${tree_size}` : 'leaf does not resolve to checkpoint root';
+    } catch (e) { inclDetail = e.message; }
+    add('log_inclusion', okIncl, inclDetail);
 
     // The issuer (tunnelmind-data-api api/roots/log.js + verdict.js) puts no
     // signature on the checkpoint itself: the root is signed by the witness
