@@ -1,21 +1,20 @@
 /**
- * verdict-lib/verify-receipt.js (from tunnelmind-data-api api/roots/verify-receipt.js)
- *
- * The pure, importable core of the standalone offline verdict verifier
- * (ADR-001 invariant 5). Given a reconciliation receipt + PINNED issuer, log and
- * witness public keys, returns a per-check pass/fail report with no service
- * call. The CLI (scripts/verify-verdict.mjs) is just argv/IO around this; the
- * test suite imports it directly.
- *
- * Trust anchors come only from the caller (V004): any public key carried inside
- * the receipt is attacker-controlled — anyone can embed their own key and sign —
- * so it is at most compared against a pinned key, never verified against.
- * When the caller pins no witness or log key, both default to the usable
- * (active/rotated) entries of the issuer bundle, matched by key_id.
- *
- * Pure: uses globalThis.crypto + the same reconcile()/Merkle code the service
- * runs. No fetch, no env, no Worker bindings. The default issuer bundle and the
- * key-window rule come from the built package (dist/, `npm run build`).
+ * verdict-lib/verify-receipt.js — the offline verdict verifier's kernel.
+ * Dialect: a Reconciliation Verdict receipt = a Receipt v1.0 envelope (the
+ * package verifies that part) whose payload holds claim/conduct/reconciliation
+ * plus a `self_verification` triple (inclusion proof, checkpoint, witness
+ * cosignatures), which is outside the signed envelope. Returns a per-check
+ * pass/fail report; `ok` only when every check passes. Never throws on any
+ * receipt shape — every primitive that can throw is caught into a failed check.
+ * Trust: only what the caller pins — the issuer bundle (default: the shipped
+ * pinned bundle), `logKey`, `witnessKeys`; with no witness/log key pinned,
+ * the bundle's usable entries stand in, matched by key_id. Every key carried
+ * inside the receipt, checkpoint or cosig is attacker-controlled and is never
+ * verified against. No revocation feed and no strength ceiling here: a verdict
+ * receipt has neither contract (the four-tier validation still applies).
+ * Pure: globalThis.crypto + the same reconcile()/Merkle code the service runs;
+ * no fetch, env or bindings. Callers: scripts/verify-verdict.mjs (argv/IO
+ * only) and the tests. Needs the built package (dist/, `npm run build`).
  */
 
 import { reconcile } from './reconcile.js';
@@ -67,14 +66,14 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
     return { ok: false, checks };
   }
 
-  // 1. receipt signature — the package's verifyReceipt (src/index.ts), the one
-  //    verifier of the envelope (this was a second copy of its steps 1–4 until
-  //    2026-10-19): key_id resolved against the BUNDLE, usable status +
+  // 1. receipt signature — delegated to the package's verifyReceipt
+  //    (src/index.ts), the one verifier of the envelope, so the kernel cannot
+  //    drift from it: key_id resolved against the BUNDLE, usable status +
   //    [created_at, rotation_after] window, embedded public_key equal to it,
   //    Ed25519 over canonical(receipt minus payload and signature.value).
-  //    self_verification is not part of the signed envelope. As before, no
-  //    revocation feed and no strength ceiling here. payload_hash is check 2's:
-  //    the package reports it as the only errors that start with "payload".
+  //    self_verification is stripped first: it is not part of the signed
+  //    envelope. payload_hash is check 2's: the package reports it as the
+  //    only errors that start with "payload", so those are filtered out here.
   const sig = receipt.signature;
   const { self_verification: _sv, ...envelope } = receipt;
   const env = await verifyEnvelope(envelope, { keys, unsafeSkipRevocations: true, unsafeSkipStrengthCeiling: true });

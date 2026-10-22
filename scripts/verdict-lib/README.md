@@ -1,28 +1,30 @@
-Moved here 2026-08-02 from `tunnelmind-data-api` (`api/roots/{verify-receipt,
-reconcile,tier,log}.js`, `api/utils/{jcs,hash}.js`) — the pure dependency
-chain of `../verify-verdict.mjs`. `reconcile.js` and the verifier half of
-`log.js` are byte-identical except import paths; these are the spec: the
-service runs the same reconcile() and Merkle verifier. Drift rule: any change
-to them must be mirrored in the private service copies (and jcs.js
-additionally stays bit-identical with the issuer-side serializers — see the
-top-level README "Spec drift"). The helpers the service files carry for the
-service's own use (HMAC, API keys, timing-safe compare, base64url, the
-checkpoint builder, the tier cap) are not here: nothing in this repo called
-them (2026-10-21).
+`scripts/verdict-lib/` is the pure dependency chain of `../verify-verdict.mjs`:
+the verdict kernel (`verify-receipt.js`) and the code it re-derives a verdict
+with. The files are vendored from the private service, `tunnelmind-data-api`
+(`api/roots/{verify-receipt,reconcile,tier,log}.js`, `api/utils/{jcs,hash}.js`).
 
-Diverges from the service copy (V004, 2026-10-17): `verify-receipt.js`
-trusts only pinned keys. `verifyReceipt(receipt, { keys, logKey, witnessKeys })`
-verifies the issuer signature against the bundle key for `signature.key_id`
-(default: the shipped `dist/pinned-keys.js`, so run `npm run build` first),
-the checkpoint signature against `logKey`, and witness cosignatures against
-`witnessKeys`. Public keys embedded in the receipt, checkpoint or cosigs are
-never used to verify; without `logKey` / `witnessKeys` those checks fail.
+**Byte-identical to the service except import paths:** `reconcile.js` and the
+verifier half of `log.js`. These are the spec — the service runs the same
+`reconcile()` and Merkle verifier — so any change to them must be mirrored in
+the service copies. `jcs.js` must additionally produce the same bytes as every
+issuer-side serializer for every well-formed input; `test/vectors/jcs.json`
+pins it (and `src/jcs.ts`, and `../verify-log.mjs`) in `test/jcs-vectors.test.mjs`.
 
-Diverges from the service copy (2026-10-19): `jcs.js` refuses a lone
-surrogate as `src/jcs.ts` does (V006); the service copy still maps it to
-U+FFFD. Both are pinned by `test/vectors/jcs.json` (`test/jcs-vectors.test.mjs`).
+**Deliberate differences from the service copies:**
 
-Diverges from the service copy (2026-10-19): `verify-receipt.js` check 1 is the
-package's `verifyReceipt()` (dist/index.js) and `hash.js` re-exports the
-package's `bytesToHex` / `sha256HexPrefixed`, so the envelope is verified and
-hashed by one implementation; `b64ToBytes` is standard base64 only.
+- `verify-receipt.js` trusts only pinned keys: the issuer signature is
+  verified against the bundle key for `signature.key_id` (default: the shipped
+  `dist/pinned-keys.js`, so run `npm run build` first), the checkpoint
+  signature against `logKey` and witness cosignatures against `witnessKeys`;
+  with no `logKey` / `witnessKeys` the bundle's active/rotated entries stand
+  in, matched by `key_id`. Keys embedded in the receipt, checkpoint or cosigs
+  are never verified against.
+- `verify-receipt.js` check 1 is the package's `verifyReceipt()` (dist/index.js)
+  and `hash.js` re-exports the package's `bytesToHex` / `sha256HexPrefixed`,
+  so the envelope is verified and hashed by one implementation; `b64ToBytes`
+  is standard base64 only, as the package's.
+- `jcs.js` refuses a lone surrogate, as `src/jcs.ts` does; the service copy
+  still maps it to U+FFFD. A verdict receipt carrying one fails here.
+- Only what the kernel calls is kept: the service files' HMAC, API-key,
+  timing-safe-compare, base64url, checkpoint-builder and tier-cap helpers
+  have no caller in this repo and are not vendored.

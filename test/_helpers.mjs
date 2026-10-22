@@ -4,8 +4,8 @@
 
 import { webcrypto } from 'node:crypto';
 import { canonicalize, canonicalizeBytes } from '../dist/jcs.js';
-// The package's own hash helper and the kernel's uuidv7: the helpers used to
-// carry a copy of each (2026-10-19).
+// The package's own hash helper and the kernel's uuidv7, so fixtures are
+// hashed and minted by the code under test, not by a parallel copy.
 import { sha256HexPrefixed } from '../dist/index.js';
 import { uuidv7 } from '../scripts/verdict-lib/jcs.js';
 

@@ -1,11 +1,13 @@
 /**
- * verdict-lib/hash.js (from tunnelmind-data-api api/utils/hash.js)
- *
- * The byte helpers the verdict kernel needs. bytesToHex and sha256HexPrefixed
- * are the package's own (dist/index.js, `npm run build` first) and re-exported
- * here, so the kernel and the verifier hash with one copy (2026-10-19). The
- * service file's other helpers (HMAC, API-key generation, timing-safe compare,
- * base64url) had no caller in this repo and were dropped 2026-10-21.
+ * verdict-lib/hash.js — the byte helpers the verdict kernel needs
+ * (verify-receipt.js, log.js). bytesToHex and sha256HexPrefixed are the
+ * package's own (dist/index.js, so `npm run build` first) re-exported here,
+ * so the kernel and the verifier hash with one implementation. Only what the
+ * kernel calls lives here; the service file this was vendored from
+ * (tunnelmind-data-api api/utils/hash.js) carries more.
+ * Inputs are untrusted strings from a receipt: b64ToBytes throws on anything
+ * but standard base64 and hexToBytes yields NaN bytes on a non-hex string —
+ * both end in a failed check, never a pass.
  */
 
 import { bytesToHex, sha256HexPrefixed } from '../../dist/index.js';
@@ -21,9 +23,9 @@ export function hexToBytes(h) {
 
 /**
  * Standard base64 → bytes, exactly as the package's src/index.ts decodes
- * signatures and keys (2026-10-19; was tolerant of base64url, so a receipt
- * could pass this kernel and fail verifyReceipt()). The spec says base64;
- * a `-` or `_` throws.
+ * signatures and keys: the spec says base64, and a decoder tolerant of
+ * base64url would let a receipt pass this kernel and fail verifyReceipt().
+ * A `-` or `_` throws.
  * @param {string} s
  * @returns {Uint8Array}
  */

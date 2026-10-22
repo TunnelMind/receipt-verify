@@ -1,20 +1,22 @@
 /**
- * verdict-lib/log.js (from tunnelmind-data-api api/roots/log.js)
- *
- * RFC 6962-style Merkle primitives for the self-verification triple (ADR-001 §3).
- * Pure + zero-dep: leaf/node hashing and an inclusion-proof verifier — the
- * verifier half, which is what matters for invariant 5: `scripts/verify-verdict.mjs`
- * re-derives a verdict offline using exactly this code path, with only the
- * receipt bytes + witness keys. The service file's checkpoint builder (the
- * publisher's half) had no caller here and was dropped 2026-10-21.
+ * verdict-lib/log.js — RFC 6962 Merkle primitives for a verdict receipt's
+ * self-verification triple: leaf/node hashing and the inclusion-proof
+ * verifier that verify-receipt.js check 3 runs over the receipt bytes and
+ * the checkpoint root. Vendored verbatim (verifier half) from
+ * tunnelmind-data-api api/roots/log.js, the code the service runs, so the
+ * offline re-derivation and the service agree by construction; the
+ * publisher's checkpoint builder is not needed here.
+ * Inputs (index, tree size, audit path, root) come from the untrusted
+ * receipt; verifyInclusion returns false on any shape it cannot walk and
+ * hexToBytes never throws, so a malformed proof is a failed check.
  *
  * Domain-separated hashing (RFC 6962 §2.1):
  *   leaf hash  = SHA-256(0x00 || data)
  *   node hash  = SHA-256(0x01 || left || right)
  *
- * Bootstrap (ADR-001): the log is a 1-leaf tree per record — root == leaf hash,
- * audit_path === []. The verifier handles general multi-leaf proofs so adding a
- * real batched log later changes data, not this code.
+ * Today's log is a 1-leaf tree per record — root == leaf hash, audit_path
+ * === []. The verifier handles general multi-leaf proofs so a batched log
+ * later changes data, not this code.
  */
 
 import { bytesToHex as hex, hexToBytes } from './hash.js';

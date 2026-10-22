@@ -1,4 +1,4 @@
-// V004 — the offline CLIs (scripts/verify-verdict.mjs, scripts/verify-log.mjs)
+// The offline CLIs (scripts/verify-verdict.mjs, scripts/verify-log.mjs)
 // trust only pinned keys, never keys carried in the receipt, STH or proof.
 
 import { test } from 'node:test';
@@ -127,7 +127,7 @@ test('(e) cosigs that verify only against their embedded public_key fail', async
   assert.equal(check(r, 'witness_cosignatures').detail, 'no pinned witness keys');
 });
 
-// R005 — with no witnessKeys / logKey, the usable `keys` entries are the default
+// With no witnessKeys / logKey, the usable `keys` entries are the default
 // pins, matched by key_id. Keys carried in the receipt still count for nothing.
 const withWitness = (v, entry) => makeKeyBundle([...v.keys.keys,
   { key_id: 'w1', algorithm: 'Ed25519', public_key: v.witness.publicKeyB64, ...entry }]);
@@ -220,7 +220,7 @@ test('(c) forged STH carrying the attacker key fails against the pinned log key'
   assert.equal(verifySth(genuine, pinned.publicKeyB64), true);
 });
 
-// Review 2026-10-20 P1: Buffer.from(s, 'base64') also takes base64url, so a
+// Buffer.from(s, 'base64') also takes base64url, so without the guard a
 // signature the package refuses would verify here. Standard base64 only.
 test('(c) an STH signature or key in base64url does not verify', async () => {
   const toUrl = (s) => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -304,7 +304,7 @@ test('CLI inclusion hashes the receipt as supplied, self_verification included',
   assert.equal(incl(f('bare.json', bare)), 1);
 });
 
-// F2 (2026-10-19): the kernel decodes standard base64 only, as the package
+// The kernel decodes standard base64 only, as the package
 // does, so one receipt cannot pass here and fail verifyReceipt().
 test('a base64url cosig fails against the pinned witness key', async () => {
   const toUrl = (s) => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -320,8 +320,8 @@ test('a base64url cosig fails against the pinned witness key', async () => {
   assert.throws(() => b64ToBytes('AbC-_w'));
 });
 
-// F3 (2026-10-19): check 1 is the package's verifyReceipt; as before the
-// kernel applies no strength ceiling and reads no revocation feed.
+// Check 1 is the package's verifyReceipt; the kernel itself applies no
+// strength ceiling and reads no revocation feed.
 test('receipt_signature passes with no ceiling, and names the package error when it fails', async () => {
   const v = await makeVerdict();
   const keys = makeKeyBundle([{ ...v.keys.keys[0], attestation_strength: 'self-asserted' }]);

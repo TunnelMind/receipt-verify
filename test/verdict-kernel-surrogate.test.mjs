@@ -1,4 +1,4 @@
-// Review 2026-10-20 C1: the verdict kernel reports per check and never throws,
+// The verdict kernel reports per check and never throws,
 // even when the receipt carries a lone surrogate the canonicalizer refuses.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,7 +17,7 @@ test('kernel: a lone surrogate in the payload is a failed check, not a throw', a
   assert.match(byName.log_inclusion.detail, /lone surrogate/);
 });
 
-// 2026-10-21: the same rule for a cosig entry that is not an object and a
+// The same rule for a cosig entry that is not an object and a
 // claim.roots reconcile() cannot iterate — failed checks, no throw.
 test('kernel: garbage cosigs and an un-iterable claim.roots are failed checks, not throws', async () => {
   const receipt = {

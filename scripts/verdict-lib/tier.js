@@ -1,16 +1,16 @@
 /**
- * verdict-lib/tier.js (from tunnelmind-data-api api/roots/tier.js)
- *
- * The attestation-tier ladder (ADR-001 invariant 4). One ordered scale that
- * every root normalizes onto, so the reconciliation layer can compare a claim
- * from any root against any other and against conduct.
+ * verdict-lib/tier.js — the attestation-tier ladder reconcile() ranks claims
+ * on. One ordered scale every root normalizes onto, so the reconciliation
+ * layer can compare a claim from any root against any other and against
+ * conduct:
  *
  *   self-asserted < software < tee-tpm < silicon-root
  *
- * A tier is ALWAYS measured/anchored, never taken from a claimant's say-so.
- * Only what reconcile() reads is here; the service file's isTier / maxTier /
- * capTier (root-verifier enforcement) had no caller in this repo and were
- * dropped 2026-10-21.
+ * Vendored verbatim from tunnelmind-data-api api/roots/tier.js (the service's
+ * copy), reduced to what reconcile() reads. A tier is ALWAYS measured or
+ * anchored by a root verifier, never taken from a claimant's say-so; an
+ * unknown tier ranks -1 and weighs as self-asserted, so garbage in a receipt
+ * can only lower a verdict, never raise it.
  */
 
 // Ordered low → high. Index is the ordinal used for comparison + the claim-side

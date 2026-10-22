@@ -1,15 +1,17 @@
 #!/usr/bin/env node
-// Moved here 2026-08-02 from tunnelmind-data-api/scripts/verify-log.mjs
-// (research-house shift, part 2): the offline log verifier is part of the
-// public verification kernel and lives in this repo alongside the receipt
-// verifier. Byte-identical to the original at the time of the move.
-//
-// P72 Gate 2 — INDEPENDENT verifier for the TunnelMind receipt transparency
-// log (RFC 6962 / RFC 9162 algorithms). By design this file imports ONLY
-// node: builtins — zero TunnelMind library code, zero helpers shared with the
-// sequencer (api/lib/receipt-log.js). The point is to catch a shared hashing
-// bug, not to confirm the sequencer agrees with itself. Independence is
-// asserted mechanically in api/lib/receipt-log.test.js.
+// INDEPENDENT verifier for the TunnelMind receipt transparency log (RFC 6962
+// / RFC 9162 inclusion + consistency proofs, Ed25519 STH signatures). By
+// design this file imports ONLY node: builtins — zero TunnelMind library
+// code, zero helpers shared with the sequencer (tunnelmind-data-api
+// api/lib/receipt-log.js), whose test suite asserts that mechanically. The
+// point is to catch a shared hashing bug, not to confirm the sequencer agrees
+// with itself; the re-implemented JCS is pinned to the package's by
+// test/vectors/jcs.json. Dialect: STH = Ed25519 over JCS(sth minus
+// `signature`), standard base64; leaf = SHA-256(0x00 || JCS(receipt)).
+// Trust: only the --key / public_key_b64 argument; never a key the STH or
+// proof carries, never the proof's own leaf_hash. Every verifier returns
+// false on malformed input (no throw); the CLI exits 1 on any failed check,
+// 2 on bad usage.
 //
 // Usage:
 //   node scripts/verify-log.mjs inclusion   <proof.json> [sth.json] --key <public_key_b64> --receipt <receipt.json>
@@ -45,9 +47,9 @@ const NODE = Buffer.from([0x01]);
 // Own RFC 8785 canonicalization for the STH body and the receipt leaf (JSON
 // subset: ES number/string serialization, which is what RFC 8785 specifies for
 // the finite numbers and well-formed strings these documents carry). A lone
-// surrogate is refused as the package's src/jcs.ts refuses it (2026-10-19):
-// JSON.stringify would escape it to \uDxxx and this leaf would differ from
-// every other canonicalizer's bytes for the same document.
+// surrogate is refused as the package's src/jcs.ts refuses it: JSON.stringify
+// would escape it to \uDxxx and this leaf would differ from every other
+// canonicalizer's bytes for the same document.
 export function jcs(v) {
   if (typeof v === 'string') {
     for (const ch of v) {
@@ -119,11 +121,13 @@ export function verifyConsistency({ first, second, firstRoot, secondRoot, proof 
 }
 
 // Standard base64 only: Buffer.from(s, 'base64') also takes the base64url
-// alphabet and skips junk, so a signature the package's atob() refuses would
-// verify here (review 2026-10-20 P1).
+// alphabet and skips junk, so without this guard a signature the package's
+// atob() refuses would verify here and the two verifiers would disagree.
 const isB64 = (s) => typeof s === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(s);
 
-/** Verify an STH document's Ed25519 signature against a raw 32-byte b64 key. */
+/** Verify an STH document's Ed25519 signature against a raw 32-byte b64 key.
+ *  False (never a throw) for a non-object STH, a non-Ed25519 or malformed
+ *  signature, a non-base64 value or key, or a key that is not 32 bytes. */
 export function verifySth(sth, publicKeyB64) {
   if (!sth || typeof sth !== 'object') return false;
   const { signature, ...body } = sth;
