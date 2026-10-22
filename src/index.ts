@@ -132,14 +132,27 @@ export interface VerifyResult {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Standard base64 → bytes. atob() throws on `-`/`_` (base64url) and junk,
- *  so one signature has exactly one wire string: the chain links on the
- *  SHA-256 of `signature.value`, and a tolerant decoder would let many
- *  strings carry the same signature and silently unlink a chain. */
+ *  but forgives ASCII whitespace, a missing `=` pad and unused low bits in
+ *  the last character; signatureBytes below closes those for the one field
+ *  where the spelling matters. */
 function b64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   const bin = atob(b64);
   const out = new Uint8Array(new ArrayBuffer(bin.length));
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+/** `signature.value` → bytes, accepting only the canonical padded spelling
+ *  (the bytes re-encode to the same string). The signature does not cover
+ *  its own value, and the chain links on the SHA-256 of that string, so a
+ *  forgiving decode would let one signature travel under many strings that
+ *  all verify and each hash to a different chain link. */
+function signatureBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bytes = b64ToBytes(b64);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  if (btoa(bin) !== b64) throw new Error('signature.value is not canonical standard base64');
+  return bytes;
 }
 
 function bytesToHex(buf: ArrayBuffer | Uint8Array): string {
@@ -297,7 +310,7 @@ export async function verifyReceipt(
           { name: 'Ed25519' },
           false, ['verify'],
         );
-        const sig = b64ToBytes(receipt.signature.value);
+        const sig = signatureBytes(receipt.signature.value);
         const ok  = await subtle.verify(
           'Ed25519', pubKey, sig,
           toAB(canonicalizeBytes(buildSigningObject(receipt))),

@@ -712,3 +712,25 @@ test('attestation_strength must be one of the four tiers', async () => {
     assert.ok(result.errors.some((e) => e.startsWith('attestation_strength: unrecognized value')), `${String(bogus)}: ${result.errors.join('; ')}`);
   }
 });
+
+// The chain links on the SHA-256 of signature.value, which the signature does
+// not cover, so the verifier must accept exactly one spelling of it. atob()
+// alone is forgiving: it skips ASCII whitespace, accepts a missing "=" pad and
+// ignores the unused low bits of the last character, so each of these decoded
+// to the signed bytes, verified, and hashed to a different chain link.
+test('rejects re-spelled signature.value (whitespace, no padding, stray low bits)', async () => {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt();
+  const keys = makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' }]);
+  const v = receipt.signature.value;
+  assert.match(v, /==$/);
+  // 64 bytes in base64: char 86 carries 2 data bits and 4 unused ones.
+  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const last = B64[B64.indexOf(v[85]) ^ 1];
+  for (const value of [` ${v}`, `${v.slice(0, 40)}\n${v.slice(40)}`, v.slice(0, -2), `${v.slice(0, 85)}${last}==`]) {
+    const r = await verifyReceipt({ ...receipt, signature: { ...receipt.signature, value } }, { keys, revocations: makeRevocations() });
+    assert.equal(r.valid, false, JSON.stringify(value));
+  }
+  const ok = await verifyReceipt(receipt, { keys, revocations: makeRevocations() });
+  assert.equal(ok.valid, true, ok.errors.join('; '));
+});
