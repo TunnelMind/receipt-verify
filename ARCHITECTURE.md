@@ -48,7 +48,9 @@ re-run over the payload and compared with the published verdict.
 - **Trusted:** the key bundle (whichever of the three sources the caller
   chose) and the revocation feed. Both are trusted as whole documents; a
   fetched body is validated only for shape (`keys` array; feed arrays
-  normalised to `[]`), and a malformed entry makes the receipt fail, never pass.
+  normalised to `[]`). Entries are not validated field by field: a null key
+  entry fails the receipt, but `status: null` reads as active and a
+  non-string bound is coerced by `Date.parse` (see `src/keys.ts`).
 - **Untrusted:** everything in the receipt, including `signature.public_key`
   (compared to the bundle, never verified against), and every key carried in
   a verdict receipt's checkpoint or cosignatures. CLI file arguments are

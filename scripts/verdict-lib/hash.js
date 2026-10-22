@@ -6,8 +6,12 @@
  * kernel calls lives here; the service file this was vendored from
  * (tunnelmind-data-api api/utils/hash.js) carries more.
  * Inputs are untrusted strings from a receipt: b64ToBytes throws on anything
- * but standard base64 and hexToBytes yields NaN bytes on a non-hex string —
- * both end in a failed check, never a pass.
+ * but standard base64. hexToBytes is no validator: a non-hex pair becomes 0
+ * (Uint8Array stores parseInt's NaN as 0), a leading sign or space is
+ * half-read ("+f" and " f" give 0x0f), and a non-string throws. Its only
+ * caller (log.js nodeHash) hashes the bytes into a Merkle root that must
+ * match the checkpoint's, inside verify-receipt.js's try, so a bad string
+ * can re-spell a valid sibling hash but never make an invalid proof pass.
  */
 
 import { bytesToHex, sha256HexPrefixed } from '../../dist/index.js';

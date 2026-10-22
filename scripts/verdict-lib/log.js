@@ -7,8 +7,10 @@
  * offline re-derivation and the service agree by construction; the
  * publisher's checkpoint builder is not needed here.
  * Inputs (index, tree size, audit path, root) come from the untrusted
- * receipt; verifyInclusion returns false on any shape it cannot walk and
- * hexToBytes never throws, so a malformed proof is a failed check.
+ * receipt. verifyInclusion returns false for a bad index or tree size or a
+ * path longer than the tree, and can throw on a path that is not iterable
+ * or on a non-string sibling it reaches (hexToBytes); verify-receipt.js
+ * catches that, so a malformed proof is a failed check either way.
  *
  * Domain-separated hashing (RFC 6962 §2.1):
  *   leaf hash  = SHA-256(0x00 || data)

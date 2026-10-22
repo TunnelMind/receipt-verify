@@ -4,8 +4,11 @@
 // Called by index.ts step 3; fetches only when the caller names a keysUrl.
 // Trust boundary: the bundle is trusted as a whole (it comes from the caller,
 // the URL the caller chose, or pinned-keys.ts); a fetched body is validated
-// only as "object with a `keys` array" — a malformed entry inside makes the
-// receipt fail (resolveKey/keyUsableAt throw into index.ts's catch), never pass.
+// only as "object with a `keys` array". Entries are not validated field by
+// field: a null entry throws in resolveKey (index.ts catches it), and
+// keyUsableAt returns a reason for an unparseable bound, but a status of null
+// reads as active and a non-string bound is coerced by Date.parse
+// (created_at 1 parses as 2001). That is why the bundle must be trusted.
 // Invariant: a fetched bundle is cached per URL, after validation, for
 // KEY_BUNDLE_CACHE_TTL_MS, so one issuer's keys are never served for another
 // and a rotation is seen within the TTL. Production verifiers should mirror
