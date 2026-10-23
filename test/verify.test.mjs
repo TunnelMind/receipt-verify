@@ -78,8 +78,8 @@ test('rejects when key_id is missing from bundle (default strict)', async () => 
   assert.ok(result.errors.some((e) => e.includes('not present in key bundle')));
 });
 
-// V001: an unresolved key_id used to become a warning here and the receipt
-// verified against its own embedded key. allowKeyMismatch no longer rescues it.
+// An unresolved key_id is never rescued by allowKeyMismatch: the flag only
+// switches between bundle entries, so an unlisted key stays untrusted.
 test('allowKeyMismatch=true does not rescue a key_id missing from the bundle', async () => {
   reset();
   const { receipt } = await makeReceipt();
@@ -166,8 +166,8 @@ test('rejects when receipt_id is in revoked_receipts', async () => {
   assert.ok(result.errors.some((e) => e.includes('revoked at')));
 });
 
-// V001 (PoC E): offline mode used to verify against the embedded key, so any
-// self-signed receipt passed. It now resolves against the pinned bundle.
+// Offline mode resolves against the pinned bundle, never the embedded key,
+// so a self-signed receipt fails without any network.
 test('offline mode (noFetchKeys + supplied revocations) rejects a self-signed receipt', async () => {
   reset();
   const { receipt } = await makeReceipt();
@@ -179,7 +179,7 @@ test('offline mode (noFetchKeys + supplied revocations) rejects a self-signed re
   assert.ok(result.errors.some((e) => e.includes('not present in key bundle')));
 });
 
-// ── V001: key binding (forgeries from the audit PoC) ─────────────────────────
+// ── Key binding: self-signed forgeries ─────────────────────────────────────
 
 const PINNED_KEY_ID = PINNED_KEY_BUNDLE.keys[0].key_id;
 
@@ -333,7 +333,7 @@ test('ttlMs: 0 refetches the key bundle; the default TTL serves the cache', asyn
   assert.equal(calls, 1);
 });
 
-// ── V002: a failed bundle fetch is an error; offline uses the pinned bundle ──
+// ── A failed bundle fetch is an error; offline uses the pinned bundle ──
 
 test('PoC C: keysUrl fetch that throws makes the receipt invalid (error, not warning)', async () => {
   reset();
@@ -378,7 +378,7 @@ test('noFetchKeys with keysUrl never calls the fetcher and resolves against the 
   assert.ok(result.errors.some((e) => e.includes('signature did not verify')));
 });
 
-// V003: allowKeyMismatch only switches to ANOTHER usable key in the bundle,
+// allowKeyMismatch only switches to ANOTHER usable key in the bundle,
 // matched by the receipt's embedded public_key; key windows always apply.
 const DAY = 24 * 3600 * 1000;
 const iso = (ms) => new Date(ms).toISOString();
@@ -502,7 +502,7 @@ test('allowKeyMismatch=true rejects when the other key is revoked in the feed', 
   assert.ok(result.errors.some((e) => e.includes('signing key key-b revoked')), result.errors.join('; '));
 });
 
-// ── V005: revocation fails closed ────────────────────────────────────────────
+// ── Revocation fails closed ──────────────────────────────────────────────────
 
 async function pinnedLocalCase(opts) {
   const { receipt, keyId, publicKeyB64 } = await makeReceipt();
@@ -582,7 +582,7 @@ test('revocation cache entries expire after ttlMs', async () => {
   assert.equal(urls.length, 2);
 });
 
-// ── V006: JCS lone surrogates + opts.previous chain check ─────────────────────
+// ── JCS lone surrogates ────── + opts.previous chain check ─────────────────────
 
 test('canonicalize rejects lone surrogates in values and keys, accepts valid pairs', async () => {
   const { canonicalize } = await import('../dist/jcs.js');
@@ -661,4 +661,76 @@ test('previous: a receipt with no chain is an error', async () => {
   const result = await verifyReceipt(receipt, { ...opts, previous: prev });
   assert.equal(result.valid, false);
   assert.ok(result.errors.some((e) => e.includes('previous supplied but receipt has no chain')), result.errors.join('; '));
+});
+
+// The signature is standard base64 (spec §3); base64url is accepted neither
+// here nor in scripts/verdict-lib, so one receipt cannot pass one and fail the other.
+test('a base64url signature.value is invalid', async () => {
+  reset();
+  let made = await makeReceipt();
+  // A signature with no + or / is the same string in both alphabets.
+  while (!/[+/]/.test(made.receipt.signature.value)) made = await makeReceipt();
+  const { receipt, keyId, publicKeyB64 } = made;
+  receipt.signature.value = receipt.signature.value.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const result = await verifyReceipt(receipt, {
+    keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64 }]),
+    revocations: makeRevocations(),
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.startsWith('signature verification failed')), result.errors.join('; '));
+});
+
+// The ceiling can be switched off (for scripts/verdict-lib); the tier validation cannot.
+test('unsafeSkipStrengthCeiling: a receipt above its key strength verifies only with the flag', async () => {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt({ attestationStrength: 'silicon-root' });
+  const opts = {
+    keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' }]),
+    revocations: makeRevocations(),
+  };
+  const strict = await verifyReceipt(receipt, opts);
+  assert.equal(strict.valid, false);
+  assert.ok(strict.errors.some((e) => e.includes('ceiling violated')), strict.errors.join('; '));
+  const lax = await verifyReceipt(receipt, { ...opts, unsafeSkipStrengthCeiling: true });
+  assert.equal(lax.valid, true, lax.errors.join('; '));
+});
+
+// attestation_strength is validated as one of the four tiers: a bare rank
+// lookup would let an unknown value sit below every ceiling, and a prototype
+// name rank as a function no ceiling exceeds.
+test('attestation_strength must be one of the four tiers', async () => {
+  reset();
+  for (const bogus of ['constructor', '__proto__', 'silicon-root-plus', undefined, 3]) {
+    const { receipt, keyId, publicKeyB64 } = await makeReceipt();
+    const claimed = { ...receipt, attestation_strength: bogus };
+    const result = await verifyReceipt(claimed, {
+      keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' }]),
+      revocations: makeRevocations(),
+      unsafeSkipStrengthCeiling: true,
+    });
+    assert.equal(result.valid, false, String(bogus));
+    assert.ok(result.errors.some((e) => e.startsWith('attestation_strength: unrecognized value')), `${String(bogus)}: ${result.errors.join('; ')}`);
+  }
+});
+
+// The chain links on the SHA-256 of signature.value, which the signature does
+// not cover, so the verifier must accept exactly one spelling of it. atob()
+// alone is forgiving: it skips ASCII whitespace, accepts a missing "=" pad and
+// ignores the unused low bits of the last character, so each of these decoded
+// to the signed bytes, verified, and hashed to a different chain link.
+test('rejects re-spelled signature.value (whitespace, no padding, stray low bits)', async () => {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt();
+  const keys = makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' }]);
+  const v = receipt.signature.value;
+  assert.match(v, /==$/);
+  // 64 bytes in base64: char 86 carries 2 data bits and 4 unused ones.
+  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const last = B64[B64.indexOf(v[85]) ^ 1];
+  for (const value of [` ${v}`, `${v.slice(0, 40)}\n${v.slice(40)}`, v.slice(0, -2), `${v.slice(0, 85)}${last}==`]) {
+    const r = await verifyReceipt({ ...receipt, signature: { ...receipt.signature, value } }, { keys, revocations: makeRevocations() });
+    assert.equal(r.valid, false, JSON.stringify(value));
+  }
+  const ok = await verifyReceipt(receipt, { keys, revocations: makeRevocations() });
+  assert.equal(ok.valid, true, ok.errors.join('; '));
 });

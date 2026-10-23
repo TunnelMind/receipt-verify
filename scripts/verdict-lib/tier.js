@@ -1,15 +1,16 @@
 /**
- * api/roots/tier.js
- *
- * The attestation-tier ladder (ADR-001 invariant 4). One ordered scale that
- * every root normalizes onto, so the reconciliation layer can compare a claim
- * from any root against any other and against conduct.
+ * verdict-lib/tier.js — the attestation-tier ladder reconcile() ranks claims
+ * on. One ordered scale every root normalizes onto, so the reconciliation
+ * layer can compare a claim from any root against any other and against
+ * conduct:
  *
  *   self-asserted < software < tee-tpm < silicon-root
  *
- * A tier is ALWAYS measured/anchored, never taken from a claimant's say-so.
- * The helpers here are pure; enforcement (capping a token's claimed tier at
- * what its trust anchor is trusted to assert) lives in the root verifiers.
+ * Vendored verbatim from tunnelmind-data-api api/roots/tier.js (the service's
+ * copy), reduced to what reconcile() reads. A tier is ALWAYS measured or
+ * anchored by a root verifier, never taken from a claimant's say-so; an
+ * unknown tier ranks -1 and weighs as self-asserted, so garbage in a receipt
+ * can only lower a verdict, never raise it.
  */
 
 // Ordered low → high. Index is the ordinal used for comparison + the claim-side
@@ -21,38 +22,9 @@ export const TIER_LADDER = Object.freeze([
   'silicon-root',
 ]);
 
-export const LOWEST_TIER  = TIER_LADDER[0];
-export const HIGHEST_TIER = TIER_LADDER[TIER_LADDER.length - 1];
-
 /** Ordinal of a tier (0..N-1), or -1 if not a known tier. */
 export function tierOrdinal(tier) {
   return TIER_LADDER.indexOf(tier);
-}
-
-/** True when `tier` is one of the canonical ladder values. */
-export function isTier(tier) {
-  return tierOrdinal(tier) >= 0;
-}
-
-/**
- * The higher of two tiers (by ordinal). Unknown tiers are treated as below the
- * floor so they never win. Used to fold many verified roots into one best tier.
- */
-export function maxTier(a, b) {
-  return tierOrdinal(a) >= tierOrdinal(b) ? (isTier(a) ? a : LOWEST_TIER)
-                                          : (isTier(b) ? b : LOWEST_TIER);
-}
-
-/**
- * Cap a claimed tier at the maximum a trust anchor is trusted to assert.
- * Invariant 4 in code: a token may *say* silicon-root, but if the anchor that
- * signed it is only trusted to `software`, the measured tier is `software`.
- */
-export function capTier(claimed, anchorMax) {
-  const c = isTier(claimed)   ? tierOrdinal(claimed)   : -1;
-  const m = isTier(anchorMax) ? tierOrdinal(anchorMax) : tierOrdinal(LOWEST_TIER);
-  if (c < 0) return LOWEST_TIER;
-  return TIER_LADDER[Math.min(c, m)];
 }
 
 /**

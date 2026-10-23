@@ -1,16 +1,15 @@
 /**
- * api/utils/jcs.js
- *
- * RFC 8785 JSON Canonicalization Scheme — THE single implementation.
- * Formerly duplicated byte-for-byte in receipt-v1.js and atap-witness.js
- * (both re-export from here, so their importers and wire bytes are unchanged).
- *
- * NOT the same as api/lib/ghostroute/signing.js `canonicalJson` — that is a
- * different, already-deployed wire format (sortKeys + JSON.stringify) with
- * receipts persisted in Supabase; it must not be merged into this one.
- *
- * uuidv7 (RFC 9562 §5.7) rides along: its only consumers are the two receipt
- * modules that canonicalize with this file.
+ * verdict-lib/jcs.js — RFC 8785 canonicalizer for the verdict kernel
+ * (verify-receipt.js: payload hash, Merkle leaf, checkpoint bytes, verdict
+ * re-derivation compare). Vendored from tunnelmind-data-api api/utils/jcs.js
+ * so the kernel hashes exactly what the service hashed; pinned byte-for-byte
+ * to src/jcs.ts by test/vectors/jcs.json (test/jcs-vectors.test.mjs), with
+ * the same lone-surrogate refusal (the service copy emits U+FFFD instead —
+ * a verdict receipt carrying one therefore fails here, by design).
+ * Input: untrusted parsed JSON from the receipt; throws on a lone surrogate
+ * or non-finite number, and every caller in verify-receipt.js catches that
+ * into a failed check. uuidv7 (RFC 9562 §5.7) rides along for the test
+ * helpers, which mint receipt ids with it.
  */
 
 import { bytesToHex } from './hash.js';
@@ -19,9 +18,12 @@ const ESC = { '"': '\\"', '\\': '\\\\', '\b': '\\b', '\f': '\\f', '\n': '\\n', '
 
 function encodeString(s) {
   let out = '"';
-  for (let i = 0; i < s.length; i++) {
-    const ch = s.charAt(i);
-    const code = s.charCodeAt(i);
+  for (const ch of s) {
+    const code = ch.codePointAt(0);
+    // Same guard as src/jcs.ts: the iterator yields valid pairs as one code
+    // point > 0xFFFF, so a code in this range is a lone surrogate, which
+    // TextEncoder would map to U+FFFD and collide two strings' bytes.
+    if (code >= 0xd800 && code <= 0xdfff) throw new Error('JCS: lone surrogate in string');
     if (ch in ESC) out += ESC[ch];
     else if (code < 0x20) out += '\\u' + code.toString(16).padStart(4, '0');
     else out += ch;

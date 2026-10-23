@@ -43,7 +43,7 @@ if (result.valid) {
 2. **Payload hash** — recompute `0x + hex(SHA-256(JCS(payload)))`, compare to `payload_hash`
 3. **Key resolution** — `signature.key_id` must be a non-empty string. It is looked up in a key bundle: `opts.keys` if given, else a fetch of `keysUrl` if given, else the pinned bundle `PINNED_KEY_BUNDLE` shipped in `dist/pinned-keys.js`. An unknown `key_id` or a failed bundle fetch is an error. The key must be `active` or `rotated` and the receipt's `timestamp` must fall inside its `[created_at, rotation_after]` window. The receipt's embedded `signature.public_key` is only compared against the bundle key (a mismatch is an error); it is never used to verify
 4. **Signature** — reconstruct the signing object (§3 step 2), JCS-canonicalize, verify Ed25519 against the bundle key from step 3
-5. **Attestation-strength ceiling** — reject if `receipt.attestation_strength` exceeds the bundle key's declared strength
+5. **Attestation strength** — `receipt.attestation_strength` must be one of `self-asserted`, `software`, `tee-tpm`, `silicon-root` (missing or anything else is an error); reject if it exceeds the bundle key's declared strength
 6. **Revocation** — use `opts.revocations`, else fetch `https://tunnelmind.ai/.well-known/receipt-revocations.json` (a failed fetch is an error):
    - if `signature.key_id` (or the key that actually verified, see `allowKeyMismatch`) is revoked for `compromise`, reject whatever the receipt's timestamp
    - if it is revoked for another reason AND the receipt was signed after `revoked_at`, reject (signed before: warning)
@@ -126,13 +126,14 @@ interface VerifyResult {
 | `revocations` | (fetched) | Pre-fetched `RevocationFeed`; offline callers pass this |
 | `unsafeSkipRevocations` | `false` | **UNSAFE**: disable revocation checking, so revoked or compromised keys verify |
 | `revocationsUrl` | `tunnelmind.ai/.well-known/receipt-revocations.json` | Self-hosted issuer override; a failed fetch is an error |
+| `unsafeSkipStrengthCeiling` | `false` | **UNSAFE**: disable the attestation-strength ceiling (step 5); the four-tier validation still runs |
 | `allowKeyMismatch` | `false` | Accept (with a warning) an embedded `public_key` that is another usable entry in the same bundle; see Rotation-overlap mode |
 | `previous` | (none) | The prior receipt; makes the chain check hard (hash link + `sequence` + 1) |
 | `fetcher` | `globalThis.fetch` | Custom fetch (e.g., for tests) |
 
 ### Lower-level exports
 
-`fetchKeyBundle`, `resolveKey`, `clearKeyCache`, `fetchRevocations`, `isKeyRevoked`, `isReceiptRevoked`, `clearRevocationCache`, `canonicalize`, `canonicalizeBytes`, `RECEIPT_VERSION`.
+`fetchKeyBundle`, `resolveKey`, `keyUsableAt`, `clearKeyCache`, `DEFAULT_KEYS_URL`, `KEY_BUNDLE_CACHE_TTL_MS`, `PINNED_KEY_BUNDLE`, `PINNED_KEYS_FETCHED_AT`, `fetchRevocations`, `isKeyRevoked`, `isReceiptRevoked`, `clearRevocationCache`, `DEFAULT_REVOCATIONS_URL`, `REVOCATION_CACHE_TTL_MS`, `canonicalize`, `canonicalizeBytes`, `bytesToHex`, `sha256HexPrefixed`, `RECEIPT_VERSION`, and the types `Receipt`, `VerifyOptions`, `VerifyResult`, `KeyBundle`, `SigningKeyEntry`, `AttestationStrength`, `RevocationFeed`, `JsonValue`. See `ARCHITECTURE.md` for the module map and trust boundaries.
 
 ## Verifying receipts you didn't issue
 
@@ -185,7 +186,7 @@ are the spec (the service runs the same code).
 
 ## Spec drift
 
-The JCS canonicalizer in `src/jcs.ts` is **bit-identical** to the issuer-side serializers in `scry-server/src/lib/receipt_v1.js` and `tunnelmind-data-api/api/utils/receipt-v1.js`. Any change to one MUST be mirrored across all three. The JCS tests live in `test/verify.test.mjs` (with the shared helpers in `test/_helpers.mjs`); there is no frozen cross-implementation wire vector yet.
+The JCS canonicalizer in `src/jcs.ts` produces the same bytes as the issuer-side serializers in `scry-server/src/lib/receipt_v1.js` and `tunnelmind-data-api/api/utils/jcs.js` for every well-formed input; any change to one MUST be mirrored across all three. The one deliberate difference: this package refuses a lone UTF-16 surrogate (the issuers emit U+FFFD), so a receipt carrying one fails closed rather than letting two strings sign to the same bytes. The JCS tests live in `test/verify.test.mjs` and `test/properties.test.mjs` (with the shared helpers in `test/_helpers.mjs`); the frozen cross-implementation wire vectors are `test/vectors/jcs.json`, run here against `src/jcs.ts`, `scripts/verdict-lib/jcs.js` and `scripts/verify-log.mjs` (`test/jcs-vectors.test.mjs`) and are the file tollbooth and atap vendor verbatim (their copies carry this file's sha).
 
 ## Migrating from 1.x to 2.0.0
 

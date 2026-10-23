@@ -1,21 +1,20 @@
 /**
- * api/roots/verify-receipt.js
- *
- * The pure, importable core of the standalone offline verdict verifier
- * (ADR-001 invariant 5). Given a reconciliation receipt + PINNED issuer, log and
- * witness public keys, returns a per-check pass/fail report with no service
- * call. The CLI (scripts/verify-verdict.mjs) is just argv/IO around this; the
- * test suite imports it directly.
- *
- * Trust anchors come only from the caller (V004): any public key carried inside
- * the receipt is attacker-controlled — anyone can embed their own key and sign —
- * so it is at most compared against a pinned key, never verified against.
- * When the caller pins no witness or log key, both default to the usable
- * (active/rotated) entries of the issuer bundle, matched by key_id.
- *
- * Pure: uses globalThis.crypto + the same reconcile()/Merkle code the service
- * runs. No fetch, no env, no Worker bindings. The default issuer bundle and the
- * key-window rule come from the built package (dist/, `npm run build`).
+ * verdict-lib/verify-receipt.js — the offline verdict verifier's kernel.
+ * Dialect: a Reconciliation Verdict receipt = a Receipt v1.0 envelope (the
+ * package verifies that part) whose payload holds claim/conduct/reconciliation
+ * plus a `self_verification` triple (inclusion proof, checkpoint, witness
+ * cosignatures), which is outside the signed envelope. Returns a per-check
+ * pass/fail report; `ok` only when every check passes. Never throws on any
+ * receipt shape — every primitive that can throw is caught into a failed check.
+ * Trust: only what the caller pins — the issuer bundle (default: the shipped
+ * pinned bundle), `logKey`, `witnessKeys`; with no witness/log key pinned,
+ * the bundle's usable entries stand in, matched by key_id. Every key carried
+ * inside the receipt, checkpoint or cosig is attacker-controlled and is never
+ * verified against. No revocation feed and no strength ceiling here: a verdict
+ * receipt has neither contract (the four-tier validation still applies).
+ * Pure: globalThis.crypto + the same reconcile()/Merkle code the service runs;
+ * no fetch, env or bindings. Callers: scripts/verify-verdict.mjs (argv/IO
+ * only) and the tests. Needs the built package (dist/, `npm run build`).
  */
 
 import { reconcile } from './reconcile.js';
@@ -23,7 +22,7 @@ import { verifyInclusion, leafHash } from './log.js';
 import { canonicalize, canonicalizeBytes } from './jcs.js';
 import { sha256HexPrefixed, b64ToBytes } from './hash.js';
 import { PINNED_KEY_BUNDLE } from '../../dist/pinned-keys.js';
-import { resolveKey, keyUsableAt } from '../../dist/keys.js';
+import { verifyReceipt as verifyEnvelope } from '../../dist/index.js';
 
 const subtle = globalThis.crypto.subtle;
 
@@ -67,35 +66,26 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
     return { ok: false, checks };
   }
 
-  // 1. receipt signature — over canonical(receipt minus payload & self_verification),
-  //    signature.value blank (mirrors wrapReceipt's signing object exactly).
-  //    Verified against the BUNDLE key for signature.key_id (same rules as
-  //    src/index.ts verifyReceipt: usable status + [created_at, rotation_after]
-  //    window); the embedded public_key must equal it or the check fails.
+  // 1. receipt signature — delegated to the package's verifyReceipt
+  //    (src/index.ts), the one verifier of the envelope, so the kernel cannot
+  //    drift from it: key_id resolved against the BUNDLE, usable status +
+  //    [created_at, rotation_after] window, embedded public_key equal to it,
+  //    Ed25519 over canonical(receipt minus payload and signature.value).
+  //    self_verification is stripped first: it is not part of the signed
+  //    envelope. payload_hash is check 2's: the package reports it as the
+  //    only errors that start with "payload", so those are filtered out here.
   const sig = receipt.signature;
-  const entry = keys && Array.isArray(keys.keys) && typeof sig.key_id === 'string'
-    ? resolveKey(keys, sig.key_id) : null;
-  if (!sig.value || sig.algorithm !== 'Ed25519') {
-    add('receipt_signature', false, 'unsigned or not Ed25519');
-  } else if (!entry) {
-    add('receipt_signature', false, `key_id ${sig.key_id} not in pinned key bundle`);
-  } else if (sig.public_key !== undefined && sig.public_key !== entry.public_key) {
-    add('receipt_signature', false, `embedded public_key does not match pinned key ${sig.key_id}`);
-  } else {
-    const ts = Date.parse(receipt.timestamp);
-    const why = Number.isFinite(ts) ? keyUsableAt(entry, ts) : `timestamp not a valid date: ${receipt.timestamp}`;
-    const signingObject = { ...receipt };
-    delete signingObject.payload;
-    delete signingObject.self_verification;
-    signingObject.signature = { algorithm: sig.algorithm, key_id: sig.key_id, public_key: sig.public_key };
-    const okSig = !why && await ed25519Verify(entry.public_key, sig.value, canonicalizeBytes(signingObject));
-    add('receipt_signature', okSig, why || (okSig ? `key_id=${sig.key_id}` : 'Ed25519 signature does not verify against pinned key'));
-  }
+  const { self_verification: _sv, ...envelope } = receipt;
+  const env = await verifyEnvelope(envelope, { keys, unsafeSkipRevocations: true, unsafeSkipStrengthCeiling: true });
+  const sigErrors = env.errors.filter((e) => !e.startsWith('payload'));
+  add('receipt_signature', sigErrors.length === 0, sigErrors.length ? sigErrors.join('; ') : `key_id=${sig.key_id}`);
 
   // 2. payload integrity.
   if (receipt.payload !== undefined && receipt.payload_hash) {
-    const h = await sha256HexPrefixed(canonicalizeBytes(receipt.payload));
-    add('payload_hash', h === receipt.payload_hash, h === receipt.payload_hash ? undefined : `recomputed ${h}`);
+    // canonicalizeBytes throws on a lone surrogate; the kernel reports, never throws.
+    let h;
+    try { h = await sha256HexPrefixed(canonicalizeBytes(receipt.payload)); } catch (e) { add('payload_hash', false, e.message); h = null; }
+    if (h !== null) add('payload_hash', h === receipt.payload_hash, h === receipt.payload_hash ? undefined : `recomputed ${h}`);
   } else {
     add('payload_hash', false, 'payload or payload_hash missing');
   }
@@ -105,10 +95,15 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
   if (sv && sv.inclusion_proof && sv.checkpoint) {
     const bare = { ...receipt };
     delete bare.self_verification;
-    const leaf = await leafHash(canonicalizeBytes(bare));
     const { leaf_index, tree_size, audit_path } = sv.inclusion_proof;
-    const okIncl = await verifyInclusion(leaf, leaf_index, tree_size, audit_path || [], sv.checkpoint.root_hash);
-    add('log_inclusion', okIncl, okIncl ? `tree_size=${tree_size}` : 'leaf does not resolve to checkpoint root');
+    let okIncl = false;
+    let inclDetail;
+    try { // canonicalizeBytes throws on a lone surrogate; the kernel reports, never throws
+      const leaf = await leafHash(canonicalizeBytes(bare));
+      okIncl = await verifyInclusion(leaf, leaf_index, tree_size, audit_path || [], sv.checkpoint.root_hash);
+      inclDetail = okIncl ? `tree_size=${tree_size}` : 'leaf does not resolve to checkpoint root';
+    } catch (e) { inclDetail = e.message; }
+    add('log_inclusion', okIncl, inclDetail);
 
     // The issuer (tunnelmind-data-api api/roots/log.js + verdict.js) puts no
     // signature on the checkpoint itself: the root is signed by the witness
@@ -139,7 +134,10 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
     // Witness cosignatures: each must verify under a PINNED witness key (by
     // key_id when the cosig names one; a pinned key without key_id matches any).
     const pinned = witnessKeys === undefined ? defaultPinned : normWitness(witnessKeys);
-    const cosigs = Array.isArray(sv.witness_cosignatures) ? sv.witness_cosignatures : [];
+    // A cosig entry that is not an object (null, a string) is not a cosig:
+    // reading .key_id off it would throw, and the kernel reports, never throws.
+    const cosigs = (Array.isArray(sv.witness_cosignatures) ? sv.witness_cosignatures : [])
+      .filter((c) => c && typeof c === 'object');
     const cpBytes = canonicalizeBytes(cp);
     if (pinned.length === 0) {
       add('witness_cosignatures', false, 'no pinned witness keys');
@@ -170,9 +168,16 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
       key_control_proven: payload.claim.key_control_proven,
     };
     const conduct = payload.conduct && payload.conduct.available !== false ? payload.conduct : null;
-    const rederived = reconcile(claimSide, conduct);
-    const okRd = sameCanonical(rederived, payload.reconciliation);
-    add('verdict_rederivation', okRd, okRd ? `verdict.tier=${rederived.verdict.tier}` : 'reconcile() differs from published');
+    // reconcile() iterates claim.roots and canonicalize() refuses a lone
+    // surrogate: a payload shaped to throw is a failed check, not a crash.
+    let okRd = false;
+    let rdDetail;
+    try {
+      const rederived = reconcile(claimSide, conduct);
+      okRd = sameCanonical(rederived, payload.reconciliation);
+      rdDetail = okRd ? `verdict.tier=${rederived.verdict.tier}` : 'reconcile() differs from published';
+    } catch (e) { rdDetail = e.message; }
+    add('verdict_rederivation', okRd, rdDetail);
   } else {
     add('verdict_rederivation', false, 'payload.claim / payload.reconciliation missing');
   }

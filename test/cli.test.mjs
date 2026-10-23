@@ -1,4 +1,4 @@
-// V004 — the offline CLIs (scripts/verify-verdict.mjs, scripts/verify-log.mjs)
+// The offline CLIs (scripts/verify-verdict.mjs, scripts/verify-log.mjs)
 // trust only pinned keys, never keys carried in the receipt, STH or proof.
 
 import { test } from 'node:test';
@@ -12,6 +12,7 @@ import { canonicalizeBytes } from '../dist/jcs.js';
 import { verifyReceipt } from '../scripts/verdict-lib/verify-receipt.js';
 import { reconcile } from '../scripts/verdict-lib/reconcile.js';
 import { leafHash as libLeafHash } from '../scripts/verdict-lib/log.js';
+import { b64ToBytes } from '../scripts/verdict-lib/hash.js';
 import { verifySth, verifyInclusion, leafHash, jcs } from '../scripts/verify-log.mjs';
 import { makeReceipt, makeEphemeralKey, makeKeyBundle } from './_helpers.mjs';
 
@@ -126,7 +127,7 @@ test('(e) cosigs that verify only against their embedded public_key fail', async
   assert.equal(check(r, 'witness_cosignatures').detail, 'no pinned witness keys');
 });
 
-// R005 — with no witnessKeys / logKey, the usable `keys` entries are the default
+// With no witnessKeys / logKey, the usable `keys` entries are the default
 // pins, matched by key_id. Keys carried in the receipt still count for nothing.
 const withWitness = (v, entry) => makeKeyBundle([...v.keys.keys,
   { key_id: 'w1', algorithm: 'Ed25519', public_key: v.witness.publicKeyB64, ...entry }]);
@@ -219,6 +220,23 @@ test('(c) forged STH carrying the attacker key fails against the pinned log key'
   assert.equal(verifySth(genuine, pinned.publicKeyB64), true);
 });
 
+// Buffer.from(s, 'base64') also takes base64url, so without the guard a
+// signature the package refuses would verify here. Standard base64 only.
+test('(c) an STH signature or key in base64url does not verify', async () => {
+  const toUrl = (s) => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  // A string with no + or / is the same in both alphabets: pick a key and a
+  // signature that carry one.
+  let pinned = await makeEphemeralKey();
+  while (!/[+/]/.test(pinned.publicKeyB64)) pinned = await makeEphemeralKey();
+  let sth = await makeSth(pinned, { root_hash: 'ab'.repeat(32), tree_size: 1 });
+  while (!/[+/]/.test(sth.signature.value)) sth = await makeSth(pinned, { root_hash: 'ab'.repeat(32), tree_size: 1 });
+  assert.equal(verifySth(sth, pinned.publicKeyB64), true);
+  assert.equal(verifySth({ ...sth, signature: { ...sth.signature, value: toUrl(sth.signature.value) } }, pinned.publicKeyB64), false);
+  assert.equal(verifySth(sth, toUrl(pinned.publicKeyB64)), false);
+  assert.equal(verifySth({ ...sth, signature: { ...sth.signature, value: 42 } }, pinned.publicKeyB64), false);
+  assert.equal(verifySth(null, pinned.publicKeyB64), false);
+});
+
 test('(d) a lying proof leaf_hash does not help: the leaf comes from receipt bytes', async () => {
   const { receipt } = await makeVerdict();
   const { self_verification, ...bare } = receipt;
@@ -284,4 +302,34 @@ test('CLI inclusion hashes the receipt as supplied, self_verification included',
   const incl = (r) => run('scripts/verify-log.mjs', ['inclusion', proofPath, '--key', pinned.publicKeyB64, '--receipt', r]);
   assert.equal(incl(f('full.json', receipt)), 0);
   assert.equal(incl(f('bare.json', bare)), 1);
+});
+
+// The kernel decodes standard base64 only, as the package
+// does, so one receipt cannot pass here and fail verifyReceipt().
+test('a base64url cosig fails against the pinned witness key', async () => {
+  const toUrl = (s) => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  let v = await makeVerdict();
+  // A signature with no + or / is the same string in both alphabets.
+  while (!/[+/]/.test(v.receipt.self_verification.witness_cosignatures[0].value)) v = await makeVerdict();
+  const sv = v.receipt.self_verification;
+  const cosig = { ...sv.witness_cosignatures[0], value: toUrl(sv.witness_cosignatures[0].value) };
+  const r = await verifyReceipt({ ...v.receipt, self_verification: { ...sv, witness_cosignatures: [cosig] } }, {
+    keys: v.keys, witnessKeys: [v.witness.publicKeyB64],
+  });
+  assert.equal(check(r, 'witness_cosignatures').pass, false);
+  assert.throws(() => b64ToBytes('AbC-_w'));
+});
+
+// Check 1 is the package's verifyReceipt; the kernel itself applies no
+// strength ceiling and reads no revocation feed.
+test('receipt_signature passes with no ceiling, and names the package error when it fails', async () => {
+  const v = await makeVerdict();
+  const keys = makeKeyBundle([{ ...v.keys.keys[0], attestation_strength: 'self-asserted' }]);
+  const r = await verifyReceipt({ ...v.receipt, attestation_strength: 'silicon-root' }, { keys, witnessKeys: [v.witness.publicKeyB64] });
+  // The strength is signed, so re-labelling it breaks the signature, not the ceiling.
+  assert.equal(check(r, 'receipt_signature').pass, false);
+  assert.equal(check(r, 'receipt_signature').detail, 'Ed25519 signature did not verify');
+  const ok = await verifyReceipt(v.receipt, { keys, witnessKeys: [v.witness.publicKeyB64] });
+  assert.equal(check(ok, 'receipt_signature').pass, true, JSON.stringify(ok.checks));
+  assert.equal(check(ok, 'receipt_signature').detail, `key_id=${v.receipt.signature.key_id}`);
 });

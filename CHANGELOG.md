@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- `attestation_strength` must be one of `self-asserted`, `software`, `tee-tpm`, `silicon-root`: a receipt without the field or with any other value (an unknown tier ranked below every ceiling; a prototype name such as `constructor` ranked as a function) now fails with `attestation_strength: unrecognized value ...`, under `unsafeSkipStrengthCeiling` too (2026-10-21).
+- `signature.value` must be the canonical padded standard base64 of the signature: a copy with whitespace, a missing `=` pad or stray low bits in the last character decoded to the same bytes and verified while hashing to a different `chain.previous_receipt_hash` link; it now fails with `signature verification failed: signature.value is not canonical standard base64` (2026-10-22).
+
 ## 2.0.0 - 2026-10-17
 
 ### Breaking

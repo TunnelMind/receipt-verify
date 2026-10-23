@@ -1,12 +1,16 @@
-// Revocation feed per Receipt Format v1.0 §8.
-//
-// Two flavors:
-//   - revoked_keys[]     — invalidate signatures by key_id after revoked_at
-//   - revoked_receipts[] — issuer-retracted individual receipts (by uuidv7)
-//
-// Production verifiers MAY also use the single-item lookup at
-// `https://data.tunnelmind.ai/v1/receipt/revoked?key_id=...|?id=...` —
-// this module concerns itself only with the static feed.
+// Revocation feed per Receipt Format v1.0 §8: the issuer's list of keys that
+// must no longer verify (revoked_keys, by key_id, from revoked_at) and of
+// individual receipts it retracted (revoked_receipts, by uuidv7).
+// Called by index.ts step 6, which applies the feed; a fetch that fails there
+// is an error, so blocking the feed cannot un-revoke a key.
+// Trust: the feed is trusted as a whole (the caller's object or the URL the
+// caller chose). A fetched body is normalised, not validated: a missing or
+// non-array revoked_keys / revoked_receipts counts as "nothing revoked" (the
+// published feed starts empty), while a malformed entry inside an array
+// throws in isKeyRevoked/isReceiptRevoked and index.ts reports that as an
+// error. Cached per URL for REVOCATION_CACHE_TTL_MS.
+// Production verifiers MAY instead use the single-item lookup at
+// `https://data.tunnelmind.ai/v1/receipt/revoked?key_id=...|?id=...`.
 
 export const DEFAULT_REVOCATIONS_URL =
   'https://tunnelmind.ai/.well-known/receipt-revocations.json';
@@ -77,6 +81,8 @@ export interface ReceiptRevocationCheck {
   reason?: string;
 }
 
+/** Whether the feed lists `keyId` (exact match: key ids are opaque) and, if
+ *  so, when and why — the caller decides how revoked_at and reason apply. */
 export function isKeyRevoked(feed: RevocationFeed, keyId: string): KeyRevocationCheck {
   const m = feed.revoked_keys.find((k) => k.key_id === keyId);
   if (!m) return { revoked: false };
@@ -88,6 +94,9 @@ export function isKeyRevoked(feed: RevocationFeed, keyId: string): KeyRevocation
   };
 }
 
+/** Whether the feed retracts `receiptId`. Case-insensitive because receipt
+ *  ids are UUIDs (RFC 9562: hex digits compare case-insensitively) and only
+ *  the feed side can differ — the receipt's own id is signed. */
 export function isReceiptRevoked(feed: RevocationFeed, receiptId: string): ReceiptRevocationCheck {
   const m = feed.revoked_receipts.find((r) => r.receipt_id.toLowerCase() === receiptId.toLowerCase());
   if (!m) return { revoked: false };

@@ -1,7 +1,15 @@
-// JCS (RFC 8785) canonicalizer — bit-identical to the issuer-side serializers
-// in scry-server (`src/lib/receipt_v1.js`) and tunnelmind-data-api
-// (`api/utils/receipt-v1.js`). DO NOT diverge: any drift breaks signature
-// verification for receipts signed by either issuer.
+// JCS (RFC 8785) canonicalizer: the bytes every signature and payload_hash
+// in this package is computed over. Produces the same bytes as the issuer-side
+// serializers (tunnelmind-data-api `api/utils/jcs.js`, scry-server
+// `src/lib/receipt_v1.js`) for every well-formed input — the frozen vectors
+// in test/vectors/jcs.json pin that — so do not change the output for any
+// input a signer can produce: drift breaks every signed receipt.
+// One deliberate difference: a lone UTF-16 surrogate throws here where the
+// issuers emit U+FFFD, so a receipt containing one fails closed instead of
+// two different strings canonicalizing to one signed byte string.
+// Input is untrusted parsed JSON; NaN/Infinity (unreachable from JSON.parse)
+// throw, `undefined` members are dropped. Never normalizes Unicode: "é" and
+// "é" are different strings and hash differently, by design.
 
 export type JsonValue =
   | null
@@ -31,6 +39,10 @@ function encodeString(s: string): string {
   return out + '"';
 }
 
+/** RFC 8785 text of `value`: keys sorted by UTF-16 code units, ES number
+ *  formatting, minimal string escapes. Throws on non-finite numbers,
+ *  non-JSON types and lone surrogates; `undefined` object members are
+ *  dropped (JSON.stringify does the same, so parsed input never has them). */
 export function canonicalize(value: JsonValue): string {
   if (value === null) return 'null';
   if (typeof value === 'boolean') return value ? 'true' : 'false';

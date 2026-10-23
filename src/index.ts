@@ -1,19 +1,18 @@
-// @tunnelmindai/receipt-verify — reference verifier for the
-// TunnelMind Receipt Format v1.0.
-//
-// Spec: https://tunnelmind.ai/standards/receipt-format/v1
-// Repo: https://github.com/TunnelMind/receipt-verify
-//
-// This package implements §4 (Verification procedure) end-to-end plus
-// §8 (Revocation) lookups. Zero runtime dependencies. Targets WebCrypto
-// SubtleCrypto + fetch — runs on Node ≥18, Cloudflare Workers, Deno, Bun.
-//
-// The verifier is deliberately STRICT-by-default. Every key that signs must
-// come from the key bundle and be usable at the receipt's timestamp (status
-// active/rotated, inside [created_at, rotation_after]). `allowKeyMismatch`
-// only lets a receipt whose embedded public_key belongs to a DIFFERENT
-// usable key in the same bundle verify against that key, with a warning
-// (key-rotation overlap). The embedded public_key is never verified against.
+// @tunnelmindai/receipt-verify — reference verifier for the TunnelMind
+// Receipt Format v1.0 (spec §4 + §8; https://tunnelmind.ai/standards/receipt-format/v1).
+// Dialect: the v1.0 envelope — Ed25519 (standard base64, never base64url)
+// over JCS(receipt minus `payload` minus `signature.value`); JCS refuses a
+// lone surrogate (see jcs.ts), so such a receipt fails, never collides.
+// Trust: ONLY the key bundle (opts.keys > fetched opts.keysUrl > the pinned
+// bundle in pinned-keys.ts) and the revocation feed. Everything inside the
+// receipt — its embedded public_key included — is attacker-controlled and is
+// compared against the bundle, never verified against. Ceiling rule: the
+// claimed attestation_strength must be one of the four tiers and at most the
+// signing key's declared strength. Fails closed: every unresolved key,
+// failed fetch, malformed field or thrown primitive is an error and
+// `valid` is false; only chain sanity without `previous` is a warning.
+// Callers: verifyReceipt() is the public API; scripts/verdict-lib wraps it
+// for verdict receipts. Zero deps; WebCrypto + fetch (Node ≥18, Workers, Deno, Bun).
 
 import { canonicalize, canonicalizeBytes, type JsonValue } from './jcs.js';
 import {
@@ -70,6 +69,7 @@ export interface Receipt {
   timestamp_proof?: { method: string; [k: string]: unknown };
   source: ReceiptSource;
   subject?: string;
+  /** Required and validated: one of the four tiers, or the receipt is invalid. */
   attestation_strength: AttestationStrength;
   payload_hash: string;
   payload: JsonValue;
@@ -95,6 +95,11 @@ export interface VerifyOptions {
    *  or compromised key verifies. Offline callers should pass `revocations`
    *  instead. */
   unsafeSkipRevocations?: boolean;
+  /** UNSAFE: disables the attestation-strength ceiling (§4 step 5), so a
+   *  receipt claiming a strength above its signing key's verifies. The
+   *  four-tier validation still runs. Exists for scripts/verdict-lib, whose
+   *  verdict receipts carry no ceiling contract. */
+  unsafeSkipStrengthCeiling?: boolean;
   /** Override the well-known revocations URL. */
   revocationsUrl?: string;
   /** When the receipt's embedded public_key differs from the bundle key for
@@ -126,11 +131,28 @@ export interface VerifyResult {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/** Standard base64 → bytes. atob() throws on `-`/`_` (base64url) and junk,
+ *  but forgives ASCII whitespace, a missing `=` pad and unused low bits in
+ *  the last character; signatureBytes below closes those for the one field
+ *  where the spelling matters. */
 function b64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   const bin = atob(b64);
   const out = new Uint8Array(new ArrayBuffer(bin.length));
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+/** `signature.value` → bytes, accepting only the canonical padded spelling
+ *  (the bytes re-encode to the same string). The signature does not cover
+ *  its own value, and the chain links on the SHA-256 of that string, so a
+ *  forgiving decode would let one signature travel under many strings that
+ *  all verify and each hash to a different chain link. */
+function signatureBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bytes = b64ToBytes(b64);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  if (btoa(bin) !== b64) throw new Error('signature.value is not canonical standard base64');
+  return bytes;
 }
 
 function bytesToHex(buf: ArrayBuffer | Uint8Array): string {
@@ -150,9 +172,11 @@ function toAB(u: Uint8Array): Uint8Array<ArrayBuffer> {
   return new Uint8Array(buf);
 }
 
+/** Spec §3 step 2: the signed bytes are JCS(receipt minus `payload` minus
+ *  `signature.value`). Every other field — unknown ones included — stays, so
+ *  the issuer and this verifier sign/verify the same bytes; dropping a field
+ *  here would let an attacker add it unsigned. */
 function buildSigningObject(receipt: Receipt): JsonValue {
-  // Per spec §3 step 2: signing object = receipt with `payload` and
-  // `signature.value` omitted, then JCS-canonicalized.
   const { payload: _payload, signature, ...rest } = receipt;
   const { value: _value, ...sigNoValue } = signature;
   void _payload; void _value;
@@ -163,6 +187,11 @@ function buildSigningObject(receipt: Receipt): JsonValue {
 
 /**
  * Verify a TunnelMind Receipt v1.0 against the published spec.
+ *
+ * `receipt` is untrusted input (any shape; never throws, every defect is an
+ * error string). Returns valid=true only when `errors` is empty; every check
+ * runs even after an earlier failure so one call reports every defect, except
+ * a wrong receipt_version, which returns at once (nothing else is defined).
  *
  * Performs:
  *   1. version check
@@ -281,7 +310,7 @@ export async function verifyReceipt(
           { name: 'Ed25519' },
           false, ['verify'],
         );
-        const sig = b64ToBytes(receipt.signature.value);
+        const sig = signatureBytes(receipt.signature.value);
         const ok  = await subtle.verify(
           'Ed25519', pubKey, sig,
           toAB(canonicalizeBytes(buildSigningObject(receipt))),
@@ -293,10 +322,19 @@ export async function verifyReceipt(
     }
   }
 
-  // 5. Attestation-strength ceiling
-  if (signingKey?.attestation_strength) {
-    const tokenRank = STRENGTH_RANK[receipt.attestation_strength] ?? -1;
-    const keyRank   = STRENGTH_RANK[signingKey.attestation_strength] ?? -1;
+  // 5. Attestation-strength ceiling. The claimed value must be one of the
+  // four tiers, checked with Object.hasOwn: a bare STRENGTH_RANK[x] lookup
+  // would rank an unknown value -1 (below every ceiling) and a prototype
+  // name ("constructor") as a function, which no ceiling exceeds. A key whose
+  // own attestation_strength is not a tier ranks -1, so every claim exceeds it.
+  const claimedStrength: unknown = receipt.attestation_strength;
+  const rankOf = (s: unknown): number =>
+    typeof s === 'string' && Object.hasOwn(STRENGTH_RANK, s) ? STRENGTH_RANK[s as AttestationStrength] : -1;
+  if (rankOf(claimedStrength) < 0) {
+    errors.push(`attestation_strength: unrecognized value ${String(claimedStrength)}`);
+  } else if (signingKey?.attestation_strength && !opts.unsafeSkipStrengthCeiling) {
+    const tokenRank = rankOf(claimedStrength);
+    const keyRank   = rankOf(signingKey.attestation_strength);
     if (tokenRank > keyRank) {
       errors.push(
         `attestation_strength ceiling violated: receipt=${receipt.attestation_strength} > key=${signingKey.attestation_strength}`,
@@ -381,8 +419,10 @@ export async function verifyReceipt(
   return out;
 }
 
-// Re-exports for advanced consumers
-export { canonicalize, canonicalizeBytes };
+// Re-exports for advanced consumers. bytesToHex / sha256HexPrefixed are also
+// the one copy scripts/verdict-lib and the test helpers hash with, so a
+// receipt is hashed the same way everywhere in this repo.
+export { canonicalize, canonicalizeBytes, bytesToHex, sha256HexPrefixed };
 export {
   DEFAULT_KEYS_URL,
   KEY_BUNDLE_CACHE_TTL_MS,

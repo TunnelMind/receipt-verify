@@ -1,10 +1,18 @@
-// Receipt signing-key bundle resolution. Spec §4 step 2: relying parties
-// fetch the well-known bundle, find the key whose key_id matches the
-// receipt's, and confirm its public_key equals the receipt's.
-//
-// Fetched bundles are cached per URL for KEY_BUNDLE_CACHE_TTL_MS (5 min);
-// pass `noCache: true` to force a re-fetch. Production verifiers should mirror the well-known
-// feed locally rather than hitting the network on every verify.
+// Receipt signing-key bundle: the trust anchor of every verification. Spec
+// §4 step 2: find the bundle key whose key_id matches the receipt's, confirm
+// the receipt's embedded public_key equals it, verify against the bundle's.
+// Called by index.ts step 3; fetches only when the caller names a keysUrl.
+// Trust boundary: the bundle is trusted as a whole (it comes from the caller,
+// the URL the caller chose, or pinned-keys.ts); a fetched body is validated
+// only as "object with a `keys` array". Entries are not validated field by
+// field: a null entry throws in resolveKey (index.ts catches it), and
+// keyUsableAt returns a reason for an unparseable bound, but a status of null
+// reads as active and a non-string bound is coerced by Date.parse
+// (created_at 1 parses as 2001). That is why the bundle must be trusted.
+// Invariant: a fetched bundle is cached per URL, after validation, for
+// KEY_BUNDLE_CACHE_TTL_MS, so one issuer's keys are never served for another
+// and a rotation is seen within the TTL. Production verifiers should mirror
+// the well-known file locally rather than fetch on every verify.
 
 export const DEFAULT_KEYS_URL =
   'https://tunnelmind.ai/.well-known/receipt-signing-key.json';
@@ -55,6 +63,9 @@ export interface ResolveKeyOptions {
   fetcher?: typeof fetch;
 }
 
+/** The bundle at `opts.url` (default DEFAULT_KEYS_URL), from cache when fresh.
+ *  Throws on a non-2xx status, a non-JSON body or a body without a `keys`
+ *  array; the caller turns that into a verification error (fail closed). */
 export async function fetchKeyBundle(opts: ResolveKeyOptions = {}): Promise<KeyBundle> {
   if (opts.bundle) return opts.bundle;
   const url = opts.url ?? DEFAULT_KEYS_URL;
@@ -71,6 +82,8 @@ export async function fetchKeyBundle(opts: ResolveKeyOptions = {}): Promise<KeyB
   return j;
 }
 
+/** The bundle entry named `keyId` (exact, case-sensitive match: key ids are
+ *  opaque identifiers the issuer chose), or null. */
 export function resolveKey(bundle: KeyBundle, keyId: string): SigningKeyEntry | null {
   return bundle.keys.find((k) => k.key_id === keyId) ?? null;
 }
@@ -85,8 +98,10 @@ export function clearKeyCache(): void {
  *  A usable key has status active or rotated (a missing status counts as
  *  active, so bare pinned/test bundles keep working) and a window
  *  [created_at, rotation_after] covering the timestamp; a missing bound is
- *  unbounded on that side. Past rotation_after is rejected even for a
- *  'rotated' key: the window, not the status, says when it signed. */
+ *  unbounded on that side; both bounds are inclusive. Past rotation_after is
+ *  rejected even for a 'rotated' key: the window, not the status, says when
+ *  it signed. An unparseable bound is a reason, not "unbounded" — a bundle
+ *  typo must not widen a key's life. */
 export function keyUsableAt(entry: SigningKeyEntry, tsMs: number): string | null {
   const status = entry.status ?? 'active';
   if (status !== 'active' && status !== 'rotated') {

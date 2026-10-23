@@ -1,19 +1,24 @@
 /**
- * api/roots/log.js
- *
- * RFC 6962-style Merkle primitives for the self-verification triple (ADR-001 §3).
- * Pure + zero-dep: leaf/node hashing, single-leaf checkpoint construction, and an
- * inclusion-proof verifier. The verifier is the half that matters for invariant 5
- * — `scripts/verify-verdict.mjs` re-derives a verdict offline using exactly this
- * code path, with only the receipt bytes + witness keys.
+ * verdict-lib/log.js — RFC 6962 Merkle primitives for a verdict receipt's
+ * self-verification triple: leaf/node hashing and the inclusion-proof
+ * verifier that verify-receipt.js check 3 runs over the receipt bytes and
+ * the checkpoint root. Vendored verbatim (verifier half) from
+ * tunnelmind-data-api api/roots/log.js, the code the service runs, so the
+ * offline re-derivation and the service agree by construction; the
+ * publisher's checkpoint builder is not needed here.
+ * Inputs (index, tree size, audit path, root) come from the untrusted
+ * receipt. verifyInclusion returns false for a bad index or tree size or a
+ * path longer than the tree, and can throw on a path that is not iterable
+ * or on a non-string sibling it reaches (hexToBytes); verify-receipt.js
+ * catches that, so a malformed proof is a failed check either way.
  *
  * Domain-separated hashing (RFC 6962 §2.1):
  *   leaf hash  = SHA-256(0x00 || data)
  *   node hash  = SHA-256(0x01 || left || right)
  *
- * Bootstrap (ADR-001): the log is a 1-leaf tree per record — root == leaf hash,
- * audit_path === []. The verifier handles general multi-leaf proofs so adding a
- * real batched log later changes data, not this code.
+ * Today's log is a 1-leaf tree per record — root == leaf hash, audit_path
+ * === []. The verifier handles general multi-leaf proofs so a batched log
+ * later changes data, not this code.
  */
 
 import { bytesToHex as hex, hexToBytes } from './hash.js';
@@ -37,29 +42,6 @@ export async function leafHash(data) {
 export async function nodeHash(leftHex, rightHex) {
   const body = concat(new Uint8Array([0x01]), concat(hexToBytes(leftHex), hexToBytes(rightHex)));
   return '0x' + hex(await sha256(body));
-}
-
-/**
- * Build the self-verification inclusion proof + checkpoint for a single record.
- * Bootstrap: a 1-leaf tree. Returns the {inclusion_proof, checkpoint} shape
- * ADR-001 §3 specifies (minus the witness cosignature, which needs the signing
- * key and is added by the publish layer).
- *
- * @param {Uint8Array} canonicalBytes — the canonical receipt body bytes
- * @param {string} treeId — log id (env-configured; never hardcoded by callers)
- */
-export async function buildSingleLeafCheckpoint(canonicalBytes, treeId) {
-  const leaf = await leafHash(canonicalBytes);
-  return {
-    inclusion_proof: { leaf_index: 0, tree_size: 1, audit_path: [] },
-    checkpoint: {
-      tree_id:   treeId,
-      tree_size: 1,
-      root_hash: leaf,                 // 1-leaf tree: root == leaf hash
-      signed_at: new Date().toISOString(),
-    },
-    _leaf_hash: leaf,                  // convenience for the publisher; not part of the wire shape
-  };
 }
 
 /**
