@@ -1,7 +1,7 @@
 {
   "name": "@tunnelmindai/receipt-verify",
   "version": "2.0.0",
-  "description": "Reference verifier for the TunnelMind Receipt Format v1.0. Offline Ed25519 + JCS verification, key-bundle resolution, and revocation checking against the well-known feed. Zero runtime dependencies; runs on Node ≥18, Cloudflare Workers, Deno, Bun.",
+  "description": "Reference verifier for the TunnelMind Receipt Format v1.0 — the offline check under TunnelMind's accountability kit for agents. Ed25519 + JCS verification against a pinned key bundle, revocation checking against the well-known feed. Zero runtime dependencies; runs on Node ≥18, Cloudflare Workers, Deno, Bun.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -26,6 +26,8 @@
   "keywords": [
     "tunnelmind",
     "receipt",
+    "offline-verification",
+    "audit",
     "ed25519",
     "jcs",
     "attestation",
