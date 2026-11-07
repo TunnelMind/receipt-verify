@@ -1,5 +1,5 @@
 // RFC 6962 / RFC 9162 Merkle primitives for the receipt transparency log,
-// on WebCrypto so they run wherever verifyReceipt() runs (Node >=18,
+// on WebCrypto so they run wherever verifyReceipt() runs (Node >=20,
 // Workers, Deno, Bun). Hashing: leaf = SHA-256(0x00 || data), node =
 // SHA-256(0x01 || left || right) (RFC 6962 §2.1). Verification follows
 // RFC 9162 §2.1.3.2 (inclusion) and §2.1.4.2 (consistency).

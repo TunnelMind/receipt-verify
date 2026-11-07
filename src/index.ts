@@ -12,7 +12,7 @@
 // failed fetch, malformed field or thrown primitive is an error and
 // `valid` is false; only chain sanity without `previous` is a warning.
 // Callers: verifyReceipt() is the public API; scripts/verdict-lib wraps it
-// for verdict receipts. Zero deps; WebCrypto + fetch (Node ≥18, Workers, Deno, Bun).
+// for verdict receipts. Zero deps; WebCrypto + fetch (Node ≥20, Workers, Deno, Bun).
 
 import { canonicalize, canonicalizeBytes, type JsonValue } from './jcs.js';
 import {
