@@ -15,7 +15,7 @@
 //
 // Usage:
 //   node scripts/verify-log.mjs inclusion   <proof.json> [sth.json] --key <public_key_b64> --receipt <receipt.json>
-//   node scripts/verify-log.mjs consistency <proof.json>
+//   node scripts/verify-log.mjs consistency <proof.json> <older_sth.json> <newer_sth.json> --key <public_key_b64>
 //   node scripts/verify-log.mjs sth         <sth.json> <public_key_b64>
 //
 // proof.json shapes are exactly what GET /v1/receipts/log/proof and
@@ -143,7 +143,7 @@ export function verifySth(sth, publicKeyB64) {
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 const USAGE = 'usage: verify-log.mjs inclusion <proof.json> [sth.json] --key <b64> --receipt <receipt.json>'
-  + ' | consistency <proof.json> | sth <sth.json> <public_key_b64>';
+  + ' | consistency <proof.json> <older_sth.json> <newer_sth.json> --key <b64> | sth <sth.json> <public_key_b64>';
 
 function main() {
   let values, positionals;
@@ -177,13 +177,26 @@ function main() {
     process.exit(okIncl && okSig ? 0 : 1);
   }
   if (mode === 'consistency') {
+    // The roots come from the two STHs, each verified under the pinned --key;
+    // the proof's own first_root/second_root are only checked against them.
+    // A proof alone is self-consistent by construction and proves nothing.
+    if (!values.key || args.length !== 3) {
+      console.error('consistency requires <proof.json> <older_sth.json> <newer_sth.json> --key <public_key_b64>');
+      process.exit(2);
+    }
     const p = unwrap(load(args[0]));
-    const okc = verifyConsistency({
-      first: p.first, second: p.second,
-      firstRoot: unhex(p.first_root), secondRoot: unhex(p.second_root),
-      proof: p.proof.map(unhex),
+    const older = unwrap(load(args[1]));
+    const newer = unwrap(load(args[2]));
+    const okSigs = verifySth(older, values.key) && verifySth(newer, values.key);
+    const rootsAgree = (p.first_root === undefined || String(p.first_root).replace(/^0x/, '') === String(older.root_hash).replace(/^0x/, ''))
+      && (p.second_root === undefined || String(p.second_root).replace(/^0x/, '') === String(newer.root_hash).replace(/^0x/, ''));
+    const sizesAgree = p.first === older.tree_size && p.second === newer.tree_size;
+    const okc = okSigs && rootsAgree && sizesAgree && verifyConsistency({
+      first: older.tree_size, second: newer.tree_size,
+      firstRoot: unhex(older.root_hash), secondRoot: unhex(newer.root_hash),
+      proof: (p.proof ?? []).map(unhex),
     });
-    console.log(JSON.stringify({ consistency: okc }));
+    console.log(JSON.stringify({ consistency: okc, sth_signatures: okSigs }));
     process.exit(okc ? 0 : 1);
   }
   if (mode === 'sth') {

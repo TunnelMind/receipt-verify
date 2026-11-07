@@ -8,7 +8,9 @@ trusts and still means what it says.
 ## Module map
 
 ```
-src/index.ts        verifyReceipt(): the §4 procedure, steps 1–7, and every public export
+src/index.ts        verifyReceipt(): the §4 procedure, steps 1–7, step 8 (log inclusion), and every public export
+src/merkle.ts       RFC 6962 hashing + RFC 9162 inclusion/consistency math (WebCrypto); trusts no root itself
+src/log.ts          signed tree heads under pinned log keys, receipt inclusion, STH consistency, LogMonitor
 src/jcs.ts          RFC 8785 canonicalizer: the bytes signatures and payload_hash cover
 src/keys.ts         key bundle: fetch + per-URL cache, resolveKey, keyUsableAt (status + window)
 src/revocation.ts   revocation feed: fetch + cache, isKeyRevoked, isReceiptRevoked
@@ -33,6 +35,9 @@ receipt (untrusted JSON)
    │ 5 attestation_strength ∈ four tiers and ≤ entry.attestation_strength
    │ 6 feed = opts.revocations > fetch(revocationsUrl); key + receipt lookups   ← revocation.ts
    │ 7 chain sanity (warning), or hard hash+sequence link when opts.previous is given
+   │ 8 opts.inclusion: STH verified under pinned logKeys (never the receipt bundle);   ← log.ts
+   │   proof root/size must equal the STH's; leaf = SHA-256(0x00||JCS(receipt));
+   │   audit path → signed root (merkle.ts). opts.requireInclusion: no proof = error
    ▼
 VerifyResult { valid: errors.length === 0, errors, warnings, receipt_id, key_id, attestation_strength }
 ```
@@ -51,6 +56,9 @@ re-run over the payload and compared with the published verdict.
   normalised to `[]`). Entries are not validated field by field: a null key
   entry fails the receipt, but `status: null` reads as active and a
   non-string bound is coerced by `Date.parse` (see `src/keys.ts`).
+- **Trusted for the log:** the caller's `logKeys` only, a separate set from the
+  receipt bundle. A tree size or root is trusted only from an STH that
+  verified under one of them; RFC 9162 proof math does not bind the tree size.
 - **Untrusted:** everything in the receipt, including `signature.public_key`
   (compared to the bundle, never verified against), and every key carried in
   a verdict receipt's checkpoint or cosignatures. CLI file arguments are

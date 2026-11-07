@@ -30,6 +30,13 @@ import {
   isReceiptRevoked,
   type RevocationFeed,
 } from './revocation.js';
+import {
+  verifyReceiptInclusion,
+  type InclusionProof,
+  type LogKeyEntry,
+  type LogStatus,
+  type SignedTreeHead,
+} from './log.js';
 
 const subtle = globalThis.crypto.subtle;
 
@@ -117,6 +124,24 @@ export interface VerifyOptions {
   previous?: Receipt;
   /** Custom fetch (e.g., for offline tests). */
   fetcher?: typeof fetch;
+  /** Transparency-log inclusion. When given, the receipt must be proven in
+   *  the log: `sth` (else `proof.sth`) must verify under the pinned
+   *  `logKeys` (never the receipt bundle), match the proof, and the audit
+   *  path must lead from the receipt's recomputed leaf to the signed root.
+   *  A failed proof is always an error. See log.ts. */
+  inclusion?: {
+    proof: InclusionProof;
+    sth?: SignedTreeHead;
+    logKeys: LogKeyEntry[];
+    /** Refuse an STH that names no signature.key_id. */
+    requireKeyId?: boolean;
+    logId?: string;
+  };
+  /** Make a missing inclusion proof an error. Default false in 2.x, because
+   *  the log does not yet issue inclusion promises and a freshly issued
+   *  receipt has no proof until the next tree head; `result.log.status`
+   *  reports `not_checked` so callers can see the gap either way. */
+  requireInclusion?: boolean;
 }
 
 export interface VerifyResult {
@@ -127,6 +152,10 @@ export interface VerifyResult {
   receipt_id?: string;
   key_id?: string;
   attestation_strength?: AttestationStrength;
+  /** Transparency-log status: `included` (proven under a pinned log key),
+   *  `failed` (a proof was given and did not verify), or `not_checked` (no
+   *  proof given: the signature is checked, log membership is NOT). */
+  log: { status: LogStatus; tree_size?: number; leaf_index?: number; log_key_id?: string };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -203,6 +232,9 @@ function buildSigningObject(receipt: Receipt): JsonValue {
  *   6. optional revocation check (key + receipt)
  *   7. chain sequence sanity (warn-only); with opts.previous, the hash link
  *      and sequence+1 are checked and mismatches are errors
+ *   8. with opts.inclusion, transparency-log inclusion under pinned log
+ *      keys (result.log.status); with opts.requireInclusion, a missing
+ *      proof is an error
  */
 export async function verifyReceipt(
   receipt: Receipt,
@@ -210,7 +242,7 @@ export async function verifyReceipt(
 ): Promise<VerifyResult> {
   const errors: string[]   = [];
   const warnings: string[] = [];
-  const out: VerifyResult = { valid: false, errors, warnings };
+  const out: VerifyResult = { valid: false, errors, warnings, log: { status: 'not_checked' } };
 
   if (!receipt || typeof receipt !== 'object') {
     errors.push('receipt must be a non-null object');
@@ -415,6 +447,23 @@ export async function verifyReceipt(
     }
   }
 
+  // 8. Transparency-log inclusion (log.ts). The leaf is the receipt exactly
+  // as supplied; the root comes only from an STH under a pinned log key.
+  if (opts.inclusion) {
+    const inc = opts.inclusion;
+    const r = await verifyReceiptInclusion(receipt, inc.proof, inc.sth, inc.logKeys, {
+      requireKeyId: inc.requireKeyId,
+      logId: inc.logId,
+    });
+    out.log = { status: r.status };
+    if (r.tree_size !== undefined) out.log.tree_size = r.tree_size;
+    if (r.leaf_index !== undefined) out.log.leaf_index = r.leaf_index;
+    if (r.log_key_id !== undefined) out.log.log_key_id = r.log_key_id;
+    for (const e of r.errors) errors.push(`log inclusion: ${e}`);
+  } else if (opts.requireInclusion) {
+    errors.push('log inclusion: required but no inclusion proof was supplied');
+  }
+
   out.valid = errors.length === 0;
   return out;
 }
@@ -453,3 +502,36 @@ export type {
   ReceiptRevocationCheck,
 } from './revocation.js';
 export type { JsonValue } from './jcs.js';
+export {
+  verifySth,
+  verifyReceiptInclusion,
+  verifySthConsistency,
+  receiptLeafHash,
+  LogMonitor,
+  MemorySthStore,
+} from './log.js';
+export type {
+  SignedTreeHead,
+  SthSignature,
+  InclusionProof,
+  ConsistencyProof,
+  LogKeyEntry,
+  SthOptions,
+  SthResult,
+  LogStatus,
+  InclusionResult,
+  ConsistencyResult,
+  SthStore,
+  MonitorStatus,
+  MonitorResult,
+  LogMonitorOptions,
+} from './log.js';
+export {
+  leafHash,
+  nodeHash,
+  verifyInclusion,
+  verifyConsistency,
+  parseHash,
+  HASH_LENGTH,
+} from './merkle.js';
+export type { InclusionInput, ConsistencyInput } from './merkle.js';
