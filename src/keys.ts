@@ -101,21 +101,28 @@ export function clearKeyCache(): void {
  *  unbounded on that side; both bounds are inclusive. Past rotation_after is
  *  rejected even for a 'rotated' key: the window, not the status, says when
  *  it signed. An unparseable bound is a reason, not "unbounded" — a bundle
- *  typo must not widen a key's life. */
-export function keyUsableAt(entry: SigningKeyEntry, tsMs: number): string | null {
+ *  typo must not widen a key's life. A non-finite `tsMs` (no or bad
+ *  timestamp) fails any key that has a window, since NaN compares false
+ *  against both bounds and would otherwise pass. `subject` names what is
+ *  being signed in the reason (log.ts passes 'sth'). */
+export function keyUsableAt(entry: SigningKeyEntry, tsMs: number, subject = 'receipt'): string | null {
   const status = entry.status ?? 'active';
   if (status !== 'active' && status !== 'rotated') {
     return `key ${entry.key_id} status is ${status}`;
   }
+  const windowed = entry.created_at !== undefined || entry.rotation_after !== undefined;
+  if (windowed && !Number.isFinite(tsMs)) {
+    return `${subject} has no valid timestamp to check against key ${entry.key_id}'s window`;
+  }
   if (entry.created_at !== undefined) {
     const from = Date.parse(entry.created_at);
     if (!Number.isFinite(from)) return `key ${entry.key_id} created_at is not a valid date`;
-    if (tsMs < from) return `receipt timestamp precedes key ${entry.key_id} created_at ${entry.created_at}`;
+    if (tsMs < from) return `${subject} timestamp precedes key ${entry.key_id} created_at ${entry.created_at}`;
   }
   if (entry.rotation_after !== undefined) {
     const until = Date.parse(entry.rotation_after);
     if (!Number.isFinite(until)) return `key ${entry.key_id} rotation_after is not a valid date`;
-    if (tsMs > until) return `receipt timestamp is after key ${entry.key_id} rotation_after ${entry.rotation_after}`;
+    if (tsMs > until) return `${subject} timestamp is after key ${entry.key_id} rotation_after ${entry.rotation_after}`;
   }
   return null;
 }

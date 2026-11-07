@@ -2,7 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- Transparency-log verification in the library, on WebCrypto (Workers, Deno, Bun, Node): `verifyReceipt()` takes `inclusion: { proof, sth?, logKeys }` and reports `result.log.status` (`included` | `failed` | `not_checked`); `requireInclusion` makes a missing proof an error. New exports `verifySth`, `verifyReceiptInclusion`, `verifySthConsistency`, `receiptLeafHash`, `LogMonitor`, `MemorySthStore`, and the RFC 9162 primitives `leafHash`, `nodeHash`, `verifyInclusion`, `verifyConsistency`, `parseHash` (src/merkle.ts, src/log.ts). Previously inclusion and consistency existed only in `scripts/`, which is not published (2026-11-07).
+- `LogMonitor` persists the last accepted STH per log and only accepts an advance proven append-only; reports `rollback`, `fork` (two signed roots for one size), `unproven` and `invalid`, and never stores an STH that failed (2026-11-07).
+- Log keys are pinned on their own (`logKeys`); the receipt-signing bundle is never consulted for an STH on its own. The live log signs STHs with the receipt key `tm-receipt-2026-05`, so today that key is pinned as the log key. Optional `signature.key_id` and `log_id` on STHs are bound when present; `requireKeyId` refuses an STH without a key_id. A log key's status and `created_at`/`rotation_after` window are checked against the STH `timestamp` (2026-11-07).
+- `LogMonitor` requires `logId` and keys its store by it, never by the STH's own `log_id`; `observe()` calls on one monitor are serialized (2026-11-07).
+- `keyUsableAt()` takes an optional `subject` for its reasons, and a key with a window now fails a non-finite timestamp instead of passing it (2026-11-07).
+- Consistency tests: exhaustive inclusion and consistency for every tree up to 33 leaves against a recursive RFC 6962 reference, plus tamper, fork and rollback cases; the src/ and scripts/ verifiers are cross-checked (test/log.test.mjs) (2026-11-07).
+
 ### Security
+
+- `scripts/verify-log.mjs consistency` took both roots from the proof document and never checked an STH signature, so any self-consistent proof passed, including one for a forked history. It now requires `<proof.json> <older_sth.json> <newer_sth.json> --key <b64>`, takes the roots from the two pinned-key STHs, and exits 1 if the proof's own roots or sizes disagree with them. The old one-argument form exits 2 (2026-11-07).
 
 - `attestation_strength` must be one of `self-asserted`, `software`, `tee-tpm`, `silicon-root`: a receipt without the field or with any other value (an unknown tier ranked below every ceiling; a prototype name such as `constructor` ranked as a function) now fails with `attestation_strength: unrecognized value ...`, under `unsafeSkipStrengthCeiling` too (2026-10-21).
 - `signature.value` must be the canonical padded standard base64 of the signature: a copy with whitespace, a missing `=` pad or stray low bits in the last character decoded to the same bytes and verified while hashing to a different `chain.previous_receipt_hash` link; it now fails with `signature verification failed: signature.value is not canonical standard base64` (2026-10-22).

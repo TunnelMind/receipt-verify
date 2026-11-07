@@ -130,10 +130,70 @@ interface VerifyResult {
 | `allowKeyMismatch` | `false` | Accept (with a warning) an embedded `public_key` that is another usable entry in the same bundle; see Rotation-overlap mode |
 | `previous` | (none) | The prior receipt; makes the chain check hard (hash link + `sequence` + 1) |
 | `fetcher` | `globalThis.fetch` | Custom fetch (e.g., for tests) |
+| `inclusion` | (none) | `{ proof, sth?, logKeys, requireKeyId?, logId? }`: prove the receipt is in the transparency log under pinned **log** keys; a failed proof is an error. See below |
+| `requireInclusion` | `false` | Make a missing inclusion proof an error. `result.log.status` reports `not_checked` either way |
 
 ### Lower-level exports
 
 `fetchKeyBundle`, `resolveKey`, `keyUsableAt`, `clearKeyCache`, `DEFAULT_KEYS_URL`, `KEY_BUNDLE_CACHE_TTL_MS`, `PINNED_KEY_BUNDLE`, `PINNED_KEYS_FETCHED_AT`, `fetchRevocations`, `isKeyRevoked`, `isReceiptRevoked`, `clearRevocationCache`, `DEFAULT_REVOCATIONS_URL`, `REVOCATION_CACHE_TTL_MS`, `canonicalize`, `canonicalizeBytes`, `bytesToHex`, `sha256HexPrefixed`, `RECEIPT_VERSION`, and the types `Receipt`, `VerifyOptions`, `VerifyResult`, `KeyBundle`, `SigningKeyEntry`, `AttestationStrength`, `RevocationFeed`, `JsonValue`. See `ARCHITECTURE.md` for the module map and trust boundaries.
+
+## Transparency-log inclusion and consistency (in the library)
+
+A signature proves who issued a receipt. It does not prove the receipt is in
+the log, or that the log was never rewritten. Both now run wherever
+`verifyReceipt()` runs (WebCrypto, no Node builtins):
+
+```ts
+import { verifyReceipt, LogMonitor } from '@tunnelmindai/receipt-verify';
+
+// The live log signs tree heads with tm-receipt-2026-05 (see below).
+const logKeys = [{ key_id: 'tm-receipt-2026-05', algorithm: 'Ed25519', public_key: '<pinned b64>', status: 'active' }];
+const logId = 'tunnelmind-receipts-log-v1';
+const proof = (await (await fetch(`https://data.tunnelmind.ai/v1/receipts/log/proof?receipt_id=${id}`)).json()).data;
+
+const r = await verifyReceipt(receipt, { inclusion: { proof, logKeys, logId, requireKeyId: true }, requireInclusion: true });
+r.log; // { status: 'included', tree_size, leaf_index, log_key_id }
+```
+
+- `result.log.status` is `included` (proven), `failed` (a proof was given and
+  did not verify: also an error), or `not_checked` (no proof given).
+- The leaf is recomputed from the receipt bytes: `SHA-256(0x00 || JCS(receipt))`.
+  The proof's `leaf_hash` and roots are never trusted; the root and tree size
+  come only from a signed tree head (the `sth` argument, else `proof.sth`).
+- **Log keys are pinned on their own.** `logKeys` is required; the
+  receipt-signing bundle is never consulted for the log on its own. If the
+  STH names `signature.key_id`, only that pinned key is tried; `requireKeyId`
+  refuses an STH without one. A key with `log_id` only signs for that log.
+  A log key's status and `created_at`/`rotation_after` window are checked
+  against the STH's `timestamp`.
+- **Today the log and the issuer share a key.** The live log
+  (`log_id` `tunnelmind-receipts-log-v1`) signs tree heads with
+  `tm-receipt-2026-05`, the receipt-signing key, so you pin that key as a
+  log key. Until the log gets a key of its own, inclusion proves the receipt
+  is in the issuer's log, not that a second party witnessed it.
+- RFC 9162 proof math does not bind the tree size by itself (a size-3 proof
+  also checks out "for size 4"), so every size is taken from the STH and a
+  proof with different sizes is refused.
+
+`LogMonitor` remembers the last STH it accepted (pluggable `SthStore`:
+memory by default; implement `get`/`put` over a file, KV or a database) and
+only accepts an advance it can prove append-only:
+
+```ts
+const mon = new LogMonitor({ logId, logKeys, store, fetchConsistency: (m, n) => getConsistency(m, n) });
+const r = await mon.observe(sth); // status: first | unchanged | advanced | unproven | fork | rollback | invalid
+```
+
+A smaller tree (`rollback`) or a second signed root for the same size
+(`fork`) is evidence of log misbehaviour: keep both STHs. Nothing that fails
+replaces the monitor's last good view. `logId` is required: the store is
+keyed by the log you watch, never by the `log_id` an STH claims. One monitor
+runs its `observe()` calls one at a time; monitors sharing one store are not
+coordinated.
+
+Lower-level: `verifySth`, `verifyReceiptInclusion`, `verifySthConsistency`,
+`receiptLeafHash`, and the raw RFC 9162 primitives `leafHash`, `nodeHash`,
+`verifyInclusion`, `verifyConsistency`, `parseHash`.
 
 ## Verifying receipts you didn't issue
 
@@ -149,13 +209,16 @@ algorithms; node builtins only, zero library code):
 ```
 node scripts/verify-log.mjs sth         <sth.json> <public_key_b64>
 node scripts/verify-log.mjs inclusion   <proof.json> [sth.json] --key <b64> --receipt <receipt.json>
-node scripts/verify-log.mjs consistency <proof.json>
+node scripts/verify-log.mjs consistency <proof.json> <older_sth.json> <newer_sth.json> --key <b64>
 ```
 
 `proof.json` / `sth.json` are exactly the `data` objects returned by
 `GET data.tunnelmind.ai/v1/receipts/log/{sth,proof,consistency}`.
 `inclusion` verifies the STH against the pinned `--key` (never the key the
 STH carries) and recomputes the leaf from the `--receipt` bytes.
+`consistency` takes both roots from the two STHs, each verified under the
+pinned `--key`; the proof's own `first_root`/`second_root` are only compared
+against them (a proof alone is self-consistent by construction).
 
 `docs/OPA-INTEGRATION.md` shows how a PDP consumes the signed bundle.
 
