@@ -10,18 +10,27 @@
 //   leaf  = SHA-256(0x00 || JCS(receipt exactly as supplied)).
 //   proof = { leaf_index, tree_size, audit_path[hex], root_hash, leaf_hash?, sth? }
 //   consistency = { first, second, proof[hex], first_root?, second_root? }
-// `log_id` and `signature.key_id` on the STH are OPTIONAL today: when present
-// they are bound (key_id must name a pinned log key; log_id must match that
-// key's log_id). Once the sequencer emits both, callers should set
-// `requireKeyId` so a bare STH is refused.
+// `log_id` and `signature.key_id` on the STH are OPTIONAL in the dialect:
+// when present they are bound (key_id must name a pinned log key; log_id
+// must match that key's log_id). The live log (2026-11-07) emits both
+// (log_id tunnelmind-receipts-log-v1, key_id tm-receipt-2026-05), so
+// callers should set `requireKeyId` and `logId`.
 //
 // Trust: ONLY the caller's pinned `logKeys`. Never a key the STH, proof or
-// receipt carries, never the proof's own leaf_hash or roots, and never the
-// receipt-signing bundle by default (an issuer is not its own log witness).
+// receipt carries, never the proof's own leaf_hash or roots, and the
+// receipt-signing bundle is never consulted on its own. NOTE: the live log
+// signs STHs with the receipt-signing key tm-receipt-2026-05, so today the
+// caller pins that same key as a log key; issuer and log witness are one
+// key until the sequencer gets a log key of its own.
+// Key windows: a log key's status and [created_at, rotation_after] window
+// are checked against the STH's own timestamp (keys.ts keyUsableAt), so a
+// key past rotation stops verifying new heads. The timestamp is the log's
+// claim; a stolen rotated key can backdate it, exactly as for receipts.
 // Fail closed: every function returns errors, never throws on bad input.
 
 import { canonicalizeBytes, type JsonValue } from './jcs.js';
-import type { SigningKeyEntry } from './keys.js';
+import { keyUsableAt, type SigningKeyEntry } from './keys.js';
+import { b64ToBytes, signatureBytes, toAB } from './bytes.js';
 import {
   bytesEqual,
   leafHash,
@@ -100,28 +109,14 @@ export interface InclusionResult {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Canonical padded standard base64 only (see index.ts signatureBytes). */
-function strictB64(s: unknown): Uint8Array<ArrayBuffer> | null {
-  if (typeof s !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(s) || s.length % 4 !== 0) return null;
-  let bin: string;
-  try { bin = atob(s); } catch { return null; }
-  const out = new Uint8Array(new ArrayBuffer(bin.length));
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  if (btoa(bin) !== s) return null;
-  return out;
-}
-
-function toAB(u: Uint8Array): Uint8Array<ArrayBuffer> {
-  const buf = new ArrayBuffer(u.byteLength);
-  new Uint8Array(buf).set(u);
-  return new Uint8Array(buf);
-}
-
-async function ed25519Verify(publicKeyB64: string, sigB64: string, data: Uint8Array): Promise<boolean> {
-  const pub = strictB64(publicKeyB64);
-  const sig = strictB64(sigB64);
-  if (!pub || pub.length !== 32 || !sig || sig.length !== 64) return false;
+/** Same base64 rules as receipt signatures (bytes.ts): the pinned public key
+ *  decodes as standard base64, the signature value must be canonical. */
+async function ed25519Verify(publicKeyB64: string, sigB64: unknown, data: Uint8Array): Promise<boolean> {
   try {
+    if (typeof sigB64 !== 'string') return false;
+    const pub = b64ToBytes(publicKeyB64);
+    const sig = signatureBytes(sigB64);
+    if (pub.length !== 32 || sig.length !== 64) return false;
     const key = await subtle.importKey('raw', pub, { name: 'Ed25519' }, false, ['verify']);
     return await subtle.verify('Ed25519', key, sig, toAB(data));
   } catch {
@@ -188,10 +183,19 @@ export async function verifySth(
   if (sig.key_id) candidates = candidates.filter((k) => k.key_id === sig.key_id);
   const wantLog = s.log_id ?? opts.logId;
   if (wantLog) candidates = candidates.filter((k) => !k.log_id || k.log_id === wantLog);
+  // Status and validity window, against the STH's timestamp (see header).
+  const tsMs = typeof s.timestamp === 'string' ? Date.parse(s.timestamp) : NaN;
+  const windowReasons: string[] = [];
+  candidates = candidates.filter((k) => {
+    const why = keyUsableAt(k, tsMs, 'sth');
+    if (why) windowReasons.push(why);
+    return why === null;
+  });
   if (candidates.length === 0) {
     errors.push(sig.key_id
       ? `sth.signature.key_id ${sig.key_id} is not a usable pinned log key${wantLog ? ` for log ${wantLog}` : ''}`
       : `no usable pinned log key${wantLog ? ` for log ${wantLog}` : ''}`);
+    errors.push(...windowReasons);
     return out;
   }
 
@@ -363,7 +367,10 @@ export async function verifySthConsistency(
 
 /** Persists the last STH a verifier accepted, per log. Implement over memory,
  *  a file, Workers KV, localStorage, a database: anything durable enough that
- *  a restart does not forget what the log already showed you. */
+ *  a restart does not forget what the log already showed you. One LogMonitor
+ *  serializes its own observe() calls; two monitors (or processes) sharing
+ *  one store are not coordinated, so give each its own store or make put()
+ *  a compare-and-swap on the previous tree_size. */
 export interface SthStore {
   get(logId: string): Promise<SignedTreeHead | null>;
   put(logId: string, sth: SignedTreeHead): Promise<void>;
@@ -386,6 +393,11 @@ export interface MonitorResult {
 }
 
 export interface LogMonitorOptions extends SthOptions {
+  /** The log this monitor watches; also the store key. Required: if the
+   *  bucket came from the STH's own log_id, a log whose key is not bound to
+   *  a log_id could sign a head under a fresh log_id and start a new,
+   *  unchecked history ('first') instead of being caught as a fork. */
+  logId: string;
   logKeys: LogKeyEntry[];
   store?: SthStore;
   /** Fetch a consistency proof from the log when observe() is not given one,
@@ -401,26 +413,37 @@ export interface LogMonitorOptions extends SthOptions {
 export class LogMonitor {
   private readonly o: LogMonitorOptions;
   private readonly store: SthStore;
+  /** Tail of the observe() queue: each call runs after the previous one, so
+   *  two concurrent advances cannot both read the same `prev` and the
+   *  smaller one overwrite the larger. */
+  private tail: Promise<unknown> = Promise.resolve();
 
   constructor(opts: LogMonitorOptions) {
+    // A constructor misuse, not untrusted input, so this one throws.
+    if (!opts || typeof opts.logId !== 'string' || opts.logId === '') {
+      throw new TypeError('LogMonitor: logId is required (the log this monitor watches)');
+    }
     this.o = opts;
     this.store = opts.store ?? new MemorySthStore();
   }
 
-  private key(sth: SignedTreeHead): string {
-    return this.o.logId ?? (typeof sth?.log_id === 'string' ? sth.log_id : 'default');
+  /** The last STH this monitor accepted. */
+  last(): Promise<SignedTreeHead | null> {
+    return this.store.get(this.o.logId);
   }
 
-  /** The last STH this monitor accepted for `logId` (default log if omitted). */
-  last(logId?: string): Promise<SignedTreeHead | null> {
-    return this.store.get(logId ?? this.o.logId ?? 'default');
+  observe(sth: unknown, proof?: ConsistencyProof): Promise<MonitorResult> {
+    const run = this.tail.then(() => this.observeNow(sth, proof));
+    this.tail = run.catch(() => undefined);
+    return run;
   }
 
-  async observe(sth: unknown, proof?: ConsistencyProof): Promise<MonitorResult> {
+  private async observeNow(sth: unknown, proof?: ConsistencyProof): Promise<MonitorResult> {
+    // verifySth with opts.logId refuses an STH naming another log.
     const sr = await verifySth(sth, this.o.logKeys, this.o);
     if (!sr.valid) return { ok: false, status: 'invalid', errors: sr.errors };
     const next = sth as SignedTreeHead;
-    const id = this.key(next);
+    const id = this.o.logId;
     const prev = await this.store.get(id);
     if (!prev) {
       await this.store.put(id, next);

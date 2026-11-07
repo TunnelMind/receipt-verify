@@ -59,6 +59,8 @@ re-run over the payload and compared with the published verdict.
 - **Trusted for the log:** the caller's `logKeys` only, a separate set from the
   receipt bundle. A tree size or root is trusted only from an STH that
   verified under one of them; RFC 9162 proof math does not bind the tree size.
+  Today the live log signs with the receipt key `tm-receipt-2026-05`, so the
+  caller pins that key in both sets: the log is the issuer's, not a witness.
 - **Untrusted:** everything in the receipt, including `signature.public_key`
   (compared to the bundle, never verified against), and every key carried in
   a verdict receipt's checkpoint or cosignatures. CLI file arguments are

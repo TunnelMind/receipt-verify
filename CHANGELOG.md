@@ -6,7 +6,9 @@
 
 - Transparency-log verification in the library, on WebCrypto (Workers, Deno, Bun, Node): `verifyReceipt()` takes `inclusion: { proof, sth?, logKeys }` and reports `result.log.status` (`included` | `failed` | `not_checked`); `requireInclusion` makes a missing proof an error. New exports `verifySth`, `verifyReceiptInclusion`, `verifySthConsistency`, `receiptLeafHash`, `LogMonitor`, `MemorySthStore`, and the RFC 9162 primitives `leafHash`, `nodeHash`, `verifyInclusion`, `verifyConsistency`, `parseHash` (src/merkle.ts, src/log.ts). Previously inclusion and consistency existed only in `scripts/`, which is not published (2026-11-07).
 - `LogMonitor` persists the last accepted STH per log and only accepts an advance proven append-only; reports `rollback`, `fork` (two signed roots for one size), `unproven` and `invalid`, and never stores an STH that failed (2026-11-07).
-- Log keys are pinned separately from receipt keys (`logKeys`); the receipt-signing bundle is never used to verify an STH. Optional `signature.key_id` and `log_id` on STHs are bound when present; `requireKeyId` refuses an STH without a key_id (2026-11-07).
+- Log keys are pinned on their own (`logKeys`); the receipt-signing bundle is never consulted for an STH on its own. The live log signs STHs with the receipt key `tm-receipt-2026-05`, so today that key is pinned as the log key. Optional `signature.key_id` and `log_id` on STHs are bound when present; `requireKeyId` refuses an STH without a key_id. A log key's status and `created_at`/`rotation_after` window are checked against the STH `timestamp` (2026-11-07).
+- `LogMonitor` requires `logId` and keys its store by it, never by the STH's own `log_id`; `observe()` calls on one monitor are serialized (2026-11-07).
+- `keyUsableAt()` takes an optional `subject` for its reasons, and a key with a window now fails a non-finite timestamp instead of passing it (2026-11-07).
 - Consistency tests: exhaustive inclusion and consistency for every tree up to 33 leaves against a recursive RFC 6962 reference, plus tamper, fork and rollback cases; the src/ and scripts/ verifiers are cross-checked (test/log.test.mjs) (2026-11-07).
 
 ### Security

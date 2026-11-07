@@ -379,7 +379,7 @@ test('LogMonitor: first → unchanged → advanced; a failed advance is not stor
   const logKeys = [logEntry(log, 'log-1')];
   const h = await history(log);
   const store = new MemorySthStore();
-  const mon = new LogMonitor({ logKeys, store });
+  const mon = new LogMonitor({ logId: 'tm-test', logKeys, store });
   const s4 = await h.at(4);
   const s9 = await h.at(9);
   const s15 = await h.at(15);
@@ -403,7 +403,7 @@ test('LogMonitor: fork, rollback and invalid STHs are reported and never replace
   const attacker = await makeEphemeralKey();
   const logKeys = [logEntry(log, 'log-1')];
   const h = await history(log);
-  const mon = new LogMonitor({ logKeys });
+  const mon = new LogMonitor({ logId: 'tm-test', logKeys });
   await mon.observe(await h.at(8));
 
   // The log signs a second root for size 8: equivocation.
@@ -432,15 +432,86 @@ test('LogMonitor: fetchConsistency is used when no proof is passed, and a failed
   const logKeys = [logEntry(log, 'log-1')];
   const h = await history(log);
   const calls = [];
-  const mon = new LogMonitor({ logKeys, fetchConsistency: async (m, n) => { calls.push([m, n]); return h.proof(m, n); } });
+  const mon = new LogMonitor({ logId: 'tm-test', logKeys, fetchConsistency: async (m, n) => { calls.push([m, n]); return h.proof(m, n); } });
   await mon.observe(await h.at(3));
   assert.equal((await mon.observe(await h.at(17))).status, 'advanced');
   assert.deepEqual(calls, [[3, 17]]);
-  const broken = new LogMonitor({ logKeys, fetchConsistency: async () => { throw new Error('503'); } });
+  const broken = new LogMonitor({ logId: 'tm-test', logKeys, fetchConsistency: async () => { throw new Error('503'); } });
   await broken.observe(await h.at(3));
   const r = await broken.observe(await h.at(17));
   assert.equal(r.status, 'unproven');
   assert.match(r.errors.join(';'), /503/);
+});
+
+test('LogMonitor: a head under a fresh log_id cannot start a new history', async () => {
+  // The live log key carries no log_id binding, so the key alone would sign
+  // for any log_id. Before the fix logId was optional, and a monitor built
+  // without it bucketed by the STH's own log_id, so this head came back
+  // 'first'. logId is now required and an STH naming another log is invalid.
+  const log = await makeEphemeralKey();
+  const logKeys = [logEntry(log, 'log-1')];
+  const mon = new LogMonitor({ logId: 'tm-test', logKeys });
+  await mon.observe(await signSth(log, { tree_size: 8, root_hash: 'aa'.repeat(32), timestamp: ts(), log_id: 'tm-test' }, { keyId: 'log-1' }));
+  const elsewhere = await signSth(log, { tree_size: 2, root_hash: 'ee'.repeat(32), timestamp: ts(), log_id: 'tm-test-2' }, { keyId: 'log-1' });
+  const r = await mon.observe(elsewhere);
+  assert.equal(r.status, 'invalid', r.errors.join('; '));
+  assert.equal((await mon.last()).tree_size, 8);
+  assert.throws(() => new LogMonitor({ logKeys }), /logId is required/);
+});
+
+test('LogMonitor: concurrent observe() calls are serialized and never roll the view back', async () => {
+  const log = await makeEphemeralKey();
+  const logKeys = [logEntry(log, 'log-1')];
+  const h = await history(log);
+  const mon = new LogMonitor({ logId: 'tm-test', logKeys });
+  await mon.observe(await h.at(4));
+  // Both proofs start at 4. Serialized, the first advances to 9 and the
+  // second (4→15) no longer starts at the last accepted size.
+  const [a, b] = await Promise.all([
+    mon.observe(await h.at(9), h.proof(4, 9)),
+    mon.observe(await h.at(15), h.proof(4, 15)),
+  ]);
+  assert.equal(a.status, 'advanced');
+  assert.equal(b.status, 'unproven');
+  assert.equal((await mon.last()).tree_size, 9);
+  // In the other order the larger head wins and the smaller is a rollback.
+  const mon2 = new LogMonitor({ logId: 'tm-test', logKeys });
+  await mon2.observe(await h.at(4));
+  const [c, d] = await Promise.all([
+    mon2.observe(await h.at(15), h.proof(4, 15)),
+    mon2.observe(await h.at(9), h.proof(4, 9)),
+  ]);
+  assert.equal(c.status, 'advanced');
+  assert.equal(d.status, 'rollback');
+  assert.equal((await mon2.last()).tree_size, 15);
+});
+
+test('verifySth: a log key past rotation_after, before created_at, or windowed with no timestamp fails', async () => {
+  const log = await makeEphemeralKey();
+  const body = { tree_size: 3, root_hash: 'ab'.repeat(32), timestamp: '2026-11-07T12:00:00.000Z' };
+  const sth = await signSth(log, body, { keyId: 'log-1' });
+  const inWindow = [logEntry(log, 'log-1', { created_at: '2026-05-01T00:00:00Z', rotation_after: '2027-05-01T00:00:00Z' })];
+  assert.equal((await verifySth(sth, inWindow)).valid, true);
+  const retired = await verifySth(sth, [logEntry(log, 'log-1', { status: 'rotated', rotation_after: '2026-11-01T00:00:00Z' })]);
+  assert.equal(retired.valid, false);
+  assert.match(retired.errors.join(';'), /sth timestamp is after key log-1 rotation_after/);
+  assert.equal((await verifySth(sth, [logEntry(log, 'log-1', { created_at: '2026-12-01T00:00:00Z' })])).valid, false);
+  const { timestamp: _t, ...noTs } = body;
+  const bare = await verifySth(await signSth(log, noTs, { keyId: 'log-1' }), inWindow);
+  assert.equal(bare.valid, false);
+  assert.match(bare.errors.join(';'), /no valid timestamp/);
+  // A key with no window still verifies a head with no timestamp.
+  assert.equal((await verifySth(await signSth(log, noTs, { keyId: 'log-1' }), [logEntry(log, 'log-1')])).valid, true);
+});
+
+test('verifySth: the live dialect (log_id + key_id, 0x root) verifies under requireKeyId + logId', async () => {
+  const log = await makeEphemeralKey();
+  const logKeys = [logEntry(log, 'tm-receipt-2026-05')];
+  const sth = await signSth(log, { log_id: 'tunnelmind-receipts-log-v1', root_hash: '0x' + 'ab'.repeat(32), timestamp: ts(), tree_size: 12327 }, { keyId: 'tm-receipt-2026-05' });
+  const r = await verifySth(sth, logKeys, { requireKeyId: true, logId: 'tunnelmind-receipts-log-v1' });
+  assert.equal(r.valid, true, r.errors.join('; '));
+  assert.equal(r.log_id, 'tunnelmind-receipts-log-v1');
+  assert.equal((await verifySth(sth, logKeys, { requireKeyId: true, logId: 'other' })).valid, false);
 });
 
 // ── CLI consistency (scripts/verify-log.mjs) ─────────────────────────────────

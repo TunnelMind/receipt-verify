@@ -146,10 +146,12 @@ the log, or that the log was never rewritten. Both now run wherever
 ```ts
 import { verifyReceipt, LogMonitor } from '@tunnelmindai/receipt-verify';
 
-const logKeys = [{ key_id: 'tm-log-…', algorithm: 'Ed25519', public_key: '<pinned b64>', status: 'active' }];
+// The live log signs tree heads with tm-receipt-2026-05 (see below).
+const logKeys = [{ key_id: 'tm-receipt-2026-05', algorithm: 'Ed25519', public_key: '<pinned b64>', status: 'active' }];
+const logId = 'tunnelmind-receipts-log-v1';
 const proof = (await (await fetch(`https://data.tunnelmind.ai/v1/receipts/log/proof?receipt_id=${id}`)).json()).data;
 
-const r = await verifyReceipt(receipt, { inclusion: { proof, logKeys }, requireInclusion: true });
+const r = await verifyReceipt(receipt, { inclusion: { proof, logKeys, logId, requireKeyId: true }, requireInclusion: true });
 r.log; // { status: 'included', tree_size, leaf_index, log_key_id }
 ```
 
@@ -158,11 +160,17 @@ r.log; // { status: 'included', tree_size, leaf_index, log_key_id }
 - The leaf is recomputed from the receipt bytes: `SHA-256(0x00 || JCS(receipt))`.
   The proof's `leaf_hash` and roots are never trusted; the root and tree size
   come only from a signed tree head (the `sth` argument, else `proof.sth`).
-- **Log keys are separate from receipt keys.** `logKeys` is required and the
-  receipt-signing bundle is never used for the log: an issuer is not its own
-  witness. If the STH names `signature.key_id`, only that pinned key is tried;
-  `requireKeyId` refuses an STH without one. A key with `log_id` only signs
-  for that log.
+- **Log keys are pinned on their own.** `logKeys` is required; the
+  receipt-signing bundle is never consulted for the log on its own. If the
+  STH names `signature.key_id`, only that pinned key is tried; `requireKeyId`
+  refuses an STH without one. A key with `log_id` only signs for that log.
+  A log key's status and `created_at`/`rotation_after` window are checked
+  against the STH's `timestamp`.
+- **Today the log and the issuer share a key.** The live log
+  (`log_id` `tunnelmind-receipts-log-v1`) signs tree heads with
+  `tm-receipt-2026-05`, the receipt-signing key, so you pin that key as a
+  log key. Until the log gets a key of its own, inclusion proves the receipt
+  is in the issuer's log, not that a second party witnessed it.
 - RFC 9162 proof math does not bind the tree size by itself (a size-3 proof
   also checks out "for size 4"), so every size is taken from the STH and a
   proof with different sizes is refused.
@@ -172,13 +180,16 @@ memory by default; implement `get`/`put` over a file, KV or a database) and
 only accepts an advance it can prove append-only:
 
 ```ts
-const mon = new LogMonitor({ logKeys, store, fetchConsistency: (m, n) => getConsistency(m, n) });
+const mon = new LogMonitor({ logId, logKeys, store, fetchConsistency: (m, n) => getConsistency(m, n) });
 const r = await mon.observe(sth); // status: first | unchanged | advanced | unproven | fork | rollback | invalid
 ```
 
 A smaller tree (`rollback`) or a second signed root for the same size
 (`fork`) is evidence of log misbehaviour: keep both STHs. Nothing that fails
-replaces the monitor's last good view.
+replaces the monitor's last good view. `logId` is required: the store is
+keyed by the log you watch, never by the `log_id` an STH claims. One monitor
+runs its `observe()` calls one at a time; monitors sharing one store are not
+coordinated.
 
 Lower-level: `verifySth`, `verifyReceiptInclusion`, `verifySthConsistency`,
 `receiptLeafHash`, and the raw RFC 9162 primitives `leafHash`, `nodeHash`,
