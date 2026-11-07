@@ -12,7 +12,7 @@ Reference TypeScript verifier for the [TunnelMind Receipt Format v1.0](https://t
 npm install @tunnelmindai/receipt-verify
 ```
 
-Zero runtime dependencies. Targets WebCrypto SubtleCrypto + `fetch` — runs on Node ≥18, Cloudflare Workers, Deno, Bun.
+Zero runtime dependencies. Targets WebCrypto SubtleCrypto + `fetch` — runs on Node ≥20, Cloudflare Workers, Deno, Bun.
 
 ## Quickstart
 

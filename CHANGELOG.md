@@ -11,6 +11,10 @@
 - `keyUsableAt()` takes an optional `subject` for its reasons, and a key with a window now fails a non-finite timestamp instead of passing it (2026-11-07).
 - Consistency tests: exhaustive inclusion and consistency for every tree up to 33 leaves against a recursive RFC 6962 reference, plus tamper, fork and rollback cases; the src/ and scripts/ verifiers are cross-checked (test/log.test.mjs) (2026-11-07).
 
+### Fixed
+
+- `engines` said Node >=18, but Node 18 has no `globalThis.crypto`, so importing the package threw there on every version. The floor is now Node >=20 (Node 18 reached end of life 2025-04-30); a CI test job runs Node 20/22/24 on every PR (2026-11-07).
+
 ### Security
 
 - `scripts/verify-log.mjs consistency` took both roots from the proof document and never checked an STH signature, so any self-consistent proof passed, including one for a forked history. It now requires `<proof.json> <older_sth.json> <newer_sth.json> --key <b64>`, takes the roots from the two pinned-key STHs, and exits 1 if the proof's own roots or sizes disagree with them. The old one-argument form exits 2 (2026-11-07).
