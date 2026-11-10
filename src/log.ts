@@ -18,10 +18,17 @@
 //
 // Trust: ONLY the caller's pinned `logKeys`. Never a key the STH, proof or
 // receipt carries, never the proof's own leaf_hash or roots, and the
-// receipt-signing bundle is never consulted on its own. NOTE: the live log
-// signs STHs with the receipt-signing key tm-receipt-2026-05, so today the
-// caller pins that same key as a log key; issuer and log witness are one
-// key until the sequencer gets a log key of its own.
+// receipt-signing bundle is never consulted on its own.
+// Log-key mode (logKeyMode), decided by the pinned `logKeys` against the
+// receipt-signing keys (`SthOptions.receiptKeys`, default the pinned bundle):
+//   shared_with_receipts  every usable log key is a receipt key. This is the
+//       live log today (2026-11): it signs STHs with tm-receipt-2026-05, so
+//       issuer and log witness are one key and inclusion proves the receipt
+//       is in the issuer's own log, not that a second party saw it.
+//   separate  at least one log key is not a receipt key. Then a log key
+//       equal to a receipt key is refused at load, so a tree head signed by
+//       the receipt-issuing key can never verify. A mixed set is refused.
+// Results report the mode as `log_key`.
 // Key windows: a log key's status and [created_at, rotation_after] window
 // are checked against the STH's own timestamp (keys.ts keyUsableAt), so a
 // key past rotation stops verifying new heads. The timestamp is the log's
@@ -30,6 +37,7 @@
 
 import { canonicalizeBytes, type JsonValue } from './jcs.js';
 import { keyUsableAt, type SigningKeyEntry } from './keys.js';
+import { PINNED_KEY_BUNDLE } from './pinned-keys.js';
 import { b64ToBytes, signatureBytes, toAB } from './bytes.js';
 import {
   bytesEqual,
@@ -87,11 +95,18 @@ export interface SthOptions {
   requireKeyId?: boolean;
   /** Expected log; an STH or key bound to another log_id is refused. */
   logId?: string;
+  /** The receipt-signing keys, to tell a shared log key from a separate one
+   *  (see header). Default: the pinned receipt bundle's keys. */
+  receiptKeys?: SigningKeyEntry[];
 }
+
+export type LogKeyMode = 'shared_with_receipts' | 'separate';
 
 export interface SthResult {
   valid: boolean;
   errors: string[];
+  /** Set once the pinned log keys were evaluated (any usable one). */
+  log_key?: LogKeyMode;
   key_id?: string;
   log_id?: string;
   tree_size?: number;
@@ -105,6 +120,7 @@ export interface InclusionResult {
   tree_size?: number;
   leaf_index?: number;
   log_key_id?: string;
+  log_key?: LogKeyMode;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -129,6 +145,27 @@ function usable(k: LogKeyEntry | null | undefined): k is LogKeyEntry {
     && (k.algorithm === undefined || k.algorithm === 'Ed25519');
 }
 
+/** Shared or separate log keys (see header), and in separate mode the error
+ *  for a log key that is also a receipt key. Keys compare by public key
+ *  bytes, so a re-spelled base64 of a receipt key is still caught. No usable
+ *  log key → no mode (verifySth reports that). */
+function logKeyMode(
+  logKeys: LogKeyEntry[] | undefined,
+  receiptKeys: SigningKeyEntry[] | undefined,
+): { mode?: LogKeyMode; error?: string } {
+  const keys = Array.isArray(logKeys) ? logKeys.filter(usable) : [];
+  if (keys.length === 0) return {};
+  const norm = (b64: string) => { try { return b64ToBytes(b64).join(','); } catch { return b64; } };
+  const rks = Array.isArray(receiptKeys) ? receiptKeys : PINNED_KEY_BUNDLE.keys;
+  const receipt = new Set(rks.flatMap((k) => (typeof k?.public_key === 'string' ? [norm(k.public_key)] : [])));
+  const isReceiptKey = (k: LogKeyEntry) => receipt.has(norm(k.public_key));
+  if (keys.every(isReceiptKey)) return { mode: 'shared_with_receipts' };
+  const clash = keys.find(isReceiptKey);
+  return clash
+    ? { mode: 'separate', error: `log key ${clash.key_id} is also a receipt-signing key` }
+    : { mode: 'separate' };
+}
+
 function isSize(n: unknown): n is number {
   return typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
 }
@@ -146,6 +183,13 @@ export async function verifySth(
 ): Promise<SthResult> {
   const errors: string[] = [];
   const out: SthResult = { valid: false, errors };
+  // Key load first: a mixed log-key set is refused before the STH is read.
+  const km = logKeyMode(logKeys, opts.receiptKeys);
+  if (km.mode) out.log_key = km.mode;
+  if (km.error) {
+    errors.push(km.error);
+    return out;
+  }
   if (!sth || typeof sth !== 'object' || Array.isArray(sth)) {
     errors.push('sth must be an object');
     return out;
@@ -244,6 +288,12 @@ export async function verifyReceiptInclusion(
 ): Promise<InclusionResult> {
   const errors: string[] = [];
   const out: InclusionResult = { status: 'failed', errors };
+  const km = logKeyMode(logKeys, opts.receiptKeys);
+  if (km.mode) out.log_key = km.mode;
+  if (km.error) {
+    errors.push(km.error);
+    return out;
+  }
   if (!proof || typeof proof !== 'object') {
     errors.push('inclusion proof must be an object');
     return out;
@@ -312,6 +362,12 @@ export async function verifySthConsistency(
 ): Promise<ConsistencyResult> {
   const errors: string[] = [];
   const out: ConsistencyResult = { valid: false, errors };
+  // Checked once here so a mixed set is one error, not one per STH.
+  const km = logKeyMode(logKeys, opts.receiptKeys);
+  if (km.error) {
+    errors.push(km.error);
+    return out;
+  }
   const a = await verifySth(older, logKeys, opts);
   const b = await verifySth(newer, logKeys, opts);
   if (!a.valid) errors.push(...a.errors.map((e) => `older sth: ${e}`));
@@ -423,6 +479,8 @@ export class LogMonitor {
     if (!opts || typeof opts.logId !== 'string' || opts.logId === '') {
       throw new TypeError('LogMonitor: logId is required (the log this monitor watches)');
     }
+    const km = logKeyMode(opts.logKeys, opts.receiptKeys);
+    if (km.error) throw new TypeError(`LogMonitor: ${km.error}`);
     this.o = opts;
     this.store = opts.store ?? new MemorySthStore();
   }

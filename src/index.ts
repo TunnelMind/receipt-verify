@@ -36,6 +36,7 @@ import {
   type InclusionProof,
   type LogKeyEntry,
   type LogStatus,
+  type LogKeyMode,
   type SignedTreeHead,
 } from './log.js';
 
@@ -156,7 +157,7 @@ export interface VerifyResult {
   /** Transparency-log status: `included` (proven under a pinned log key),
    *  `failed` (a proof was given and did not verify), or `not_checked` (no
    *  proof given: the signature is checked, log membership is NOT). */
-  log: { status: LogStatus; tree_size?: number; leaf_index?: number; log_key_id?: string };
+  log: { status: LogStatus; tree_size?: number; leaf_index?: number; log_key_id?: string; log_key?: LogKeyMode };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -435,14 +436,19 @@ export async function verifyReceipt(
   // as supplied; the root comes only from an STH under a pinned log key.
   if (opts.inclusion) {
     const inc = opts.inclusion;
+    // Receipt keys = the bundle in use plus the pinned one, so a log key
+    // that is also a receipt key is caught whichever bundle signed.
+    const receiptKeys = [...(Array.isArray(bundle?.keys) ? bundle.keys : []), ...PINNED_KEY_BUNDLE.keys];
     const r = await verifyReceiptInclusion(receipt, inc.proof, inc.sth, inc.logKeys, {
       requireKeyId: inc.requireKeyId,
       logId: inc.logId,
+      receiptKeys,
     });
     out.log = { status: r.status };
     if (r.tree_size !== undefined) out.log.tree_size = r.tree_size;
     if (r.leaf_index !== undefined) out.log.leaf_index = r.leaf_index;
     if (r.log_key_id !== undefined) out.log.log_key_id = r.log_key_id;
+    if (r.log_key !== undefined) out.log.log_key = r.log_key;
     for (const e of r.errors) errors.push(`log inclusion: ${e}`);
   } else if (opts.requireInclusion) {
     errors.push('log inclusion: required but no inclusion proof was supplied');
@@ -503,6 +509,7 @@ export type {
   SthOptions,
   SthResult,
   LogStatus,
+  LogKeyMode,
   InclusionResult,
   ConsistencyResult,
   SthStore,

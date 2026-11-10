@@ -282,7 +282,7 @@ test('verifyReceipt: a receipt proven in a 7-leaf log is included', async () => 
   const s = await setup();
   const r = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, inclusion: { proof: s.proof, sth: s.sth, logKeys: s.logKeys } });
   assert.equal(r.valid, true, r.errors.join('; '));
-  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: 'log-1' });
+  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: 'log-1', log_key: 'separate' });
   // STH may ride inside the proof, as /v1/receipts/log/proof serves it.
   const r2 = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, inclusion: { proof: { ...s.proof, sth: s.sth }, logKeys: s.logKeys } });
   assert.equal(r2.log.status, 'included', r2.errors.join('; '));
@@ -512,6 +512,95 @@ test('verifySth: the live dialect (log_id + key_id, 0x root) verifies under requ
   assert.equal(r.valid, true, r.errors.join('; '));
   assert.equal(r.log_id, 'tunnelmind-receipts-log-v1');
   assert.equal((await verifySth(sth, logKeys, { requireKeyId: true, logId: 'other' })).valid, false);
+});
+
+// ── Log-key mode: shared with receipts vs separate (R004) ────────────────────
+
+test('log key mode: log keys that are all receipt keys verify as today, log_key shared_with_receipts', async () => {
+  // Today's live setup: the log signs with the receipt key.
+  const issuer = await makeEphemeralKey();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt(issuer);
+  const keys = makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64 }]);
+  const logKeys = [logEntry(issuer, keyId)];
+  const { root, path } = await receiptInTree(receipt, 7, 4);
+  const proof = { leaf_index: 4, tree_size: 7, audit_path: path.map(hex), root_hash: hex(root) };
+  const sth = await signSth(issuer, { tree_size: 7, root_hash: hex(root), timestamp: ts() }, { keyId });
+  const r = await verifyReceipt(receipt, { keys, revocations: makeRevocations(), inclusion: { proof, sth, logKeys } });
+  assert.equal(r.valid, true, r.errors.join('; '));
+  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: keyId, log_key: 'shared_with_receipts' });
+  const sr = await verifySth(sth, logKeys, { receiptKeys: keys.keys });
+  assert.equal(sr.valid, true, sr.errors.join('; '));
+  assert.equal(sr.log_key, 'shared_with_receipts');
+  const ir = await verifyReceiptInclusion(receipt, proof, sth, logKeys, { receiptKeys: keys.keys });
+  assert.equal(ir.status, 'included');
+  assert.equal(ir.log_key, 'shared_with_receipts');
+  // The default receipt keys are the pinned bundle: the live key as log key is shared.
+  const live = { key_id: 'tm-receipt-2026-05', algorithm: 'Ed25519', public_key: 'U18ONQCXr/Ox3Ac1ShKB1zYRcPIM9Sp9yZrka1jzoCY=', status: 'active' };
+  assert.equal((await verifySth(sth, [live])).log_key, 'shared_with_receipts');
+  // Without inclusion there is no log_key.
+  const bare = await verifyReceipt(receipt, { keys, revocations: makeRevocations() });
+  assert.deepEqual(bare.log, { status: 'not_checked' });
+});
+
+test('log key mode: a mixed set (log key + receipt key) is refused at load, before any STH check', async () => {
+  const s = await setup();
+  const rk = s.keys.keys[0];
+  const mixed = [...s.logKeys, { ...rk, status: 'active' }];
+  const want = `log key ${rk.key_id} is also a receipt-signing key`;
+  // Even a non-object STH reports the key clash: the keys are checked first.
+  for (const sth of [s.sth, null]) {
+    const sr = await verifySth(sth, mixed, { receiptKeys: s.keys.keys });
+    assert.equal(sr.valid, false);
+    assert.deepEqual(sr.errors, [want]);
+  }
+  const ir = await verifyReceiptInclusion(s.receipt, s.proof, s.sth, mixed, { receiptKeys: s.keys.keys });
+  assert.equal(ir.status, 'failed');
+  assert.deepEqual(ir.errors, [want]);
+  const cr = await verifySthConsistency(s.sth, s.sth, null, mixed, { receiptKeys: s.keys.keys });
+  assert.equal(cr.valid, false);
+  assert.deepEqual(cr.errors, [want]);
+  // verifyReceipt learns the receipt keys from its own bundle.
+  const r = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, inclusion: { proof: s.proof, sth: s.sth, logKeys: mixed } });
+  assert.equal(r.valid, false);
+  assert.equal(r.log.status, 'failed');
+  assert.ok(r.errors.includes(`log inclusion: ${want}`), r.errors.join('; '));
+});
+
+test('log key mode: with a separate log key, an STH signed by the receipt key is rejected', async () => {
+  const s = await setup();
+  const { kp, publicKeyB64 } = await makeEphemeralKey();
+  const { receipt, keyId } = await makeReceipt({ kp, publicKeyB64 });
+  const keys = makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64 }]);
+  const { root, path } = await receiptInTree(receipt, 7, 4);
+  const proof = { leaf_index: 4, tree_size: 7, audit_path: path.map(hex), root_hash: hex(root) };
+  const body = { tree_size: 7, root_hash: hex(root), timestamp: ts() };
+  const byReceiptKey = await signSth({ kp, publicKeyB64 }, body, { keyId: 'log-1' });
+  const byLogKey = await signSth(s.log, body, { keyId: 'log-1' });
+  const bad = await verifySth(byReceiptKey, s.logKeys, { receiptKeys: keys.keys });
+  assert.equal(bad.valid, false);
+  assert.equal(bad.log_key, 'separate');
+  const ok = await verifySth(byLogKey, s.logKeys, { receiptKeys: keys.keys });
+  assert.equal(ok.valid, true, ok.errors.join('; '));
+  assert.equal(ok.log_key, 'separate');
+  const r = await verifyReceipt(receipt, { keys, revocations: s.revocations, inclusion: { proof, sth: byReceiptKey, logKeys: s.logKeys } });
+  assert.equal(r.valid, false);
+  assert.equal(r.log.status, 'failed');
+  assert.equal(r.log.log_key, 'separate');
+  const r2 = await verifyReceipt(receipt, { keys, revocations: s.revocations, inclusion: { proof, sth: byLogKey, logKeys: s.logKeys } });
+  assert.equal(r2.valid, true, r2.errors.join('; '));
+  assert.equal(r2.log.log_key, 'separate');
+});
+
+test('log key mode: LogMonitor throws on a mixed log-key set', async () => {
+  const s = await setup();
+  const rk = s.keys.keys[0];
+  assert.throws(
+    () => new LogMonitor({ logId: 'tm-test', logKeys: [...s.logKeys, rk], receiptKeys: s.keys.keys }),
+    (e) => e instanceof TypeError && e.message.includes(`log key ${rk.key_id} is also a receipt-signing key`),
+  );
+  // Separate-only and shared-only sets construct fine.
+  new LogMonitor({ logId: 'tm-test', logKeys: s.logKeys, receiptKeys: s.keys.keys });
+  new LogMonitor({ logId: 'tm-test', logKeys: [rk], receiptKeys: s.keys.keys });
 });
 
 // ── CLI consistency (scripts/verify-log.mjs) ─────────────────────────────────

@@ -152,7 +152,7 @@ const logId = 'tunnelmind-receipts-log-v1';
 const proof = (await (await fetch(`https://data.tunnelmind.ai/v1/receipts/log/proof?receipt_id=${id}`)).json()).data;
 
 const r = await verifyReceipt(receipt, { inclusion: { proof, logKeys, logId, requireKeyId: true }, requireInclusion: true });
-r.log; // { status: 'included', tree_size, leaf_index, log_key_id }
+r.log; // { status: 'included', tree_size, leaf_index, log_key_id, log_key: 'shared_with_receipts' }
 ```
 
 - `result.log.status` is `included` (proven), `failed` (a proof was given and
@@ -171,6 +171,18 @@ r.log; // { status: 'included', tree_size, leaf_index, log_key_id }
   `tm-receipt-2026-05`, the receipt-signing key, so you pin that key as a
   log key. Until the log gets a key of its own, inclusion proves the receipt
   is in the issuer's log, not that a second party witnessed it.
+- **Log-key mode: shared or separate.** The mode comes from your `logKeys`,
+  compared by public key with the receipt-signing keys (`receiptKeys` in
+  `SthOptions`, default `PINNED_KEY_BUNDLE.keys`; `verifyReceipt` passes its
+  bundle in use plus the pinned one). Every log key a receipt key: mode
+  `shared_with_receipts`, behaviour as above. Any log key that is not a
+  receipt key: mode `separate`, and then a log key equal to a receipt key is
+  refused at load (`log key <id> is also a receipt-signing key`, before any
+  STH is read; `LogMonitor`'s constructor throws), so a tree head signed by
+  the receipt-issuing key never verifies. Pin either only receipt keys or
+  only dedicated log keys, never a mix. Results report the mode as
+  `log_key` (`SthResult`, `InclusionResult`, and `result.log` when
+  `inclusion` was given).
 - RFC 9162 proof math does not bind the tree size by itself (a size-3 proof
   also checks out "for size 4"), so every size is taken from the STH and a
   proof with different sizes is refused.
