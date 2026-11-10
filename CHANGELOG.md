@@ -19,6 +19,7 @@
 ### Changed
 
 - Renamed to Fareseal in 4 prose mentions (ARCHITECTURE.md, README.md, test/jcs-vectors.test.mjs, the `about` string of test/vectors/jcs.json); no identifier or signed value changed. test/vectors/jcs.json's sha256 is now `b294a60b53b743eedb6f77c2473abe9e1b1f1d2eec631ad8a36018a82cad3a2d`: Fareseal and atap re-sync their vendored copies (2026-11-10).
+- `scripts/verdict-lib/jcs.js` now re-exports `canonicalize`/`canonicalizeBytes` from `dist/index.js` instead of carrying a vendored copy (internal: `scripts/` is unpublished; behavior identical on test/vectors/jcs.json) (2026-11-10).
 
 ### Fixed
 
