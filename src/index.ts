@@ -14,7 +14,7 @@
 // Callers: verifyReceipt() is the public API; scripts/verdict-lib wraps it
 // for verdict receipts. Zero deps; WebCrypto + fetch (Node ≥20, Workers, Deno, Bun).
 
-import { canonicalize, canonicalizeBytes, type JsonValue } from './jcs.js';
+import { canonicalize, canonicalizeBytes, parseJsonStrict, type JsonValue } from './jcs.js';
 import {
   fetchKeyBundle,
   resolveKey,
@@ -36,6 +36,7 @@ import {
   type InclusionProof,
   type LogKeyEntry,
   type LogStatus,
+  type LogKeyMode,
   type SignedTreeHead,
 } from './log.js';
 
@@ -108,6 +109,12 @@ export interface VerifyOptions {
    *  four-tier validation still runs. Exists for scripts/verdict-lib, whose
    *  verdict receipts carry no ceiling contract. */
   unsafeSkipStrengthCeiling?: boolean;
+  /** UNSAFE: disables the rule that every number in the receipt is a
+   *  JS-safe integer (rune-record check_numbers, receipt_v1.rs:67-80), so a
+   *  float or an integer beyond ±(2^53-1) verifies. Exists for
+   *  scripts/verdict-lib, whose verdict receipts carry float weights
+   *  (tier.js:38-41). */
+  unsafeAllowNonIntegers?: boolean;
   /** Override the well-known revocations URL. */
   revocationsUrl?: string;
   /** When the receipt's embedded public_key differs from the bundle key for
@@ -156,7 +163,7 @@ export interface VerifyResult {
   /** Transparency-log status: `included` (proven under a pinned log key),
    *  `failed` (a proof was given and did not verify), or `not_checked` (no
    *  proof given: the signature is checked, log membership is NOT). */
-  log: { status: LogStatus; tree_size?: number; leaf_index?: number; log_key_id?: string };
+  log: { status: LogStatus; tree_size?: number; leaf_index?: number; log_key_id?: string; log_key?: LogKeyMode };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -192,7 +199,7 @@ function buildSigningObject(receipt: Receipt): JsonValue {
  * a wrong receipt_version, which returns at once (nothing else is defined).
  *
  * Performs:
- *   1. version check
+ *   1. version check; required fields; every number a JS-safe integer
  *   2. payload_hash recompute
  *   3. key_id resolution against the key bundle (keys > keysUrl > pinned),
  *      plus the key's status + [created_at, rotation_after] window check
@@ -205,6 +212,34 @@ function buildSigningObject(receipt: Receipt): JsonValue {
  *      keys (result.log.status); with opts.requireInclusion, a missing
  *      proof is an error
  */
+/** Push one error per number anywhere in `v` that fails Number.isSafeInteger
+ *  (-0 passes). Mirrors rune-record check_numbers. */
+function checkNumbers(v: unknown, errors: string[]): void {
+  if (typeof v === 'number') {
+    if (!Number.isSafeInteger(v)) errors.push(`number ${String(v)} is not a JS-safe integer`);
+  } else if (v && typeof v === 'object') {
+    for (const x of Object.values(v)) checkNumbers(x, errors);
+  }
+}
+
+/** verifyReceipt over raw receipt text. Never throws: a repeated member name
+ *  at any depth gives `duplicate key "<name>"` (JSON.parse would silently keep
+ *  the last one), any other parse error gives `receipt JSON: <message>`. */
+export async function verifyReceiptJson(
+  text: string,
+  opts: VerifyOptions = {},
+): Promise<VerifyResult> {
+  let parsed: JsonValue;
+  try {
+    parsed = parseJsonStrict(text);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const error = msg.startsWith('duplicate key "') ? msg : `receipt JSON: ${msg}`;
+    return { valid: false, errors: [error], warnings: [], log: { status: 'not_checked' } };
+  }
+  return verifyReceipt(parsed as unknown as Receipt, opts);
+}
+
 export async function verifyReceipt(
   receipt: Receipt,
   opts: VerifyOptions = {},
@@ -229,6 +264,19 @@ export async function verifyReceipt(
     );
     return out;
   }
+
+  // Both fields are required by the format. A missing public_key used to skip
+  // the bundle-mismatch check below, and a missing receipt_id skipped the
+  // receipt revocation check, so either let a signed receipt pass short.
+  if (typeof receipt.signature?.public_key !== 'string') {
+    errors.push('signature.public_key: required string');
+  }
+  if (typeof receipt.receipt_id !== 'string') {
+    errors.push('receipt_id: required string');
+  }
+  // Numbers: rune-record refuses any number that is not a JS-safe integer,
+  // because floats and big integers do not round-trip across languages.
+  if (!opts.unsafeAllowNonIntegers) checkNumbers(receipt, errors);
 
   // 2. payload_hash
   try {
@@ -272,7 +320,7 @@ export async function verifyReceipt(
   if (resolvedKey && bundle) {
     if (!Number.isFinite(tsMs)) {
       errors.push(`timestamp: not a valid date: ${String(receipt.timestamp)}`);
-    } else if (receipt.signature.public_key !== undefined
+    } else if (typeof receipt.signature.public_key === 'string'
         && receipt.signature.public_key !== resolvedKey.public_key) {
       // The named key A's status/window is deliberately not checked here: B is the signer.
       const embedded = receipt.signature.public_key;
@@ -328,17 +376,22 @@ export async function verifyReceipt(
   // would rank an unknown value -1 (below every ceiling) and a prototype
   // name ("constructor") as a function, which no ceiling exceeds. A key whose
   // own attestation_strength is not a tier ranks -1, so every claim exceeds it.
+  // A key with no (or null) attestation_strength ranks as self-asserted, the
+  // lowest tier: an issuer that never stated a strength gets no more than
+  // that. (It used to skip the ceiling, so any tier passed.)
   const claimedStrength: unknown = receipt.attestation_strength;
   const rankOf = (s: unknown): number =>
     typeof s === 'string' && Object.hasOwn(STRENGTH_RANK, s) ? STRENGTH_RANK[s as AttestationStrength] : -1;
   if (rankOf(claimedStrength) < 0) {
     errors.push(`attestation_strength: unrecognized value ${String(claimedStrength)}`);
-  } else if (signingKey?.attestation_strength && !opts.unsafeSkipStrengthCeiling) {
-    const tokenRank = rankOf(claimedStrength);
-    const keyRank   = rankOf(signingKey.attestation_strength);
+  } else if (signingKey && !opts.unsafeSkipStrengthCeiling) {
+    const keyStrength = signingKey.attestation_strength;
+    const missing     = keyStrength === undefined || keyStrength === null;
+    const tokenRank   = rankOf(claimedStrength);
+    const keyRank     = rankOf(missing ? 'self-asserted' : keyStrength);
     if (tokenRank > keyRank) {
       errors.push(
-        `attestation_strength ceiling violated: receipt=${receipt.attestation_strength} > key=${signingKey.attestation_strength}`,
+        `attestation_strength ceiling violated: receipt=${receipt.attestation_strength} > key=${missing ? '(none, treated as self-asserted)' : keyStrength}`,
       );
     }
   }
@@ -420,14 +473,19 @@ export async function verifyReceipt(
   // as supplied; the root comes only from an STH under a pinned log key.
   if (opts.inclusion) {
     const inc = opts.inclusion;
+    // Receipt keys = the bundle in use plus the pinned one, so a log key
+    // that is also a receipt key is caught whichever bundle signed.
+    const receiptKeys = [...(Array.isArray(bundle?.keys) ? bundle.keys : []), ...PINNED_KEY_BUNDLE.keys];
     const r = await verifyReceiptInclusion(receipt, inc.proof, inc.sth, inc.logKeys, {
       requireKeyId: inc.requireKeyId,
       logId: inc.logId,
+      receiptKeys,
     });
     out.log = { status: r.status };
     if (r.tree_size !== undefined) out.log.tree_size = r.tree_size;
     if (r.leaf_index !== undefined) out.log.leaf_index = r.leaf_index;
     if (r.log_key_id !== undefined) out.log.log_key_id = r.log_key_id;
+    if (r.log_key !== undefined) out.log.log_key = r.log_key;
     for (const e of r.errors) errors.push(`log inclusion: ${e}`);
   } else if (opts.requireInclusion) {
     errors.push('log inclusion: required but no inclusion proof was supplied');
@@ -440,7 +498,7 @@ export async function verifyReceipt(
 // Re-exports for advanced consumers. bytesToHex / sha256HexPrefixed are also
 // the one copy scripts/verdict-lib and the test helpers hash with, so a
 // receipt is hashed the same way everywhere in this repo.
-export { canonicalize, canonicalizeBytes, bytesToHex, sha256HexPrefixed };
+export { canonicalize, canonicalizeBytes, parseJsonStrict, bytesToHex, sha256HexPrefixed };
 export {
   DEFAULT_KEYS_URL,
   KEY_BUNDLE_CACHE_TTL_MS,
@@ -488,6 +546,7 @@ export type {
   SthOptions,
   SthResult,
   LogStatus,
+  LogKeyMode,
   InclusionResult,
   ConsistencyResult,
   SthStore,

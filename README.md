@@ -116,6 +116,10 @@ interface VerifyResult {
 }
 ```
 
+### `verifyReceiptJson(text, opts?)`
+
+`verifyReceipt` over raw receipt text. It refuses an object that repeats a member name at any depth (`duplicate key "<name>"`; `JSON.parse` would silently keep the last one), reports other parse errors as `receipt JSON: <message>`, and never throws; otherwise the result equals `verifyReceipt(JSON.parse(text), opts)`. Prefer it when you hold the receipt as text.
+
 ### `VerifyOptions`
 
 | Option | Default | Purpose |
@@ -135,7 +139,7 @@ interface VerifyResult {
 
 ### Lower-level exports
 
-`fetchKeyBundle`, `resolveKey`, `keyUsableAt`, `clearKeyCache`, `DEFAULT_KEYS_URL`, `KEY_BUNDLE_CACHE_TTL_MS`, `PINNED_KEY_BUNDLE`, `PINNED_KEYS_FETCHED_AT`, `fetchRevocations`, `isKeyRevoked`, `isReceiptRevoked`, `clearRevocationCache`, `DEFAULT_REVOCATIONS_URL`, `REVOCATION_CACHE_TTL_MS`, `canonicalize`, `canonicalizeBytes`, `bytesToHex`, `sha256HexPrefixed`, `RECEIPT_VERSION`, and the types `Receipt`, `VerifyOptions`, `VerifyResult`, `KeyBundle`, `SigningKeyEntry`, `AttestationStrength`, `RevocationFeed`, `JsonValue`. See `ARCHITECTURE.md` for the module map and trust boundaries.
+`fetchKeyBundle`, `resolveKey`, `keyUsableAt`, `clearKeyCache`, `DEFAULT_KEYS_URL`, `KEY_BUNDLE_CACHE_TTL_MS`, `PINNED_KEY_BUNDLE`, `PINNED_KEYS_FETCHED_AT`, `fetchRevocations`, `isKeyRevoked`, `isReceiptRevoked`, `clearRevocationCache`, `DEFAULT_REVOCATIONS_URL`, `REVOCATION_CACHE_TTL_MS`, `canonicalize`, `canonicalizeBytes`, `parseJsonStrict`, `bytesToHex`, `sha256HexPrefixed`, `RECEIPT_VERSION`, and the types `Receipt`, `VerifyOptions`, `VerifyResult`, `KeyBundle`, `SigningKeyEntry`, `AttestationStrength`, `RevocationFeed`, `JsonValue`. See `ARCHITECTURE.md` for the module map and trust boundaries.
 
 ## Transparency-log inclusion and consistency (in the library)
 
@@ -152,7 +156,7 @@ const logId = 'tunnelmind-receipts-log-v1';
 const proof = (await (await fetch(`https://data.tunnelmind.ai/v1/receipts/log/proof?receipt_id=${id}`)).json()).data;
 
 const r = await verifyReceipt(receipt, { inclusion: { proof, logKeys, logId, requireKeyId: true }, requireInclusion: true });
-r.log; // { status: 'included', tree_size, leaf_index, log_key_id }
+r.log; // { status: 'included', tree_size, leaf_index, log_key_id, log_key: 'shared_with_receipts' }
 ```
 
 - `result.log.status` is `included` (proven), `failed` (a proof was given and
@@ -171,6 +175,18 @@ r.log; // { status: 'included', tree_size, leaf_index, log_key_id }
   `tm-receipt-2026-05`, the receipt-signing key, so you pin that key as a
   log key. Until the log gets a key of its own, inclusion proves the receipt
   is in the issuer's log, not that a second party witnessed it.
+- **Log-key mode: shared or separate.** The mode comes from your `logKeys`,
+  compared by public key with the receipt-signing keys (`receiptKeys` in
+  `SthOptions`, default `PINNED_KEY_BUNDLE.keys`; `verifyReceipt` passes its
+  bundle in use plus the pinned one). Every log key a receipt key: mode
+  `shared_with_receipts`, behaviour as above. Any log key that is not a
+  receipt key: mode `separate`, and then a log key equal to a receipt key is
+  refused at load (`log key <id> is also a receipt-signing key`, before any
+  STH is read; `LogMonitor`'s constructor throws), so a tree head signed by
+  the receipt-issuing key never verifies. Pin either only receipt keys or
+  only dedicated log keys, never a mix. Results report the mode as
+  `log_key` (`SthResult`, `InclusionResult`, and `result.log` when
+  `inclusion` was given).
 - RFC 9162 proof math does not bind the tree size by itself (a size-3 proof
   also checks out "for size 4"), so every size is taken from the STH and a
   proof with different sizes is refused.
@@ -249,7 +265,9 @@ are the spec (the service runs the same code).
 
 ## Spec drift
 
-The JCS canonicalizer in `src/jcs.ts` produces the same bytes as the issuer-side serializers in `scry-server/src/lib/receipt_v1.js` and `tunnelmind-data-api/api/utils/jcs.js` for every well-formed input; any change to one MUST be mirrored across all three. The one deliberate difference: this package refuses a lone UTF-16 surrogate (the issuers emit U+FFFD), so a receipt carrying one fails closed rather than letting two strings sign to the same bytes. The JCS tests live in `test/verify.test.mjs` and `test/properties.test.mjs` (with the shared helpers in `test/_helpers.mjs`); the frozen cross-implementation wire vectors are `test/vectors/jcs.json`, run here against `src/jcs.ts`, `scripts/verdict-lib/jcs.js` and `scripts/verify-log.mjs` (`test/jcs-vectors.test.mjs`) and are the file tollbooth and atap vendor verbatim (their copies carry this file's sha).
+The JCS canonicalizer in `src/jcs.ts` produces the same bytes as the issuer-side serializers in `scry-server/src/lib/receipt_v1.js` and `tunnelmind-data-api/api/utils/jcs.js` for every well-formed input; any change to one MUST be mirrored across all three. The one deliberate difference: this package refuses a lone UTF-16 surrogate (the issuers emit U+FFFD), so a receipt carrying one fails closed rather than letting two strings sign to the same bytes. The JCS tests live in `test/verify.test.mjs` and `test/properties.test.mjs` (with the shared helpers in `test/_helpers.mjs`); the frozen cross-implementation wire vectors are `test/vectors/jcs.json`, run here against all three entry points — the two independent implementations in this repo, `src/jcs.ts` and `scripts/verify-log.mjs` `jcs()`, plus `scripts/verdict-lib/jcs.js`, which re-exports `src/jcs.ts` and is pinned to it by identity (`test/jcs-vectors.test.mjs`) — and are the file Fareseal and atap vendor verbatim (their copies carry this file's sha).
+
+`test/vectors/receipt-v1/` holds the Receipt v1.0 vectors shared with the Rust verifier (rune-record): `cases.json` (the key bundle, revocation feed and case list) plus 10 raw receipt files, each with one defect and its expected verdict, generated by `scripts/gen-receipt-v1-vectors.mjs` from public test-only seeds and checked by `test/receipt-v1-vectors.test.mjs`.
 
 ## Migrating from 1.x to 2.0.0
 

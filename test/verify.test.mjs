@@ -4,6 +4,7 @@ import { webcrypto } from 'node:crypto';
 import { canonicalizeBytes } from '../dist/jcs.js';
 import {
   verifyReceipt,
+  verifyReceiptJson,
   fetchRevocations,
   clearKeyCache,
   clearRevocationCache,
@@ -695,6 +696,31 @@ test('unsafeSkipStrengthCeiling: a receipt above its key strength verifies only 
   assert.equal(lax.valid, true, lax.errors.join('; '));
 });
 
+// A key with no attestation_strength used to skip the ceiling, so any tier
+// up to silicon-root passed. It now ranks as self-asserted. The field is
+// passed explicitly as undefined so makeKeyBundle's 'software' default stays off.
+test('key without attestation_strength is ranked self-asserted', async () => {
+  reset();
+  const check = async (claim, extra = {}) => {
+    const { receipt, keyId, publicKeyB64 } = await makeReceipt({ attestationStrength: claim });
+    return verifyReceipt(receipt, {
+      keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: undefined }]),
+      revocations: makeRevocations(),
+      ...extra,
+    });
+  };
+  const over = await check('software');
+  assert.equal(over.valid, false);
+  assert.ok(
+    over.errors.includes('attestation_strength ceiling violated: receipt=software > key=(none, treated as self-asserted)'),
+    over.errors.join('; '),
+  );
+  const at = await check('self-asserted');
+  assert.equal(at.valid, true, at.errors.join('; '));
+  const skipped = await check('software', { unsafeSkipStrengthCeiling: true });
+  assert.equal(skipped.valid, true, skipped.errors.join('; '));
+});
+
 // attestation_strength is validated as one of the four tiers: a bare rank
 // lookup would let an unknown value sit below every ceiling, and a prototype
 // name rank as a function no ceiling exceeds.
@@ -734,3 +760,120 @@ test('rejects re-spelled signature.value (whitespace, no padding, stray low bits
   const ok = await verifyReceipt(receipt, { keys, revocations: makeRevocations() });
   assert.equal(ok.valid, true, ok.errors.join('; '));
 });
+
+// R001: a receipt correctly signed by a bundle key, but missing (or with a
+// non-string) signature.public_key or receipt_id, must not verify. The field
+// is changed before signing, so the only failure is the missing field.
+for (const [name, mutate, expected] of [
+  ['no signature.public_key', (r) => { delete r.signature.public_key; }, 'signature.public_key: required string'],
+  ['non-string signature.public_key', (r) => { r.signature.public_key = 123; }, 'signature.public_key: required string'],
+  ['no receipt_id', (r) => { delete r.receipt_id; }, 'receipt_id: required string'],
+  ['non-string receipt_id', (r) => { r.receipt_id = 42; }, 'receipt_id: required string'],
+]) {
+  test(`rejects a correctly signed receipt with ${name}`, async () => {
+    reset();
+    const { receipt, keyId, publicKeyB64 } = await makeReceipt({ mutate });
+    const result = await verifyReceipt(receipt, {
+      keys: makeKeyBundle([
+        { key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' },
+      ]),
+      revocations: makeRevocations(),
+    });
+    assert.equal(result.valid, false, `expected invalid, got valid=${result.valid}`);
+    assert.deepEqual(result.errors, [expected]);
+  });
+}
+
+// R005: every number in the receipt must be a JS-safe integer (rune-record
+// check_numbers, receipt_v1.rs:67-80). Floats canonicalize and sign fine, so
+// only this check rejects them.
+async function verifyPayload(payload, extra = {}) {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt({ payload });
+  return verifyReceipt(receipt, {
+    keys: makeKeyBundle([
+      { key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' },
+    ]),
+    revocations: makeRevocations(),
+    ...extra,
+  });
+}
+
+for (const [payload, n] of [
+  [{ x: 1.5 }, '1.5'],
+  [{ deep: [{ n: 9007199254740992 }] }, '9007199254740992'],
+  [{ neg: -(2 ** 53) }, '-9007199254740992'],
+]) {
+  test(`rejects a correctly signed receipt with number ${n} in the payload`, async () => {
+    const result = await verifyPayload(payload);
+    assert.equal(result.valid, false);
+    assert.deepEqual(result.errors, [`number ${n} is not a JS-safe integer`]);
+  });
+}
+
+test('accepts -0 and 2^53-1 in the payload', async () => {
+  const result = await verifyPayload({ z: -0, max: 2 ** 53 - 1, min: -(2 ** 53 - 1) });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.valid, true);
+});
+
+test('unsafeAllowNonIntegers skips the safe-integer check', async () => {
+  const result = await verifyPayload({ x: 1.5 }, { unsafeAllowNonIntegers: true });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.valid, true);
+});
+
+// R005: JSON.parse keeps the last duplicate silently, so verifyReceiptJson
+// must refuse one. JSON.stringify cannot emit a duplicate, so the texts below
+// are spliced by hand.
+async function signedText() {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt({ payload: { list: [{ a: 1 }] } });
+  const opts = {
+    keys: makeKeyBundle([
+      { key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' },
+    ]),
+    revocations: makeRevocations(),
+  };
+  return { receipt, opts, text: JSON.stringify(receipt) };
+}
+
+test('verifyReceiptJson gives the same result as verifyReceipt for valid text', async () => {
+  const { receipt, opts, text } = await signedText();
+  const fromText = await verifyReceiptJson(text, opts);
+  assert.equal(fromText.valid, true, fromText.errors.join('; '));
+  assert.deepEqual(fromText, await verifyReceipt(receipt, opts));
+});
+
+for (const [where, edit, name] of [
+  ['top-level', (t) => t.replace(/^\{/, '{"receipt_id":"x",'), 'receipt_id'],
+  ['nested', (t) => t.replace('[{"a":1}]', '[{"a":1,"a":2}]'), 'a'],
+  ['in signature', (t) => t.replace('"signature":{', '"signature":{"key_id":"evil",'), 'key_id'],
+  ['escaped-equal', (t) => t.replace('[{"a":1}]', '[{"a":1,"\\u0061":2}]'), 'a'],
+]) {
+  test(`verifyReceiptJson refuses a ${where} duplicate key`, async () => {
+    const { opts, text } = await signedText();
+    const dup = edit(text);
+    assert.notEqual(dup, text, 'splice must change the text');
+    const result = await verifyReceiptJson(dup, opts);
+    assert.equal(result.valid, false);
+    assert.deepEqual(result.errors, [`duplicate key "${name}"`]);
+  });
+}
+
+test('verifyReceiptJson treats __proto__ as an ordinary key', async () => {
+  const { opts, text } = await signedText();
+  const once = await verifyReceiptJson(text.replace('[{"a":1}]', '[{"a":1,"__proto__":1}]'), opts);
+  assert.ok(!once.errors.some((e) => e.startsWith('duplicate') || e.startsWith('receipt JSON')), once.errors.join('; '));
+  const twice = await verifyReceiptJson(text.replace('[{"a":1}]', '[{"__proto__":1,"__proto__":2}]'), opts);
+  assert.deepEqual(twice.errors, ['duplicate key "__proto__"']);
+});
+
+for (const bad of ['', '{"a":', '{"a":1}}', 'not json']) {
+  test(`verifyReceiptJson reports malformed text ${JSON.stringify(bad)} without throwing`, async () => {
+    const result = await verifyReceiptJson(bad);
+    assert.equal(result.valid, false);
+    assert.equal(result.errors.length, 1);
+    assert.ok(result.errors[0].startsWith('receipt JSON: '), result.errors[0]);
+  });
+}

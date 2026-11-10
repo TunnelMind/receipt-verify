@@ -5,7 +5,9 @@
 // code, zero helpers shared with the sequencer (tunnelmind-data-api
 // api/lib/receipt-log.js), whose test suite asserts that mechanically. The
 // point is to catch a shared hashing bug, not to confirm the sequencer agrees
-// with itself; the re-implemented JCS is pinned to the package's by
+// with itself. jcs() is deliberately NOT the package canonicalizer (unlike
+// scripts/verdict-lib/jcs.js, which re-exports it), so a shared JCS bug is
+// caught; the re-implementation is pinned to the package's by
 // test/vectors/jcs.json. Dialect: STH = Ed25519 over JCS(sth minus
 // `signature`), standard base64; leaf = SHA-256(0x00 || JCS(receipt)).
 // Trust: only the --key / public_key_b64 argument; never a key the STH or

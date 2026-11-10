@@ -29,6 +29,9 @@ export async function makeReceipt({
   chain = { previous_receipt_hash: null, sequence: 0 },
   kp,
   publicKeyB64,
+  // Edits the unsigned envelope before signing, so a test can build a
+  // receipt that is correctly signed yet malformed (e.g. a field removed).
+  mutate,
 } = {}) {
   if (!kp || !publicKeyB64) {
     const fresh = await makeEphemeralKey();
@@ -52,6 +55,7 @@ export async function makeReceipt({
       public_key: publicKeyB64,
     },
   };
+  if (mutate) mutate(receipt);
   const signingObject = { ...receipt };
   delete signingObject.payload;
   signingObject.signature = { ...receipt.signature };
@@ -66,7 +70,14 @@ export function makeKeyBundle(entries) {
     spec: 'https://tunnelmind.ai/standards/receipt-format/v1',
     format_version: '1.0',
     updated_at: new Date().toISOString(),
-    keys: entries,
+    // Entries that omit attestation_strength get 'software' (what makeReceipt
+    // claims by default); one with the property present, even undefined, is
+    // left as-is so a test can build a key with no stated strength. Non-object
+    // entries (garbage-bundle tests) and non-array keys pass through untouched.
+    keys: Array.isArray(entries)
+      ? entries.map((e) => (e && typeof e === 'object' && !Array.isArray(e) && !Object.hasOwn(e, 'attestation_strength')
+        ? { ...e, attestation_strength: 'software' } : e))
+      : entries,
   };
 }
 

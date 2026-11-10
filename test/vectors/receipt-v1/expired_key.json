@@ -1,0 +1,28 @@
+{
+  "receipt_version": "1.0",
+  "receipt_id": "019c0000-0000-7000-8000-000000000003",
+  "timestamp": "2026-03-01T00:00:00Z",
+  "timestamp_proof": {
+    "method": "none"
+  },
+  "source": {
+    "lens": "tracker",
+    "endpoint": "/v1/test/echo",
+    "node_id": "OAI-2026-0000201"
+  },
+  "attestation_strength": "software",
+  "payload_hash": "0x93a23971a914e5eacbf0a8d25154cda309c3c1c72fbb9914d47c60f3cb681588",
+  "payload": {
+    "hello": "world"
+  },
+  "chain": {
+    "previous_receipt_hash": null,
+    "sequence": 0
+  },
+  "signature": {
+    "algorithm": "Ed25519",
+    "key_id": "vec-expired",
+    "public_key": "h6m6sdo8fhmO0HcvPV/qpd0mol+qJ22UQWT303npnHw=",
+    "value": "0VeDyLEDWLIWfajliFnQ3hgUJnjoFSMIQMIXH8Q+8ovGIy2MLS8C4sR/Hc1Ci6cHlbRJ5oEyijcu6iYN8LPlCQ=="
+  }
+}
