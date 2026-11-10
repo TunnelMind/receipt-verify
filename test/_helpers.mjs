@@ -29,6 +29,9 @@ export async function makeReceipt({
   chain = { previous_receipt_hash: null, sequence: 0 },
   kp,
   publicKeyB64,
+  // Edits the unsigned envelope before signing, so a test can build a
+  // receipt that is correctly signed yet malformed (e.g. a field removed).
+  mutate,
 } = {}) {
   if (!kp || !publicKeyB64) {
     const fresh = await makeEphemeralKey();
@@ -52,6 +55,7 @@ export async function makeReceipt({
       public_key: publicKeyB64,
     },
   };
+  if (mutate) mutate(receipt);
   const signingObject = { ...receipt };
   delete signingObject.payload;
   signingObject.signature = { ...receipt.signature };

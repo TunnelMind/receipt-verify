@@ -734,3 +734,26 @@ test('rejects re-spelled signature.value (whitespace, no padding, stray low bits
   const ok = await verifyReceipt(receipt, { keys, revocations: makeRevocations() });
   assert.equal(ok.valid, true, ok.errors.join('; '));
 });
+
+// R001: a receipt correctly signed by a bundle key, but missing (or with a
+// non-string) signature.public_key or receipt_id, must not verify. The field
+// is changed before signing, so the only failure is the missing field.
+for (const [name, mutate, expected] of [
+  ['no signature.public_key', (r) => { delete r.signature.public_key; }, 'signature.public_key: required string'],
+  ['non-string signature.public_key', (r) => { r.signature.public_key = 123; }, 'signature.public_key: required string'],
+  ['no receipt_id', (r) => { delete r.receipt_id; }, 'receipt_id: required string'],
+  ['non-string receipt_id', (r) => { r.receipt_id = 42; }, 'receipt_id: required string'],
+]) {
+  test(`rejects a correctly signed receipt with ${name}`, async () => {
+    reset();
+    const { receipt, keyId, publicKeyB64 } = await makeReceipt({ mutate });
+    const result = await verifyReceipt(receipt, {
+      keys: makeKeyBundle([
+        { key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' },
+      ]),
+      revocations: makeRevocations(),
+    });
+    assert.equal(result.valid, false, `expected invalid, got valid=${result.valid}`);
+    assert.deepEqual(result.errors, [expected]);
+  });
+}

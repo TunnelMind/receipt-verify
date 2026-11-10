@@ -230,6 +230,16 @@ export async function verifyReceipt(
     return out;
   }
 
+  // Both fields are required by the format. A missing public_key used to skip
+  // the bundle-mismatch check below, and a missing receipt_id skipped the
+  // receipt revocation check, so either let a signed receipt pass short.
+  if (typeof receipt.signature?.public_key !== 'string') {
+    errors.push('signature.public_key: required string');
+  }
+  if (typeof receipt.receipt_id !== 'string') {
+    errors.push('receipt_id: required string');
+  }
+
   // 2. payload_hash
   try {
     const computed = await sha256HexPrefixed(toAB(canonicalizeBytes(receipt.payload)));
@@ -272,7 +282,7 @@ export async function verifyReceipt(
   if (resolvedKey && bundle) {
     if (!Number.isFinite(tsMs)) {
       errors.push(`timestamp: not a valid date: ${String(receipt.timestamp)}`);
-    } else if (receipt.signature.public_key !== undefined
+    } else if (typeof receipt.signature.public_key === 'string'
         && receipt.signature.public_key !== resolvedKey.public_key) {
       // The named key A's status/window is deliberately not checked here: B is the signer.
       const embedded = receipt.signature.public_key;

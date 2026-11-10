@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Breaking
+
+- `verifyReceipt()` now errors with `signature.public_key: required string` when `signature.public_key` is absent or not a string, and `receipt_id: required string` when `receipt_id` is absent or not a string; before, a correctly signed receipt without either still verified. Migration: receipts from rune-record and Fareseal always carry both; add them to hand-built receipts and re-sign (2026-11-10).
+
 ### Added
 
 - Transparency-log verification in the library, on WebCrypto (Workers, Deno, Bun, Node): `verifyReceipt()` takes `inclusion: { proof, sth?, logKeys }` and reports `result.log.status` (`included` | `failed` | `not_checked`); `requireInclusion` makes a missing proof an error. New exports `verifySth`, `verifyReceiptInclusion`, `verifySthConsistency`, `receiptLeafHash`, `LogMonitor`, `MemorySthStore`, and the RFC 9162 primitives `leafHash`, `nodeHash`, `verifyInclusion`, `verifyConsistency`, `parseHash` (src/merkle.ts, src/log.ts). Previously inclusion and consistency existed only in `scripts/`, which is not published (2026-11-07).
