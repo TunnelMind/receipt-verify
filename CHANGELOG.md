@@ -11,6 +11,10 @@
 - `keyUsableAt()` takes an optional `subject` for its reasons, and a key with a window now fails a non-finite timestamp instead of passing it (2026-11-07).
 - Consistency tests: exhaustive inclusion and consistency for every tree up to 33 leaves against a recursive RFC 6962 reference, plus tamper, fork and rollback cases; the src/ and scripts/ verifiers are cross-checked (test/log.test.mjs) (2026-11-07).
 
+### Changed
+
+- Renamed to Fareseal in 4 prose mentions (ARCHITECTURE.md, README.md, test/jcs-vectors.test.mjs, the `about` string of test/vectors/jcs.json); no identifier or signed value changed. test/vectors/jcs.json's sha256 is now `b294a60b53b743eedb6f77c2473abe9e1b1f1d2eec631ad8a36018a82cad3a2d`: Fareseal and atap re-sync their vendored copies (2026-11-10).
+
 ### Fixed
 
 - `engines` said Node >=18, but Node 18 has no `globalThis.crypto`, so importing the package threw there on every version. The floor is now Node >=20 (Node 18 reached end of life 2025-04-30); a CI test job runs Node 20/22/24 on every PR (2026-11-07).

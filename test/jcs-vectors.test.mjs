@@ -1,6 +1,6 @@
 // The frozen JCS wire vectors (test/vectors/jcs.json) against every
 // canonicalizer this repo carries: the package, the vendored verdict kernel
-// and the independent log verifier. tollbooth and atap vendor the vector
+// and the independent log verifier. Fareseal and atap vendor the vector
 // file verbatim; a change here must be mirrored there.
 
 import { test } from 'node:test';

@@ -19,7 +19,7 @@ scripts/verify-verdict.mjs   CLI: offline Reconciliation Verdict verifier (argv/
 scripts/verdict-lib/         its kernel: verify-receipt.js (5 checks) + reconcile/tier/log/jcs/hash,
                              vendored from the service; verify-receipt.js calls the package for the envelope
 scripts/verify-log.mjs       CLI: independent transparency-log verifier (node builtins only, by design)
-test/vectors/jcs.json        frozen JCS vectors shared verbatim with tollbooth and atap
+test/vectors/jcs.json        frozen JCS vectors shared verbatim with Fareseal and atap
 ```
 
 ## Data flow
