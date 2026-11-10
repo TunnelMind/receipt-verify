@@ -4,6 +4,7 @@ import { webcrypto } from 'node:crypto';
 import { canonicalizeBytes } from '../dist/jcs.js';
 import {
   verifyReceipt,
+  verifyReceiptJson,
   fetchRevocations,
   clearKeyCache,
   clearRevocationCache,
@@ -821,3 +822,58 @@ test('unsafeAllowNonIntegers skips the safe-integer check', async () => {
   assert.deepEqual(result.errors, []);
   assert.equal(result.valid, true);
 });
+
+// R005: JSON.parse keeps the last duplicate silently, so verifyReceiptJson
+// must refuse one. JSON.stringify cannot emit a duplicate, so the texts below
+// are spliced by hand.
+async function signedText() {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt({ payload: { list: [{ a: 1 }] } });
+  const opts = {
+    keys: makeKeyBundle([
+      { key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' },
+    ]),
+    revocations: makeRevocations(),
+  };
+  return { receipt, opts, text: JSON.stringify(receipt) };
+}
+
+test('verifyReceiptJson gives the same result as verifyReceipt for valid text', async () => {
+  const { receipt, opts, text } = await signedText();
+  const fromText = await verifyReceiptJson(text, opts);
+  assert.equal(fromText.valid, true, fromText.errors.join('; '));
+  assert.deepEqual(fromText, await verifyReceipt(receipt, opts));
+});
+
+for (const [where, edit, name] of [
+  ['top-level', (t) => t.replace(/^\{/, '{"receipt_id":"x",'), 'receipt_id'],
+  ['nested', (t) => t.replace('[{"a":1}]', '[{"a":1,"a":2}]'), 'a'],
+  ['in signature', (t) => t.replace('"signature":{', '"signature":{"key_id":"evil",'), 'key_id'],
+  ['escaped-equal', (t) => t.replace('[{"a":1}]', '[{"a":1,"\\u0061":2}]'), 'a'],
+]) {
+  test(`verifyReceiptJson refuses a ${where} duplicate key`, async () => {
+    const { opts, text } = await signedText();
+    const dup = edit(text);
+    assert.notEqual(dup, text, 'splice must change the text');
+    const result = await verifyReceiptJson(dup, opts);
+    assert.equal(result.valid, false);
+    assert.deepEqual(result.errors, [`duplicate key "${name}"`]);
+  });
+}
+
+test('verifyReceiptJson treats __proto__ as an ordinary key', async () => {
+  const { opts, text } = await signedText();
+  const once = await verifyReceiptJson(text.replace('[{"a":1}]', '[{"a":1,"__proto__":1}]'), opts);
+  assert.ok(!once.errors.some((e) => e.startsWith('duplicate') || e.startsWith('receipt JSON')), once.errors.join('; '));
+  const twice = await verifyReceiptJson(text.replace('[{"a":1}]', '[{"__proto__":1,"__proto__":2}]'), opts);
+  assert.deepEqual(twice.errors, ['duplicate key "__proto__"']);
+});
+
+for (const bad of ['', '{"a":', '{"a":1}}', 'not json']) {
+  test(`verifyReceiptJson reports malformed text ${JSON.stringify(bad)} without throwing`, async () => {
+    const result = await verifyReceiptJson(bad);
+    assert.equal(result.valid, false);
+    assert.equal(result.errors.length, 1);
+    assert.ok(result.errors[0].startsWith('receipt JSON: '), result.errors[0]);
+  });
+}

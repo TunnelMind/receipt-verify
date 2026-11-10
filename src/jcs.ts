@@ -63,3 +63,37 @@ export function canonicalize(value: JsonValue): string {
 export function canonicalizeBytes(value: JsonValue): Uint8Array {
   return new TextEncoder().encode(canonicalize(value));
 }
+
+/** `JSON.parse(text)`, but throws `duplicate key "<name>"` when an object
+ *  repeats a member name at any depth. Why: JSON.parse silently keeps the
+ *  last duplicate while other parsers keep the first (or refuse), so one
+ *  receipt text could verify here and mean something else to the next
+ *  reader. Names are compared decoded, so "a" and "a" collide;
+ *  `__proto__` is an ordinary key (JSON.parse makes it an own property). */
+export function parseJsonStrict(text: string): JsonValue {
+  // JSON.parse validates and builds the value (its syntax errors propagate);
+  // the scan below only runs on text already known to be valid JSON.
+  const value = JSON.parse(text) as JsonValue;
+  const stack: (Set<string> | null)[] = []; // a Set per open object, null per array
+  let expectKey = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '{') { stack.push(new Set()); expectKey = true; }
+    else if (c === '[') { stack.push(null); expectKey = false; }
+    else if (c === '}' || c === ']') { stack.pop(); expectKey = false; }
+    else if (c === ',') expectKey = stack[stack.length - 1] != null;
+    else if (c === '"') {
+      let j = i + 1;
+      while (text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+      if (expectKey) {
+        const name = JSON.parse(text.slice(i, j + 1)) as string;
+        const keys = stack[stack.length - 1]!;
+        if (keys.has(name)) throw new Error(`duplicate key "${name}"`);
+        keys.add(name);
+        expectKey = false;
+      }
+      i = j;
+    }
+  }
+  return value;
+}

@@ -14,7 +14,7 @@
 // Callers: verifyReceipt() is the public API; scripts/verdict-lib wraps it
 // for verdict receipts. Zero deps; WebCrypto + fetch (Node ≥20, Workers, Deno, Bun).
 
-import { canonicalize, canonicalizeBytes, type JsonValue } from './jcs.js';
+import { canonicalize, canonicalizeBytes, parseJsonStrict, type JsonValue } from './jcs.js';
 import {
   fetchKeyBundle,
   resolveKey,
@@ -220,6 +220,24 @@ function checkNumbers(v: unknown, errors: string[]): void {
   } else if (v && typeof v === 'object') {
     for (const x of Object.values(v)) checkNumbers(x, errors);
   }
+}
+
+/** verifyReceipt over raw receipt text. Never throws: a repeated member name
+ *  at any depth gives `duplicate key "<name>"` (JSON.parse would silently keep
+ *  the last one), any other parse error gives `receipt JSON: <message>`. */
+export async function verifyReceiptJson(
+  text: string,
+  opts: VerifyOptions = {},
+): Promise<VerifyResult> {
+  let parsed: JsonValue;
+  try {
+    parsed = parseJsonStrict(text);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const error = msg.startsWith('duplicate key "') ? msg : `receipt JSON: ${msg}`;
+    return { valid: false, errors: [error], warnings: [], log: { status: 'not_checked' } };
+  }
+  return verifyReceipt(parsed as unknown as Receipt, opts);
 }
 
 export async function verifyReceipt(
@@ -480,7 +498,7 @@ export async function verifyReceipt(
 // Re-exports for advanced consumers. bytesToHex / sha256HexPrefixed are also
 // the one copy scripts/verdict-lib and the test helpers hash with, so a
 // receipt is hashed the same way everywhere in this repo.
-export { canonicalize, canonicalizeBytes, bytesToHex, sha256HexPrefixed };
+export { canonicalize, canonicalizeBytes, parseJsonStrict, bytesToHex, sha256HexPrefixed };
 export {
   DEFAULT_KEYS_URL,
   KEY_BUNDLE_CACHE_TTL_MS,

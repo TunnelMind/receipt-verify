@@ -116,6 +116,10 @@ interface VerifyResult {
 }
 ```
 
+### `verifyReceiptJson(text, opts?)`
+
+`verifyReceipt` over raw receipt text. It refuses an object that repeats a member name at any depth (`duplicate key "<name>"`; `JSON.parse` would silently keep the last one), reports other parse errors as `receipt JSON: <message>`, and never throws; otherwise the result equals `verifyReceipt(JSON.parse(text), opts)`. Prefer it when you hold the receipt as text.
+
 ### `VerifyOptions`
 
 | Option | Default | Purpose |
@@ -135,7 +139,7 @@ interface VerifyResult {
 
 ### Lower-level exports
 
-`fetchKeyBundle`, `resolveKey`, `keyUsableAt`, `clearKeyCache`, `DEFAULT_KEYS_URL`, `KEY_BUNDLE_CACHE_TTL_MS`, `PINNED_KEY_BUNDLE`, `PINNED_KEYS_FETCHED_AT`, `fetchRevocations`, `isKeyRevoked`, `isReceiptRevoked`, `clearRevocationCache`, `DEFAULT_REVOCATIONS_URL`, `REVOCATION_CACHE_TTL_MS`, `canonicalize`, `canonicalizeBytes`, `bytesToHex`, `sha256HexPrefixed`, `RECEIPT_VERSION`, and the types `Receipt`, `VerifyOptions`, `VerifyResult`, `KeyBundle`, `SigningKeyEntry`, `AttestationStrength`, `RevocationFeed`, `JsonValue`. See `ARCHITECTURE.md` for the module map and trust boundaries.
+`fetchKeyBundle`, `resolveKey`, `keyUsableAt`, `clearKeyCache`, `DEFAULT_KEYS_URL`, `KEY_BUNDLE_CACHE_TTL_MS`, `PINNED_KEY_BUNDLE`, `PINNED_KEYS_FETCHED_AT`, `fetchRevocations`, `isKeyRevoked`, `isReceiptRevoked`, `clearRevocationCache`, `DEFAULT_REVOCATIONS_URL`, `REVOCATION_CACHE_TTL_MS`, `canonicalize`, `canonicalizeBytes`, `parseJsonStrict`, `bytesToHex`, `sha256HexPrefixed`, `RECEIPT_VERSION`, and the types `Receipt`, `VerifyOptions`, `VerifyResult`, `KeyBundle`, `SigningKeyEntry`, `AttestationStrength`, `RevocationFeed`, `JsonValue`. See `ARCHITECTURE.md` for the module map and trust boundaries.
 
 ## Transparency-log inclusion and consistency (in the library)
 

@@ -12,6 +12,7 @@
 
 ### Added
 
+- `verifyReceiptJson(text, opts)`: verifies raw receipt text and refuses a repeated member name at any depth with `duplicate key "<name>"` (names compared decoded), where `JSON.parse` silently keeps the last one; other parse errors give `receipt JSON: <message>`, it never throws, and otherwise it returns `verifyReceipt(parsed, opts)`. The strict parser is exported as `parseJsonStrict` (2026-11-10).
 - `log_key: "shared_with_receipts" | "separate"` on `SthResult`, `InclusionResult` and `VerifyResult.log` (when `inclusion` was given), and the `LogKeyMode` type: whether the pinned log keys are the receipt-signing keys or a key of their own (2026-11-10).
 - Transparency-log verification in the library, on WebCrypto (Workers, Deno, Bun, Node): `verifyReceipt()` takes `inclusion: { proof, sth?, logKeys }` and reports `result.log.status` (`included` | `failed` | `not_checked`); `requireInclusion` makes a missing proof an error. New exports `verifySth`, `verifyReceiptInclusion`, `verifySthConsistency`, `receiptLeafHash`, `LogMonitor`, `MemorySthStore`, and the RFC 9162 primitives `leafHash`, `nodeHash`, `verifyInclusion`, `verifyConsistency`, `parseHash` (src/merkle.ts, src/log.ts). Previously inclusion and consistency existed only in `scripts/`, which is not published (2026-11-07).
 - `LogMonitor` persists the last accepted STH per log and only accepts an advance proven append-only; reports `rollback`, `fork` (two signed roots for one size), `unproven` and `invalid`, and never stores an STH that failed (2026-11-07).
