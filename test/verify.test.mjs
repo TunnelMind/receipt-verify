@@ -782,3 +782,42 @@ for (const [name, mutate, expected] of [
     assert.deepEqual(result.errors, [expected]);
   });
 }
+
+// R005: every number in the receipt must be a JS-safe integer (rune-record
+// check_numbers, receipt_v1.rs:67-80). Floats canonicalize and sign fine, so
+// only this check rejects them.
+async function verifyPayload(payload, extra = {}) {
+  reset();
+  const { receipt, keyId, publicKeyB64 } = await makeReceipt({ payload });
+  return verifyReceipt(receipt, {
+    keys: makeKeyBundle([
+      { key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: 'software' },
+    ]),
+    revocations: makeRevocations(),
+    ...extra,
+  });
+}
+
+for (const [payload, n] of [
+  [{ x: 1.5 }, '1.5'],
+  [{ deep: [{ n: 9007199254740992 }] }, '9007199254740992'],
+  [{ neg: -(2 ** 53) }, '-9007199254740992'],
+]) {
+  test(`rejects a correctly signed receipt with number ${n} in the payload`, async () => {
+    const result = await verifyPayload(payload);
+    assert.equal(result.valid, false);
+    assert.deepEqual(result.errors, [`number ${n} is not a JS-safe integer`]);
+  });
+}
+
+test('accepts -0 and 2^53-1 in the payload', async () => {
+  const result = await verifyPayload({ z: -0, max: 2 ** 53 - 1, min: -(2 ** 53 - 1) });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.valid, true);
+});
+
+test('unsafeAllowNonIntegers skips the safe-integer check', async () => {
+  const result = await verifyPayload({ x: 1.5 }, { unsafeAllowNonIntegers: true });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.valid, true);
+});

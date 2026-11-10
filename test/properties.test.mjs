@@ -52,17 +52,23 @@ function randomNumber(r) {
   return (r() - 0.5) * 1000;
 }
 
-function randomValue(r, depth = 0) {
+// intsOnly: numbers are safe integers, as verifyReceipt requires (R005). It
+// draws the same r() calls either way, so the canonicalize sequences are
+// unchanged.
+function randomValue(r, depth = 0, intsOnly = false) {
   const k = r();
   if (depth > 3 || k < 0.1) return null;
   if (k < 0.2) return r() < 0.5;
-  if (k < 0.4) return randomNumber(r);
+  if (k < 0.4) {
+    const n = randomNumber(r);
+    return intsOnly && !Number.isSafeInteger(n) ? Math.trunc(n) % Number.MAX_SAFE_INTEGER : n;
+  }
   if (k < 0.6) return randomString(r);
-  if (k < 0.8) return Array.from({ length: Math.floor(r() * 4) }, () => randomValue(r, depth + 1));
+  if (k < 0.8) return Array.from({ length: Math.floor(r() * 4) }, () => randomValue(r, depth + 1, intsOnly));
   // Object.fromEntries defines "__proto__" as an own property (as JSON.parse
   // does); an object literal would set the prototype instead.
   return Object.fromEntries(Array.from({ length: Math.floor(r() * 4) },
-    () => [randomString(r), randomValue(r, depth + 1)]));
+    () => [randomString(r), randomValue(r, depth + 1, intsOnly)]));
 }
 
 const CASES = 300;
@@ -108,7 +114,7 @@ test('property: a lone surrogate anywhere in a document makes all three canonica
 async function signedCase(r, key) {
   const strength = pick(r, ['self-asserted', 'software', 'tee-tpm', 'silicon-root']);
   const { receipt, keyId, publicKeyB64 } = await makeReceipt({
-    payload: randomValue(r) ?? { seeded: SEED },
+    payload: randomValue(r, 0, true) ?? { seeded: SEED },
     attestationStrength: strength,
     kp: key.kp, publicKeyB64: key.publicKeyB64,
   });

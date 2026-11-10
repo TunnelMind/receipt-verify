@@ -109,6 +109,12 @@ export interface VerifyOptions {
    *  four-tier validation still runs. Exists for scripts/verdict-lib, whose
    *  verdict receipts carry no ceiling contract. */
   unsafeSkipStrengthCeiling?: boolean;
+  /** UNSAFE: disables the rule that every number in the receipt is a
+   *  JS-safe integer (rune-record check_numbers, receipt_v1.rs:67-80), so a
+   *  float or an integer beyond ±(2^53-1) verifies. Exists for
+   *  scripts/verdict-lib, whose verdict receipts carry float weights
+   *  (tier.js:38-41). */
+  unsafeAllowNonIntegers?: boolean;
   /** Override the well-known revocations URL. */
   revocationsUrl?: string;
   /** When the receipt's embedded public_key differs from the bundle key for
@@ -193,7 +199,7 @@ function buildSigningObject(receipt: Receipt): JsonValue {
  * a wrong receipt_version, which returns at once (nothing else is defined).
  *
  * Performs:
- *   1. version check
+ *   1. version check; required fields; every number a JS-safe integer
  *   2. payload_hash recompute
  *   3. key_id resolution against the key bundle (keys > keysUrl > pinned),
  *      plus the key's status + [created_at, rotation_after] window check
@@ -206,6 +212,16 @@ function buildSigningObject(receipt: Receipt): JsonValue {
  *      keys (result.log.status); with opts.requireInclusion, a missing
  *      proof is an error
  */
+/** Push one error per number anywhere in `v` that fails Number.isSafeInteger
+ *  (-0 passes). Mirrors rune-record check_numbers. */
+function checkNumbers(v: unknown, errors: string[]): void {
+  if (typeof v === 'number') {
+    if (!Number.isSafeInteger(v)) errors.push(`number ${String(v)} is not a JS-safe integer`);
+  } else if (v && typeof v === 'object') {
+    for (const x of Object.values(v)) checkNumbers(x, errors);
+  }
+}
+
 export async function verifyReceipt(
   receipt: Receipt,
   opts: VerifyOptions = {},
@@ -240,6 +256,9 @@ export async function verifyReceipt(
   if (typeof receipt.receipt_id !== 'string') {
     errors.push('receipt_id: required string');
   }
+  // Numbers: rune-record refuses any number that is not a JS-safe integer,
+  // because floats and big integers do not round-trip across languages.
+  if (!opts.unsafeAllowNonIntegers) checkNumbers(receipt, errors);
 
   // 2. payload_hash
   try {

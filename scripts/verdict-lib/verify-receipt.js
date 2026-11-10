@@ -76,7 +76,7 @@ export async function verifyReceipt(receipt, { keys = PINNED_KEY_BUNDLE, logKey,
   //    only errors that start with "payload", so those are filtered out here.
   const sig = receipt.signature;
   const { self_verification: _sv, ...envelope } = receipt;
-  const env = await verifyEnvelope(envelope, { keys, unsafeSkipRevocations: true, unsafeSkipStrengthCeiling: true });
+  const env = await verifyEnvelope(envelope, { keys, unsafeSkipRevocations: true, unsafeSkipStrengthCeiling: true, unsafeAllowNonIntegers: true });
   const sigErrors = env.errors.filter((e) => !e.startsWith('payload'));
   add('receipt_signature', sigErrors.length === 0, sigErrors.length ? sigErrors.join('; ') : `key_id=${sig.key_id}`);
 
