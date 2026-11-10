@@ -70,7 +70,14 @@ export function makeKeyBundle(entries) {
     spec: 'https://tunnelmind.ai/standards/receipt-format/v1',
     format_version: '1.0',
     updated_at: new Date().toISOString(),
-    keys: entries,
+    // Entries that omit attestation_strength get 'software' (what makeReceipt
+    // claims by default); one with the property present, even undefined, is
+    // left as-is so a test can build a key with no stated strength. Non-object
+    // entries (garbage-bundle tests) and non-array keys pass through untouched.
+    keys: Array.isArray(entries)
+      ? entries.map((e) => (e && typeof e === 'object' && !Array.isArray(e) && !Object.hasOwn(e, 'attestation_strength')
+        ? { ...e, attestation_strength: 'software' } : e))
+      : entries,
   };
 }
 

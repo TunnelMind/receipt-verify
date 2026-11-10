@@ -338,17 +338,22 @@ export async function verifyReceipt(
   // would rank an unknown value -1 (below every ceiling) and a prototype
   // name ("constructor") as a function, which no ceiling exceeds. A key whose
   // own attestation_strength is not a tier ranks -1, so every claim exceeds it.
+  // A key with no (or null) attestation_strength ranks as self-asserted, the
+  // lowest tier: an issuer that never stated a strength gets no more than
+  // that. (It used to skip the ceiling, so any tier passed.)
   const claimedStrength: unknown = receipt.attestation_strength;
   const rankOf = (s: unknown): number =>
     typeof s === 'string' && Object.hasOwn(STRENGTH_RANK, s) ? STRENGTH_RANK[s as AttestationStrength] : -1;
   if (rankOf(claimedStrength) < 0) {
     errors.push(`attestation_strength: unrecognized value ${String(claimedStrength)}`);
-  } else if (signingKey?.attestation_strength && !opts.unsafeSkipStrengthCeiling) {
-    const tokenRank = rankOf(claimedStrength);
-    const keyRank   = rankOf(signingKey.attestation_strength);
+  } else if (signingKey && !opts.unsafeSkipStrengthCeiling) {
+    const keyStrength = signingKey.attestation_strength;
+    const missing     = keyStrength === undefined || keyStrength === null;
+    const tokenRank   = rankOf(claimedStrength);
+    const keyRank     = rankOf(missing ? 'self-asserted' : keyStrength);
     if (tokenRank > keyRank) {
       errors.push(
-        `attestation_strength ceiling violated: receipt=${receipt.attestation_strength} > key=${signingKey.attestation_strength}`,
+        `attestation_strength ceiling violated: receipt=${receipt.attestation_strength} > key=${missing ? '(none, treated as self-asserted)' : keyStrength}`,
       );
     }
   }

@@ -695,6 +695,31 @@ test('unsafeSkipStrengthCeiling: a receipt above its key strength verifies only 
   assert.equal(lax.valid, true, lax.errors.join('; '));
 });
 
+// A key with no attestation_strength used to skip the ceiling, so any tier
+// up to silicon-root passed. It now ranks as self-asserted. The field is
+// passed explicitly as undefined so makeKeyBundle's 'software' default stays off.
+test('key without attestation_strength is ranked self-asserted', async () => {
+  reset();
+  const check = async (claim, extra = {}) => {
+    const { receipt, keyId, publicKeyB64 } = await makeReceipt({ attestationStrength: claim });
+    return verifyReceipt(receipt, {
+      keys: makeKeyBundle([{ key_id: keyId, algorithm: 'Ed25519', public_key: publicKeyB64, attestation_strength: undefined }]),
+      revocations: makeRevocations(),
+      ...extra,
+    });
+  };
+  const over = await check('software');
+  assert.equal(over.valid, false);
+  assert.ok(
+    over.errors.includes('attestation_strength ceiling violated: receipt=software > key=(none, treated as self-asserted)'),
+    over.errors.join('; '),
+  );
+  const at = await check('self-asserted');
+  assert.equal(at.valid, true, at.errors.join('; '));
+  const skipped = await check('software', { unsafeSkipStrengthCeiling: true });
+  assert.equal(skipped.valid, true, skipped.errors.join('; '));
+});
+
 // attestation_strength is validated as one of the four tiers: a bare rank
 // lookup would let an unknown value sit below every ceiling, and a prototype
 // name rank as a function no ceiling exceeds.

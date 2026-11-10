@@ -5,6 +5,7 @@
 ### Breaking
 
 - `verifyReceipt()` now errors with `signature.public_key: required string` when `signature.public_key` is absent or not a string, and `receipt_id: required string` when `receipt_id` is absent or not a string; before, a correctly signed receipt without either still verified. Migration: receipts from rune-record and Fareseal always carry both; add them to hand-built receipts and re-sign (2026-11-10).
+- A key bundle entry with no (or null) `attestation_strength` is now ranked `self-asserted` in the ceiling check, so a receipt claiming a higher tier fails with `attestation_strength ceiling violated: receipt=<x> > key=(none, treated as self-asserted)`; before, such a key skipped the ceiling and any tier up to `silicon-root` passed. Migration: add `attestation_strength` to each key entry in your bundle (or pass `unsafeSkipStrengthCeiling`) (2026-11-10).
 
 ### Added
 
