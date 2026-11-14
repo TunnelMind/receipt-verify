@@ -35,6 +35,7 @@ import {
   verifyReceiptInclusion,
   type InclusionProof,
   type LogKeyEntry,
+  type LogKeyDoc,
   type LogStatus,
   type LogKeyMode,
   type SignedTreeHead,
@@ -136,11 +137,12 @@ export interface VerifyOptions {
    *  the log: `sth` (else `proof.sth`) must verify under the pinned
    *  `logKeys` (never the receipt bundle), match the proof, and the audit
    *  path must lead from the receipt's recomputed leaf to the signed root.
-   *  A failed proof is always an error. See log.ts. */
+   *  A failed proof is always an error. `logKeys` may be the log's key
+   *  document (e.g. PINNED_LOG_KEYS) instead of a key array. See log.ts. */
   inclusion?: {
     proof: InclusionProof;
     sth?: SignedTreeHead;
-    logKeys: LogKeyEntry[];
+    logKeys: LogKeyEntry[] | LogKeyDoc;
     /** Refuse an STH that names no signature.key_id. */
     requireKeyId?: boolean;
     logId?: string;
@@ -507,7 +509,13 @@ export {
   keyUsableAt,
   clearKeyCache,
 } from './keys.js';
-export { PINNED_KEY_BUNDLE, PINNED_KEYS_FETCHED_AT } from './pinned-keys.js';
+export {
+  PINNED_KEY_BUNDLE,
+  PINNED_KEYS_FETCHED_AT,
+  PINNED_LOG_KEYS,
+  PINNED_LOG_KEYS_FETCHED_AT,
+  LOG_KEYS_URL,
+} from './pinned-keys.js';
 export {
   DEFAULT_REVOCATIONS_URL,
   REVOCATION_CACHE_TTL_MS,
@@ -536,6 +544,7 @@ export {
   receiptLeafHash,
   LogMonitor,
   MemorySthStore,
+  checkLogKeyDoc,
 } from './log.js';
 export type {
   SignedTreeHead,
@@ -543,6 +552,9 @@ export type {
   InclusionProof,
   ConsistencyProof,
   LogKeyEntry,
+  LogKeyDoc,
+  LogKeyDocEntry,
+  LogKeyHandover,
   SthOptions,
   SthResult,
   LogStatus,

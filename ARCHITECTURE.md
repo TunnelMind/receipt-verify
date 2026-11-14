@@ -10,11 +10,13 @@ trusts and still means what it says.
 ```
 src/index.ts        verifyReceipt(): the §4 procedure, steps 1–7, step 8 (log inclusion), and every public export
 src/merkle.ts       RFC 6962 hashing + RFC 9162 inclusion/consistency math (WebCrypto); trusts no root itself
-src/log.ts          signed tree heads under pinned log keys, receipt inclusion, STH consistency, LogMonitor
+src/log.ts          signed tree heads under pinned log keys (a key array, or the log's key document:
+                    checkLogKeyDoc), receipt inclusion, STH consistency, LogMonitor
 src/jcs.ts          RFC 8785 canonicalizer: the bytes signatures and payload_hash cover
 src/keys.ts         key bundle: fetch + per-URL cache, resolveKey, keyUsableAt (status + window)
 src/revocation.ts   revocation feed: fetch + cache, isKeyRevoked, isReceiptRevoked
-src/pinned-keys.ts  the published bundle, shipped so the default path needs no network
+src/pinned-keys.ts  the published bundle, shipped so the default path needs no network; also the log's
+                    key document (PINNED_LOG_KEYS) and where it is served (LOG_KEYS_URL)
 scripts/verify-verdict.mjs   CLI: offline Reconciliation Verdict verifier (argv/IO only)
 scripts/verdict-lib/         its kernel: verify-receipt.js (5 checks) + reconcile/tier/log/jcs/hash,
                              vendored from the service (jcs re-exports the package canonicalizer);
@@ -38,7 +40,8 @@ receipt (untrusted JSON)
    │ 5 attestation_strength ∈ four tiers and ≤ entry.attestation_strength
    │ 6 feed = opts.revocations > fetch(revocationsUrl); key + receipt lookups   ← revocation.ts
    │ 7 chain sanity (warning), or hard hash+sequence link when opts.previous is given
-   │ 8 opts.inclusion: STH verified under pinned logKeys (never the receipt bundle);   ← log.ts
+   │ 8 opts.inclusion: STH verified under logKeys: a pinned key array (never the       ← log.ts
+   │   receipt bundle), or a key document, which is rooted in a receipt key;
    │   proof root/size must equal the STH's; leaf = SHA-256(0x00||JCS(receipt));
    │   audit path → signed root (merkle.ts). opts.requireInclusion: no proof = error
    ▼
@@ -59,11 +62,27 @@ re-run over the payload and compared with the published verdict.
   normalised to `[]`). Entries are not validated field by field: a null key
   entry fails the receipt, but `status: null` reads as active and a
   non-string bound is coerced by `Date.parse` (see `src/keys.ts`).
-- **Trusted for the log:** the caller's `logKeys` only, a separate set from the
-  receipt bundle. A tree size or root is trusted only from an STH that
-  verified under one of them; RFC 9162 proof math does not bind the tree size.
-  Today the live log signs with the receipt key `tm-receipt-2026-05`, so the
-  caller pins that key in both sets: the log is the issuer's, not a witness.
+- **Trusted for the log:** the caller's `logKeys` only. A tree size or root is
+  trusted only from an STH that verified under them; RFC 9162 proof math does
+  not bind the tree size. `logKeys` has two forms:
+  - *Array mode:* the caller's own set of keys, separate from the receipt
+    bundle and trusted as given, each with a status and time window.
+  - *Document mode:* the log's key document (`PINNED_LOG_KEYS`, or the file
+    served at `LOG_KEYS_URL`). The document itself is not trusted. Its first
+    key must be, byte for byte, an active or rotated receipt key (the pinned bundle;
+    in `verifyReceipt`, the bundle in use plus the pinned one), and every
+    later key must carry a hand-over signed by the key before it. Each key
+    signs only inside its tree-size range, which replaces the time window.
+    So a document is exactly as strong as the receipt key.
+
+  Today the live log signs with the receipt key `tm-receipt-2026-05`
+  (one-entry document, mode `shared_with_receipts`): the log is the issuer's,
+  not a witness. After the cut-over to a log key, a receipt-key head at or
+  below the hand-over size is still accepted by design (ADR-047 §8), and
+  `LogMonitor` consistency is the defence against a forged old head. A stale
+  `PINNED_LOG_KEYS` refuses log-key heads (`unknown_key_id`) and still
+  accepts receipt-key heads above the hand-over size, until it is refreshed
+  or the served document is passed.
 - **Untrusted:** everything in the receipt, including `signature.public_key`
   (compared to the bundle, never verified against), and every key carried in
   a verdict receipt's checkpoint or cosignatures. CLI file arguments are

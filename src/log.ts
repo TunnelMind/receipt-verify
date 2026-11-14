@@ -33,6 +33,18 @@
 // are checked against the STH's own timestamp (keys.ts keyUsableAt), so a
 // key past rotation stops verifying new heads. The timestamp is the log's
 // claim; a stolen rotated key can backdate it, exactly as for receipts.
+// Key document (checkLogKeyDoc): the log's published list of keys by tree
+// size, each later key endorsed by a hand-over the previous key signed, the
+// first key anchored on a receipt key.
+// Key-document mode: verifySth(sth, doc) with such a document (PINNED_LOG_KEYS,
+// or the served file) instead of a key array applies ADR-047 §7 as the CLI's
+// checkSthKey does. The trust anchor is the receipt key, not the document:
+// keys[0] must be a receipt key and every later key hangs off it by signed
+// hand-overs. Each key signs only inside its tree-size range, which replaces
+// the time window (no keyUsableAt here), and the head must name its key.
+// verifyReceiptInclusion, verifySthConsistency and LogMonitor take a document
+// in place of the key array too: each head is then judged by verifySth under
+// the document, so a consistency proof may span a key cut-over.
 // Fail closed: every function returns errors, never throws on bad input.
 
 import { canonicalizeBytes, type JsonValue } from './jcs.js';
@@ -90,6 +102,39 @@ export interface LogKeyEntry extends SigningKeyEntry {
   log_id?: string;
 }
 
+/** The previous key's signed statement that the log moves to `to_key_id` at
+ *  `tree_size` under `root_hash`. Signed bytes = JCS(hand-over minus `signature`). */
+export interface LogKeyHandover {
+  type: 'tunnelmind.log-key-handover/v1';
+  log_id: string;
+  from_key_id: string;
+  to_key_id: string;
+  to_public_key: string;
+  tree_size: number;
+  root_hash: string;
+  signature: SthSignature;
+  [k: string]: unknown;
+}
+
+/** One key of a key document: it signs heads of tree sizes
+ *  [from_tree_size, until_tree_size], open-ended when `until_tree_size` is null. */
+export interface LogKeyDocEntry {
+  key_id: string;
+  public_key: string;
+  from_tree_size: number;
+  until_tree_size: number | null;
+  shared_with_receipts?: boolean;
+  handover?: LogKeyHandover; // required on every entry but the first
+  [k: string]: unknown;
+}
+
+/** The log's key document (key per tree size). Validate with checkLogKeyDoc. */
+export interface LogKeyDoc {
+  log_id: string;
+  keys: LogKeyDocEntry[];
+  [k: string]: unknown;
+}
+
 export interface SthOptions {
   /** Refuse an STH whose signature does not name a key_id. */
   requireKeyId?: boolean;
@@ -107,6 +152,8 @@ export interface SthResult {
   errors: string[];
   /** Set once the pinned log keys were evaluated (any usable one). */
   log_key?: LogKeyMode;
+  /** Key-document mode only: why the head was refused, the CLI's fixed string. */
+  reason?: string;
   key_id?: string;
   log_id?: string;
   tree_size?: number;
@@ -150,7 +197,7 @@ function usable(k: LogKeyEntry | null | undefined): k is LogKeyEntry {
  *  bytes, so a re-spelled base64 of a receipt key is still caught. No usable
  *  log key → no mode (verifySth reports that). */
 function logKeyMode(
-  logKeys: LogKeyEntry[] | undefined,
+  logKeys: LogKeyEntry[] | LogKeyDoc | undefined, // a document has no mode here: verifySth reports it per head
   receiptKeys: SigningKeyEntry[] | undefined,
 ): { mode?: LogKeyMode; error?: string } {
   const keys = Array.isArray(logKeys) ? logKeys.filter(usable) : [];
@@ -170,17 +217,204 @@ function isSize(n: unknown): n is number {
   return typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
 }
 
+// ── Key document ──────────────────────────────────────────────────────────────
+
+type Obj = Record<string, unknown>;
+const isObj = (v: unknown): v is Obj => v !== null && typeof v === 'object' && !Array.isArray(v);
+const isStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+// 32-byte hex, lower-case 0x prefix only: the CLI's pattern, kept as a pattern so both
+// verifiers accept the very same spellings.
+const isHex32 = (v: unknown): boolean => typeof v === 'string' && /^(0x)?[0-9a-fA-F]{64}$/.test(v);
+// tm-log-YYYY-MM, the id every key after the first must carry.
+const LOG_KEY_ID_RE = /^tm-log-[0-9]{4}-(0[1-9]|1[0-2])$/;
+
+/** A key string → its bytes, or null. Standard base64 alphabet only: atob()
+ *  alone forgives ASCII whitespace, which the CLI refuses. Padding is dropped
+ *  before decoding because the CLI's decoder ignores how many `=` there are. */
+function keyBytes(v: unknown): Uint8Array | null {
+  if (!isStr(v) || !/^[A-Za-z0-9+/]*={0,2}$/.test(v)) return null;
+  try { return b64ToBytes(v.replace(/=+$/, '')); } catch { return null; }
+}
+const key32 = (v: unknown): Uint8Array | null => {
+  const b = keyBytes(v);
+  return b && b.length === 32 ? b : null;
+};
+
+/** Why a key document is invalid (a short fixed string), or null when valid.
+ *  Same reasons in the same order as checkLogKeys in scripts/verify-log.mjs
+ *  (first failure wins), then the anchor the CLI applies per head: the first
+ *  key must be, byte for byte, an active or rotated receipt key (`receiptKeys`,
+ *  default the pinned bundle's), else `first_key_not_pinned`. Without the
+ *  anchor anyone could publish a self-consistent chain of hand-overs.
+ *  Resolves on any input; never throws or rejects. */
+export async function checkLogKeyDoc(doc: unknown, receiptKeys?: SigningKeyEntry[]): Promise<string | null> {
+  const sigs: HandoverSigCheck[] = [];
+  const reason = checkLogKeyDocSync(doc, receiptKeys, sigs);
+  // Every collected signature was met before `reason`, so a bad one is the
+  // first failure and wins over it.
+  for (const sigOk of sigs) if (!(await sigOk())) return 'handover_signature';
+  return reason;
+}
+
+type HandoverSigCheck = () => Promise<boolean>;
+
+/** Everything checkLogKeyDoc checks except the hand-over signatures
+ *  themselves (WebCrypto is async-only): those are pushed onto `sigs`, in
+ *  document order, for the caller to await. Returns the first other failure;
+ *  the walk stops there, so no signature after it is collected.
+ *  Synchronous so the LogMonitor constructor can refuse a bad document. */
+function checkLogKeyDocSync(
+  doc: unknown,
+  receiptKeys: SigningKeyEntry[] | undefined,
+  sigs: HandoverSigCheck[],
+): string | null {
+  if (!isObj(doc) || !isStr(doc.log_id) || !Array.isArray(doc.keys) || doc.keys.length === 0) return 'bad_doc';
+  const keys = doc.keys as unknown[];
+  const ids = new Set<string>();
+  const handoverTo = new Set<unknown>();
+  let firstKey: Uint8Array | null = null;
+  let prev: Obj | undefined;      // the previous entry, already checked
+  let prevKey: Uint8Array | null = null;
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    if (!isObj(k) || !isStr(k.key_id)) return 'bad_entry';
+    const pub = key32(k.public_key);
+    if (!pub) return 'bad_entry';
+    if (i === 0) firstKey = pub;
+    if (i > 0 && !LOG_KEY_ID_RE.test(k.key_id)) return 'bad_key_id'; // keys[0] is the receipt key, own id
+    if (!isSize(k.from_tree_size) || k.from_tree_size !== (prev ? prev.until_tree_size : 0)) return 'bad_range';
+    // until > from: a zero-width range lets two hand-overs at one size carry two roots.
+    if (k.until_tree_size === null
+      ? i !== keys.length - 1
+      : !(isSize(k.until_tree_size) && k.until_tree_size > k.from_tree_size)) return 'bad_range';
+    const h = k.handover;
+    // A later key without a hand-over is one the old key never endorsed.
+    if (prev && h === undefined) return 'handover_missing';
+    if (h !== undefined) {
+      if (!prev || !prevKey) return 'handover_on_first_entry';
+      if (!isObj(h) || h.type !== 'tunnelmind.log-key-handover/v1' || !isHex32(h.root_hash)) return 'bad_handover';
+      if (handoverTo.has(h.to_key_id)) return 'handover_replay';
+      handoverTo.add(h.to_key_id);
+      if (h.log_id !== doc.log_id) return 'handover_log_id';
+      if (h.from_key_id !== prev.key_id) return 'handover_from_key';
+      const to = keyBytes(h.to_public_key);
+      if (h.to_key_id !== k.key_id || !to || !bytesEqual(to, pub)) return 'handover_to_key';
+      if (h.tree_size !== k.from_tree_size) return 'handover_tree_size';
+      const { signature: sig, ...body } = h;
+      if (!isObj(sig) || sig.algorithm !== 'Ed25519') return 'handover_signature';
+      let signed: Uint8Array;
+      // canonicalizeBytes throws on a lone surrogate anywhere in the body.
+      try { signed = canonicalizeBytes(body as JsonValue); } catch { return 'handover_signature'; }
+      // The key goes in re-encoded from its bytes, so a spelling accepted
+      // above cannot fail ed25519Verify's own decode.
+      const signerKey = btoa(String.fromCharCode(...prevKey));
+      const value = sig.value;
+      sigs.push(() => ed25519Verify(signerKey, value, signed));
+    }
+    // Checked after the hand-over so a replayed hand-over reports as one.
+    if (ids.has(k.key_id)) return 'duplicate_key_id';
+    ids.add(k.key_id);
+    prev = k;
+    prevKey = pub;
+  }
+  const rks: unknown[] = Array.isArray(receiptKeys) ? receiptKeys : PINNED_KEY_BUNDLE.keys;
+  const pinned = rks.some((r) => {
+    if (!isObj(r)) return false;
+    // Allowlist, not a 'revoked' denylist: an unknown status ('suspended',
+    // 'compromised', a typo) must not anchor the document (fail closed).
+    const st = r.status ?? 'active';
+    if (st !== 'active' && st !== 'rotated') return false;
+    const b = key32(r.public_key);
+    return !!b && !!firstKey && bytesEqual(b, firstKey);
+  });
+  return pinned ? null : 'first_key_not_pinned';
+}
+
 // ── Signed tree heads ─────────────────────────────────────────────────────────
+
+/** verifySth with a key document: the same checks in the same order as
+ *  checkSthKey in scripts/verify-log.mjs (first failure wins), reported as
+ *  `reason`. The head must name its key (`signature.key_id`); no other key is
+ *  ever tried. `log_key` says which kind of entry that key is. Never throws. */
+// A type guard, so that past the early return in verifySth `logKeys` is the
+// key array again and the array-mode code compiles untouched.
+const isKeyDoc = (v: unknown): v is LogKeyDoc => isObj(v) && Array.isArray(v.keys);
+
+async function verifySthDoc(sth: unknown, doc: LogKeyDoc, opts: SthOptions): Promise<SthResult> {
+  const out: SthResult = { valid: false, errors: [] };
+  const refuse = (reason: string): SthResult => {
+    out.reason = reason;
+    out.errors.push(reason);
+    return out;
+  };
+  // The document first, anchored on the receipt key: nothing in an
+  // unanchored or malformed document is used to judge a head.
+  const docReason = await checkLogKeyDoc(doc, opts.receiptKeys);
+  if (docReason !== null) return refuse(docReason === 'first_key_not_pinned' ? docReason : 'invalid_key_doc');
+  const keys = doc.keys;
+
+  const sig = isObj(sth) ? sth.signature : null;
+  if (!isObj(sth) || !isObj(sig) || !isStr(sig.key_id)) return refuse('no_signature');
+  // opts.logId has no CLI counterpart: a document for another log than the
+  // caller expects is refused here too (fail closed).
+  if (sth.log_id !== doc.log_id || (opts.logId && doc.log_id !== opts.logId)) return refuse('log_id_mismatch');
+  if ('key_id' in sth && sth.key_id !== sig.key_id) return refuse('key_id_mismatch');
+  const idx = keys.findIndex((k) => k.key_id === sig.key_id);
+  const e = keys[idx];
+  if (!e) return refuse('unknown_key_id');
+  out.log_key = e.handover ? 'separate' : 'shared_with_receipts';
+  // Own-key heads sign their key id; only first-entry (shared) heads may lack it.
+  if (e.handover && !('key_id' in sth)) return refuse('key_id_missing');
+  const pub = keyBytes(e.public_key) as Uint8Array; // decodes: checkLogKeyDoc passed
+  if ('public_key' in sig) {
+    const carried = keyBytes(sig.public_key);
+    if (!carried || !bytesEqual(carried, pub)) return refuse('public_key_mismatch');
+  }
+  if (sig.algorithm !== 'Ed25519') return refuse('bad_signature');
+  const { signature: _sig, ...body } = sth;
+  void _sig;
+  let signed: Uint8Array;
+  try { signed = canonicalizeBytes(body as JsonValue); } catch { return refuse('bad_signature'); }
+  // Canonical base64 signatures only (ed25519Verify); the CLI also takes
+  // unpadded ones. The key goes in re-encoded from its bytes, as in checkLogKeyDoc.
+  if (!(await ed25519Verify(btoa(String.fromCharCode(...pub)), sig.value, signed))) return refuse('bad_signature');
+  const n = sth.tree_size;
+  if (!isSize(n) || n < e.from_tree_size || (e.until_tree_size !== null && n > e.until_tree_size)) {
+    return refuse('tree_size_out_of_range');
+  }
+  // At the cut-over size both keys must sign the very tree the old key handed over.
+  const rootIs = (h: LogKeyHandover): boolean => {
+    const a = isHex32(sth.root_hash) ? parseHash(sth.root_hash) : null;
+    const b = parseHash(h.root_hash);
+    return !!a && !!b && bytesEqual(a, b);
+  };
+  if (e.handover && n === e.from_tree_size && !rootIs(e.handover)) return refuse('root_mismatch');
+  const next = keys[idx + 1];
+  if (next?.handover && n === e.until_tree_size && !rootIs(next.handover)) return refuse('root_mismatch');
+
+  out.valid = true;
+  out.key_id = e.key_id;
+  out.log_id = doc.log_id;
+  out.tree_size = n;
+  return out;
+}
 
 /** Verify an STH's Ed25519 signature against the pinned `logKeys` only.
  *  If the STH names `signature.key_id`, only that pinned key is tried;
  *  otherwise (legacy dialect, unless `requireKeyId`) each usable pinned key
- *  is tried. A key or STH bound to a different log_id than expected fails. */
+ *  is tried. A key or STH bound to a different log_id than expected fails.
+ *
+ *  `logKeys` may instead be a key document (`LogKeyDoc`, e.g. PINNED_LOG_KEYS):
+ *  then the ADR-047 §7 rules apply (see verifySthDoc and the header). The
+ *  head must name its key, the key must cover the head's tree size, and a
+ *  refusal carries the CLI's fixed string as `reason`. `requireKeyId` is
+ *  moot in that mode (always required) and no time window is applied. */
 export async function verifySth(
   sth: unknown,
-  logKeys: LogKeyEntry[] | undefined,
+  logKeys: LogKeyEntry[] | LogKeyDoc | undefined,
   opts: SthOptions = {},
 ): Promise<SthResult> {
+  if (isKeyDoc(logKeys)) return verifySthDoc(sth, logKeys, opts);
   const errors: string[] = [];
   const out: SthResult = { valid: false, errors };
   // Key load first: a mixed log-key set is refused before the STH is read.
@@ -278,12 +512,14 @@ export async function receiptLeafHash(receipt: unknown): Promise<Uint8Array> {
 /** Prove `receipt` is in the log: the STH (argument, else proof.sth) must
  *  verify under a pinned log key and match the proof's root_hash and
  *  tree_size, and the audit path must lead from the receipt's recomputed
- *  leaf to that root. */
+ *  leaf to that root. `logKeys` may be a key document (see verifySth): the
+ *  head's key must then cover its tree size (no time window), and `log_key`
+ *  says which kind of key the head named. */
 export async function verifyReceiptInclusion(
   receipt: unknown,
   proof: unknown,
   sth: unknown,
-  logKeys: LogKeyEntry[] | undefined,
+  logKeys: LogKeyEntry[] | LogKeyDoc | undefined,
   opts: SthOptions = {},
 ): Promise<InclusionResult> {
   const errors: string[] = [];
@@ -305,6 +541,9 @@ export async function verifyReceiptInclusion(
     return out;
   }
   const sr = await verifySth(head, logKeys, opts);
+  // Document mode: the kind of key is per head, so it comes from verifySth,
+  // and is set before the refusal so a refused head still reports it.
+  if (isKeyDoc(logKeys) && sr.log_key) out.log_key = sr.log_key;
   if (!sr.valid) {
     errors.push(...sr.errors.map((e) => `sth: ${e}`));
     return out;
@@ -314,6 +553,9 @@ export async function verifyReceiptInclusion(
   const root = parseHash(p.root_hash);
   const sthRoot = parseHash(h.root_hash);
   if (!root) errors.push('proof.root_hash: not a 32-byte hex hash');
+  // Document mode only checks a head's root at the cut-over size (CLI
+  // parity), so a signed head can reach here with no usable root.
+  if (!sthRoot) errors.push('sth: root_hash: not a 32-byte hex hash');
   if (!isSize(p.tree_size) || !isSize(p.leaf_index)) errors.push('proof.tree_size / leaf_index: not non-negative integers');
   if (root && sthRoot && !bytesEqual(root, sthRoot)) errors.push('proof.root_hash does not match the signed tree head');
   if (p.tree_size !== h.tree_size) errors.push(`proof.tree_size ${String(p.tree_size)} does not match the signed tree head ${String(h.tree_size)}`);
@@ -352,12 +594,14 @@ export interface ConsistencyResult {
 
 /** Prove `newer` extends `older` without rewriting history. Both STHs must
  *  verify under pinned log keys, belong to the same log, and the roots come
- *  from the STHs, never from the proof document. */
+ *  from the STHs, never from the proof document. With a key document as
+ *  `logKeys` each head is checked against the key covering its own tree
+ *  size, so the proof may run from a receipt-key head to a log-key head. */
 export async function verifySthConsistency(
   older: unknown,
   newer: unknown,
   proof: unknown,
-  logKeys: LogKeyEntry[] | undefined,
+  logKeys: LogKeyEntry[] | LogKeyDoc | undefined,
   opts: SthOptions = {},
 ): Promise<ConsistencyResult> {
   const errors: string[] = [];
@@ -379,8 +623,14 @@ export async function verifySthConsistency(
   }
   const o = older as SignedTreeHead;
   const n = newer as SignedTreeHead;
-  const oRoot = parseHash(o.root_hash) as Uint8Array;
-  const nRoot = parseHash(n.root_hash) as Uint8Array;
+  const oRoot = parseHash(o.root_hash);
+  const nRoot = parseHash(n.root_hash);
+  // Array mode refused a bad root in verifySth; document mode only checks
+  // it at the cut-over size (CLI parity), so a signed head with no usable
+  // root is refused here instead of being compared.
+  if (!oRoot) errors.push('older sth: root_hash: not a 32-byte hex hash');
+  if (!nRoot) errors.push('newer sth: root_hash: not a 32-byte hex hash');
+  if (!oRoot || !nRoot) return out;
   if (n.tree_size < o.tree_size) {
     errors.push(`newer sth tree_size ${n.tree_size} is smaller than older ${o.tree_size} (rollback)`);
     return out;
@@ -454,7 +704,9 @@ export interface LogMonitorOptions extends SthOptions {
    *  a log_id could sign a head under a fresh log_id and start a new,
    *  unchecked history ('first') instead of being caught as a fork. */
   logId: string;
-  logKeys: LogKeyEntry[];
+  /** Pinned log keys, or the log's key document (tree-size ranges instead of
+   *  time windows; `receiptKeys` anchors its first key). */
+  logKeys: LogKeyEntry[] | LogKeyDoc;
   store?: SthStore;
   /** Fetch a consistency proof from the log when observe() is not given one,
    *  e.g. GET /v1/receipts/log/consistency?first=&second= . */
@@ -465,7 +717,8 @@ export interface LogMonitorOptions extends SthOptions {
  *  come with a consistency proof from the last accepted STH. A smaller tree,
  *  a second root for the same size, or an unprovable advance is reported and
  *  NOT stored, so the monitor keeps its last good view. A fork or rollback is
- *  evidence of log misbehaviour: keep both STHs. */
+ *  evidence of log misbehaviour: keep both STHs. With a key document the
+ *  monitor follows the log across a key cut-over (see verifySth). */
 export class LogMonitor {
   private readonly o: LogMonitorOptions;
   private readonly store: SthStore;
@@ -481,6 +734,19 @@ export class LogMonitor {
     }
     const km = logKeyMode(opts.logKeys, opts.receiptKeys);
     if (km.error) throw new TypeError(`LogMonitor: ${km.error}`);
+    if (isKeyDoc(opts.logKeys)) {
+      // A document that can never verify a head is a misuse too: say so now
+      // instead of answering `invalid` forever. Only the synchronous rules
+      // run here. A bad hand-over signature cannot be caught in a
+      // constructor (WebCrypto verify is async); it is still refused, on
+      // every observe() as `invalid`, because verifySth re-checks the whole
+      // document for each head.
+      const reason = checkLogKeyDocSync(opts.logKeys, opts.receiptKeys, []);
+      if (reason) throw new TypeError(`LogMonitor: invalid key document (${reason})`);
+      if (opts.logKeys.log_id !== opts.logId) {
+        throw new TypeError(`LogMonitor: key document is for log ${opts.logKeys.log_id}, not ${opts.logId}`);
+      }
+    }
     this.o = opts;
     this.store = opts.store ?? new MemorySthStore();
   }
@@ -501,6 +767,12 @@ export class LogMonitor {
     const sr = await verifySth(sth, this.o.logKeys, this.o);
     if (!sr.valid) return { ok: false, status: 'invalid', errors: sr.errors };
     const next = sth as SignedTreeHead;
+    // A document-mode head can be validly signed with no usable root (see
+    // verifySthConsistency). Refused before the store: a stored rootless
+    // head could never be compared or extended.
+    if (!parseHash(next.root_hash)) {
+      return { ok: false, status: 'invalid', errors: ['sth.root_hash: not a 32-byte hex hash'] };
+    }
     const id = this.o.logId;
     const prev = await this.store.get(id);
     if (!prev) {

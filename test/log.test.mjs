@@ -24,6 +24,11 @@ import {
   receiptLeafHash,
   LogMonitor,
   MemorySthStore,
+  checkLogKeyDoc,
+  PINNED_KEY_BUNDLE,
+  PINNED_LOG_KEYS,
+  PINNED_LOG_KEYS_FETCHED_AT,
+  LOG_KEYS_URL,
 } from '../dist/index.js';
 import * as oracle from '../scripts/verify-log.mjs';
 import { makeReceipt, makeEphemeralKey, makeKeyBundle, makeRevocations } from './_helpers.mjs';
@@ -630,4 +635,515 @@ test('CLI consistency: needs two STHs under a pinned --key; a self-consistent fo
   const F = leaves(13, 'forged');
   const forged = f('forged.json', { first: 6, second: 13, proof: PROOF(6, F).map(hex), first_root: hex(MTH(F.slice(0, 6))), second_root: hex(MTH(F)) });
   assert.equal(run(['consistency', forged, a, b, '--key', key]), 1, 'forged roots');
+});
+
+// ── Key document: the library check against the CLI's (ADR-047 §7 rule 3) ───
+// checkLogKeyDoc must give the CLI's checkLogKeys answer on every document,
+// then anchor the first key on a receipt key. Every key is made in the run.
+// The builders repeat test/cli.test.mjs's on purpose: a test file does not
+// import another test file.
+
+const KD_LOG_ID = 'test-log';
+const KD_RECEIPT_KID = 'test-receipt-2026-05';
+const KD_LOG_KID = 'tm-log-2026-11';
+const KD_M = 5; // cut-over tree size
+const KD_ROOT_M = 'cd'.repeat(32); // the root handed over at KD_M
+const kdSign = async (signer, body) =>
+  Buffer.from(await subtle.sign('Ed25519', signer.kp.privateKey, Buffer.from(oracle.jcs(body)))).toString('base64');
+
+// A key whose standard base64 carries + or /, so its base64url spelling differs.
+async function kdKeyWithB64OnlyChars() {
+  let k = await makeEphemeralKey();
+  while (!/[+/]/.test(k.publicKeyB64)) k = await makeEphemeralKey();
+  return k;
+}
+
+// Hand-over at KD_M to `to`, signed by `signer` over jcs(hand-over minus signature).
+async function kdHandover(signer, to, over = {}, sigExtra = {}) {
+  const body = {
+    type: 'tunnelmind.log-key-handover/v1', log_id: KD_LOG_ID,
+    from_key_id: KD_RECEIPT_KID, to_key_id: KD_LOG_KID, to_public_key: to.publicKeyB64,
+    tree_size: KD_M, root_hash: KD_ROOT_M, ...over,
+  };
+  return { ...body, signature: { algorithm: 'Ed25519', ...sigExtra, value: await kdSign(signer, body) } };
+}
+
+const kdOneEntryDoc = (receipt) => ({
+  log_id: KD_LOG_ID,
+  keys: [{ key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64, from_tree_size: 0, until_tree_size: null }],
+});
+
+async function kdTwoEntryDoc(receipt, log, handover) {
+  return {
+    log_id: KD_LOG_ID,
+    keys: [
+      { key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64, from_tree_size: 0, until_tree_size: KD_M },
+      { key_id: KD_LOG_KID, public_key: log.publicKeyB64, from_tree_size: KD_M, until_tree_size: null,
+        handover: handover ?? await kdHandover(receipt, log) },
+    ],
+  };
+}
+
+test('PINNED_LOG_KEYS: a valid key document anchored on the pinned receipt bundle', async () => {
+  assert.equal(await checkLogKeyDoc(PINNED_LOG_KEYS), null); // default anchor: PINNED_KEY_BUNDLE.keys
+  assert.equal(oracle.checkLogKeys(PINNED_LOG_KEYS), null);
+  assert.equal(PINNED_LOG_KEYS.log_id, 'tunnelmind-receipts-log-v1');
+  // Only the first entry and the open end are fixed: after the cut-over the
+  // served document (more entries) replaces the literal and this must still pass.
+  const first = PINNED_LOG_KEYS.keys[0];
+  assert.equal(first.key_id, PINNED_KEY_BUNDLE.keys[0].key_id);
+  assert.equal(first.public_key, PINNED_KEY_BUNDLE.keys[0].public_key);
+  assert.equal(first.from_tree_size, 0);
+  assert.equal(PINNED_LOG_KEYS.keys.at(-1).until_tree_size, null);
+
+  const other = await makeEphemeralKey();
+  assert.equal(await checkLogKeyDoc(PINNED_LOG_KEYS, [{ key_id: 'other', public_key: other.publicKeyB64 }]), 'first_key_not_pinned');
+  assert.equal(typeof LOG_KEYS_URL, 'string');
+  assert.match(LOG_KEYS_URL, /^https:\/\//);
+  assert.equal(typeof PINNED_LOG_KEYS_FETCHED_AT, 'string');
+});
+
+test('checkLogKeyDoc: same answer as the CLI checkLogKeys on every document vector', async () => {
+  const receipt = await kdKeyWithB64OnlyChars();
+  const log = await makeEphemeralKey();
+  const attacker = await makeEphemeralKey();
+  const third = await makeEphemeralKey();
+  const b64 = receipt.publicKeyB64;
+  const one = kdOneEntryDoc(receipt);
+  const two = await kdTwoEntryDoc(receipt, log);
+  const { handover, ...noHandover } = two.keys[1];
+  const withKeys = (k0, k1) => ({ ...two, keys: [{ ...two.keys[0], ...k0 }, { ...two.keys[1], ...k1 }] });
+  const withKey = (pk) => ({ ...one, keys: [{ ...one.keys[0], public_key: pk }] });
+
+  // The spellings the Data API emits: 0x root, the signer's key in the signature.
+  const dataApi = await kdTwoEntryDoc(receipt, log, await kdHandover(receipt, log,
+    { root_hash: `0x${KD_ROOT_M}`, sth_timestamp: new Date().toISOString() },
+    { key_id: KD_RECEIPT_KID, public_key: b64 }));
+  // First entry already under a log-style id, second entry reusing it.
+  const dupId = await kdTwoEntryDoc(receipt, log, await kdHandover(receipt, log, { from_key_id: KD_LOG_KID }));
+  dupId.keys[0].key_id = KD_LOG_KID;
+
+  const vectors = [
+    ['valid one entry', one],
+    ['valid two entries', two],
+    ['Data-API-shaped', dataApi],
+    ['over-padded key, same 32 bytes', withKey(`${b64.replace(/=+$/, '')}==`)],
+    ['handover missing', { ...two, keys: [two.keys[0], noHandover] }],
+    ['handover signed by an attacker', await kdTwoEntryDoc(receipt, log, await kdHandover(attacker, log))],
+    ['handover root changed after signing', await kdTwoEntryDoc(receipt, log, { ...handover, root_hash: 'ab'.repeat(32) })],
+    ['handover signature not an object', await kdTwoEntryDoc(receipt, log, { ...handover, signature: 'x' })],
+    ['handover signature wrong algorithm', await kdTwoEntryDoc(receipt, log, { ...handover, signature: { ...handover.signature, algorithm: 'RSA' } })],
+    ['handover with a lone surrogate', await kdTwoEntryDoc(receipt, log, { ...handover, note: '\ud800' })],
+    ['handover replayed for a third entry', { ...two, keys: [
+      two.keys[0],
+      { ...two.keys[1], until_tree_size: 9 },
+      { key_id: 'tm-log-2026-12', public_key: third.publicKeyB64, from_tree_size: 9, until_tree_size: null, handover },
+    ] }],
+    ['handover on the first entry', { ...one, keys: [{ ...one.keys[0], handover }] }],
+    ['handover of another type', await kdTwoEntryDoc(receipt, log, { ...handover, type: 'other' })],
+    ['handover root not 32-byte hex', await kdTwoEntryDoc(receipt, log, { ...handover, root_hash: 'cd'.repeat(31) })],
+    ['handover null', await kdTwoEntryDoc(receipt, log, null)],
+    ['handover for another log', await kdTwoEntryDoc(receipt, log, await kdHandover(receipt, log, { log_id: 'other-log' }))],
+    ['handover from another key id', await kdTwoEntryDoc(receipt, log, await kdHandover(receipt, log, { from_key_id: 'other' }))],
+    ['handover to another key', await kdTwoEntryDoc(receipt, log, await kdHandover(receipt, attacker))],
+    ['handover to another key id', await kdTwoEntryDoc(receipt, log, await kdHandover(receipt, log, { to_key_id: 'tm-log-2026-12' }))],
+    ['handover at another size', await kdTwoEntryDoc(receipt, log, await kdHandover(receipt, log, { tree_size: KD_M - 1 }))],
+    ['range gap', withKeys({}, { from_tree_size: KD_M + 1 })],
+    ['first entry not from 0', withKeys({ from_tree_size: 1 }, {})],
+    ['zero width', withKeys({ until_tree_size: 0 }, { from_tree_size: 0 })],
+    ['zero width, last entry', withKeys({}, { until_tree_size: KD_M })],
+    ['open range before the last entry', withKeys({ until_tree_size: null }, {})],
+    ['fractional size', withKeys({ until_tree_size: 5.5 }, { from_tree_size: 5.5 })],
+    ['key id of another shape', withKeys({}, { key_id: 'log-key-2' })],
+    ['key id month 13', withKeys({}, { key_id: 'tm-log-2026-13' })],
+    ['second entry equals the first', { ...two, keys: [two.keys[0], two.keys[0]] }],
+    ['duplicate key id', dupId],
+    ['base64url key', withKey(b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''))],
+    ['key with an inner space', withKey(`${b64.slice(0, 20)} ${b64.slice(20)}`)],
+    ['key of 3 bytes', withKey('AAAA')],
+    ['key not a string', withKey(42)],
+    ['entry null', { ...one, keys: [null] }],
+    ['empty key id', { ...one, keys: [{ ...one.keys[0], key_id: '' }] }],
+    ['empty keys', { ...one, keys: [] }],
+    ['no log_id', { keys: one.keys }],
+    ['keys not an array', { log_id: KD_LOG_ID, keys: 'x' }],
+    ['null', null],
+    ['array', [one]],
+    ['string', JSON.stringify(one)],
+  ];
+
+  const receiptKeys = [{ key_id: KD_RECEIPT_KID, public_key: b64 }];
+  const seen = new Set();
+  for (const [name, doc] of vectors) {
+    const want = oracle.checkLogKeys(doc);
+    assert.deepEqual(await checkLogKeyDoc(doc, receiptKeys), want, name);
+    seen.add(want);
+  }
+  // The vectors must reach every reason the document check can give.
+  for (const reason of [
+    null, 'bad_doc', 'bad_entry', 'bad_key_id', 'bad_range', 'handover_missing', 'handover_on_first_entry',
+    'bad_handover', 'handover_replay', 'handover_log_id', 'handover_from_key', 'handover_to_key',
+    'handover_tree_size', 'handover_signature', 'duplicate_key_id',
+  ]) assert.ok(seen.has(reason), `no vector reaches ${reason}`);
+});
+
+test('an explicit empty anchor list fails closed on the real pin shape; no fallback to the built-in pin', async () => {
+  const first = PINNED_KEY_BUNDLE.keys[0];
+  // Same shape as PINNED_LOG_KEYS: one shared entry from 0, open-ended, the real key.
+  const doc = { log_id: PINNED_LOG_KEYS.log_id, keys: [{ ...PINNED_LOG_KEYS.keys[0], key_id: first.key_id, public_key: first.public_key, from_tree_size: 0, until_tree_size: null }] };
+  assert.equal(await checkLogKeyDoc(doc), null); // default anchor accepts it
+  assert.equal(await checkLogKeyDoc(doc, []), 'first_key_not_pinned');
+  const attacker = await makeEphemeralKey();
+  const head = await kdHead(attacker, { key_id: first.key_id, tree_size: 9, log_id: doc.log_id });
+  const r = await verifySth(head, doc, { receiptKeys: [] });
+  assert.equal(r.valid, false);
+  assert.equal(r.reason, 'first_key_not_pinned');
+});
+
+test('checkLogKeyDoc: the first key must be a non-revoked receipt key; malformed input is a reason, never a throw', async () => {
+  const receipt = await makeEphemeralKey();
+  const log = await makeEphemeralKey();
+  const attacker = await makeEphemeralKey();
+  const entry = { key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64 };
+
+  // Internally valid, but the chain of hand-overs starts from a key nobody pinned.
+  const forged = await kdTwoEntryDoc(attacker, log);
+  assert.equal(oracle.checkLogKeys(forged), null);
+  assert.equal(await checkLogKeyDoc(forged, [entry]), 'first_key_not_pinned');
+  assert.equal(await checkLogKeyDoc(forged), 'first_key_not_pinned'); // default anchor
+
+  const good = await kdTwoEntryDoc(receipt, log);
+  assert.equal(await checkLogKeyDoc(good, [entry]), null);
+  assert.equal(await checkLogKeyDoc(good, [{ key_id: 'x', public_key: attacker.publicKeyB64 }, entry]), null);
+  assert.equal(await checkLogKeyDoc(good, []), 'first_key_not_pinned');
+  assert.equal(await checkLogKeyDoc(good, [{ ...entry, status: 'revoked' }]), 'first_key_not_pinned');
+  // Status is an allowlist: absent, 'active' and 'rotated' anchor; anything else does not.
+  for (const status of ['active', 'rotated']) assert.equal(await checkLogKeyDoc(good, [{ ...entry, status }]), null, status);
+  for (const status of ['suspended', 'compromised', 'actve', '', 1]) {
+    assert.equal(await checkLogKeyDoc(good, [{ ...entry, status }]), 'first_key_not_pinned', String(status));
+  }
+  // The same through the real pinned document, and through verifySth.
+  const suspended = [{ ...PINNED_KEY_BUNDLE.keys[0], status: 'suspended' }];
+  assert.equal(await checkLogKeyDoc(PINNED_LOG_KEYS, suspended), 'first_key_not_pinned');
+  assert.equal(await checkLogKeyDoc(PINNED_LOG_KEYS, [{ ...PINNED_KEY_BUNDLE.keys[0], status: 'rotated' }]), null);
+  const head = await kdHead(attacker, { key_id: PINNED_KEY_BUNDLE.keys[0].key_id, tree_size: 9, log_id: PINNED_LOG_KEYS.log_id });
+  const viaSth = await verifySth(head, PINNED_LOG_KEYS, { receiptKeys: suspended });
+  assert.equal(viaSth.valid, false);
+  assert.equal(viaSth.reason, 'first_key_not_pinned');
+  // A receipt key the document check would refuse matches nothing.
+  assert.equal(await checkLogKeyDoc(good, [null, { key_id: 'x' }, { key_id: 'x', public_key: 'AAAA' }]), 'first_key_not_pinned');
+  // A document reason comes before the anchor.
+  assert.equal(await checkLogKeyDoc({ ...good, keys: [] }, []), 'bad_doc');
+
+  for (const bad of [undefined, 42, { keys: 'x' }]) assert.equal(await checkLogKeyDoc(bad), 'bad_doc');
+});
+
+// ── Key document: the library head check against the CLI's (ADR-047 §7) ─────
+// verifySth(sth, doc) must refuse exactly the heads the CLI's checkSthKey
+// refuses, with the same reason. Heads are in the live dialect: log_id and
+// signature.key_id always; a top-level key_id only on an own-key head.
+
+async function kdHead(signer, { key_id, tree_size, root_hash = 'ab'.repeat(32), own = false, log_id = KD_LOG_ID, body: extra = {}, sig = {} }) {
+  const body = { log_id, tree_size, root_hash, timestamp: new Date().toISOString(), ...(own && { key_id }), ...extra };
+  return { ...body, signature: { algorithm: 'Ed25519', key_id, ...sig, value: await kdSign(signer, body) } };
+}
+const kdSharedHead = (receipt, tree_size, o = {}) => kdHead(receipt, { key_id: KD_RECEIPT_KID, tree_size, ...o });
+const kdOwnHead = (log, tree_size, o = {}) => kdHead(log, { key_id: KD_LOG_KID, tree_size, own: true, ...o });
+
+test('verifySth key document: a live-dialect shared head is valid under a one-entry document', async () => {
+  const receipt = await makeEphemeralKey();
+  const receiptKeys = [{ key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64 }];
+  // Shaped like PINNED_LOG_KEYS: one shared entry, from 0, open-ended.
+  const doc = kdOneEntryDoc(receipt);
+  doc.keys[0].shared_with_receipts = true;
+  assert.deepEqual(Object.keys(doc.keys[0]).sort(), Object.keys(PINNED_LOG_KEYS.keys[0]).sort());
+
+  const head = await kdSharedHead(receipt, 1234, { root_hash: `0x${'ab'.repeat(32)}` });
+  assert.equal('key_id' in head, false);
+  const r = await verifySth(head, doc, { receiptKeys });
+  assert.deepEqual(r, {
+    valid: true, errors: [], log_key: 'shared_with_receipts',
+    key_id: KD_RECEIPT_KID, log_id: KD_LOG_ID, tree_size: 1234,
+  });
+  assert.equal(r.reason, undefined);
+  assert.equal(oracle.checkSthKey(head, doc, receipt.publicKeyB64), null);
+});
+
+test('verifySth key document: under the real PINNED_LOG_KEYS a tm-log-* head and a forged receipt-key head are refused', async () => {
+  const attacker = await makeEphemeralKey();
+  const log_id = PINNED_LOG_KEYS.log_id;
+  // Default anchor: the pinned receipt bundle.
+  const own = await verifySth(await kdHead(attacker, { key_id: 'tm-log-2026-11', tree_size: 9, own: true, log_id }), PINNED_LOG_KEYS);
+  assert.equal(own.valid, false);
+  assert.equal(own.reason, 'unknown_key_id');
+  assert.deepEqual(own.errors, ['unknown_key_id']);
+  const forged = await verifySth(await kdHead(attacker, { key_id: 'tm-receipt-2026-05', tree_size: 9, log_id }), PINNED_LOG_KEYS);
+  assert.equal(forged.valid, false);
+  assert.equal(forged.reason, 'bad_signature');
+  assert.equal(forged.log_key, 'shared_with_receipts');
+});
+
+test('verifySth key document: an own-key head is valid above the cut-over and at it with the handed-over root', async () => {
+  const receipt = await makeEphemeralKey();
+  const log = await makeEphemeralKey();
+  const receiptKeys = [{ key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64 }];
+  const doc = await kdTwoEntryDoc(receipt, log);
+  for (const head of [
+    await kdOwnHead(log, KD_M + 4),
+    await kdOwnHead(log, KD_M, { root_hash: KD_ROOT_M }),
+    await kdOwnHead(log, KD_M, { root_hash: `0x${KD_ROOT_M.toUpperCase()}` }),
+  ]) {
+    assert.deepEqual(await verifySth(head, doc, { receiptKeys }), {
+      valid: true, errors: [], log_key: 'separate',
+      key_id: KD_LOG_KID, log_id: KD_LOG_ID, tree_size: head.tree_size,
+    });
+  }
+  // The receipt key still signs up to and including the cut-over size.
+  const shared = await verifySth(await kdSharedHead(receipt, KD_M, { root_hash: KD_ROOT_M }), doc, { receiptKeys });
+  assert.equal(shared.valid, true);
+  assert.equal(shared.log_key, 'shared_with_receipts');
+});
+
+test('verifySth key document: the same reason as the CLI on every head vector (FR-008)', async () => {
+  const receipt = await makeEphemeralKey();
+  const log = await makeEphemeralKey();
+  const attacker = await makeEphemeralKey();
+  const pin = receipt.publicKeyB64;
+  const receiptKeys = [{ key_id: KD_RECEIPT_KID, public_key: pin }];
+  const one = kdOneEntryDoc(receipt);
+  const two = await kdTwoEntryDoc(receipt, log);
+  const { signature, ...unsigned } = await kdSharedHead(receipt, 3);
+  const { log_id: _l, ...noLogId } = await kdSharedHead(receipt, 3);
+  const ownAtM = await kdOwnHead(log, KD_M, { root_hash: KD_ROOT_M });
+
+  // [name, head, document]
+  const vectors = [
+    ['shared head, one entry', await kdSharedHead(receipt, 3), one],
+    ['shared head far out, one entry', await kdSharedHead(receipt, 1000), one],
+    ['shared head below m', await kdSharedHead(receipt, 3), two],
+    ['shared head at m, hand-over root', await kdSharedHead(receipt, KD_M, { root_hash: KD_ROOT_M }), two],
+    ['own head at m, hand-over root', ownAtM, two],
+    ['own head at m, 0x root', await kdOwnHead(log, KD_M, { root_hash: `0x${KD_ROOT_M}` }), two],
+    ['own head above m', await kdOwnHead(log, KD_M + 4), two],
+    ['own head carrying its key', await kdOwnHead(log, KD_M + 1, { sig: { public_key: log.publicKeyB64 } }), two],
+    ['document without a hand-over', await kdSharedHead(receipt, 3), { ...two, keys: [two.keys[0], { ...two.keys[1], handover: undefined }] }],
+    ['document with no keys', await kdSharedHead(receipt, 3), { ...two, keys: [] }],
+    ['document from an attacker', await kdOwnHead(log, KD_M + 1), await kdTwoEntryDoc(attacker, log)],
+    ['no signature', unsigned, two],
+    ['signature not an object', { ...unsigned, signature: 'x' }, two],
+    ['signature without key_id', { ...unsigned, signature: { ...signature, key_id: undefined } }, two],
+    ['another log', await kdSharedHead(receipt, 3, { log_id: 'other-log' }), two],
+    ['no log_id', noLogId, two],
+    ['top-level key_id is not the signature key_id', await kdHead(log, { key_id: KD_LOG_KID, tree_size: KD_M + 1, body: { key_id: KD_RECEIPT_KID } }), two],
+    ['top-level key_id undefined', { ...await kdSharedHead(receipt, 3), key_id: undefined }, two],
+    ['unknown key id', await kdHead(attacker, { key_id: 'tm-log-2027-01', tree_size: 3, own: true }), two],
+    ['log-key head without top-level key_id', await kdHead(log, { key_id: KD_LOG_KID, tree_size: KD_M + 1 }), two],
+    ['signature carries another key', { ...ownAtM, signature: { ...ownAtM.signature, public_key: pin } }, two],
+    ['signature carries junk for a key', { ...ownAtM, signature: { ...ownAtM.signature, public_key: 42 } }, two],
+    ['attacker under the receipt key id', await kdSharedHead(attacker, 3), two],
+    ['attacker under the log key id', await kdOwnHead(attacker, KD_M + 1), two],
+    ['wrong algorithm', await kdSharedHead(receipt, 3, { sig: { algorithm: 'RSA' } }), two],
+    ['body changed after signing', { ...await kdSharedHead(receipt, 3), tree_size: 4 }, two],
+    ['lone surrogate in the body', { ...await kdSharedHead(receipt, 3), note: '\ud800' }, two],
+    ['receipt key above m', await kdSharedHead(receipt, KD_M + 1), two],
+    ['log key below m', await kdOwnHead(log, KD_M - 1), two],
+    ['string tree size', await kdSharedHead(receipt, '3'), two],
+    ['non-integer tree size', await kdOwnHead(log, KD_M + 0.5), two],
+    ['receipt key at m, another root', await kdSharedHead(receipt, KD_M), two],
+    ['log key at m, another root', await kdOwnHead(log, KD_M), two],
+    ['log key at m, root not hex', await kdOwnHead(log, KD_M, { root_hash: 'zz' }), two],
+  ];
+  const seen = new Set();
+  for (const [name, sth, doc] of vectors) {
+    const want = oracle.checkSthKey(sth, doc, pin);
+    const r = await verifySth(sth, doc, { receiptKeys });
+    assert.deepEqual(r.reason ?? null, want, name);
+    assert.equal(r.valid, want === null, name);
+    assert.deepEqual(r.errors, want === null ? [] : [want], name);
+    seen.add(want);
+  }
+  for (const reason of [
+    null, 'invalid_key_doc', 'first_key_not_pinned', 'no_signature', 'log_id_mismatch',
+    'key_id_mismatch', 'unknown_key_id', 'key_id_missing', 'public_key_mismatch',
+    'bad_signature', 'tree_size_out_of_range', 'root_mismatch',
+  ]) assert.ok(seen.has(reason), `no vector reaches ${reason}`);
+});
+
+test('verifySth key document: junk input is a reason, never a throw; opts.logId must be the document log', async () => {
+  const receipt = await makeEphemeralKey();
+  const receiptKeys = [{ key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64 }];
+  const doc = kdOneEntryDoc(receipt);
+  for (const junk of [null, 42, [], {}, undefined, 'x']) {
+    const r = await verifySth(junk, doc, { receiptKeys });
+    assert.equal(r.valid, false);
+    assert.equal(typeof r.reason, 'string');
+    assert.equal(r.reason, oracle.checkSthKey(junk, doc, receipt.publicKeyB64));
+  }
+  // A document with junk inside still resolves.
+  assert.equal((await verifySth({}, { keys: [null] }, { receiptKeys })).reason, 'invalid_key_doc');
+
+  const head = await kdSharedHead(receipt, 3);
+  assert.equal((await verifySth(head, doc, { receiptKeys, logId: KD_LOG_ID })).valid, true);
+  const other = await verifySth(head, doc, { receiptKeys, logId: 'other-log' });
+  assert.equal(other.valid, false);
+  assert.equal(other.reason, 'log_id_mismatch');
+});
+
+// ── Key document: the library callers (FR-007) ───────────────────────────────
+// A real 20-leaf tree with the cut-over at KD_M: the hand-over carries the
+// tree's real root at KD_M, so heads and proofs on both sides are genuine.
+
+async function kdHistory(D = leaves(20)) {
+  const receipt = await makeEphemeralKey();
+  const log = await makeEphemeralKey();
+  const root = (n) => hex(MTH(D.slice(0, n)));
+  const doc = await kdTwoEntryDoc(receipt, log, await kdHandover(receipt, log, { root_hash: root(KD_M) }));
+  return {
+    receipt, log, doc, root,
+    receiptKeys: [{ key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64 }],
+    shared: (n) => kdSharedHead(receipt, n, { root_hash: root(n) }),
+    own: (n) => kdOwnHead(log, n, { root_hash: root(n) }),
+    proof: (m, n) => ({ first: m, second: n, proof: PROOF(m, D.slice(0, n)).map(hex) }),
+  };
+}
+
+test('verifyReceiptInclusion key document: a receipt under a log-key head is included, log_key separate', async () => {
+  const { receipt } = await makeReceipt();
+  const { D, path } = await receiptInTree(receipt, 9, 6);
+  const h = await kdHistory(D);
+  const proof = { leaf_index: 6, tree_size: 9, audit_path: path.map(hex), root_hash: h.root(9) };
+  const sth = await h.own(9);
+  assert.equal(sth.key_id, KD_LOG_KID); // an own-key head: top-level key_id
+  const r = await verifyReceiptInclusion(receipt, proof, sth, h.doc, { receiptKeys: h.receiptKeys });
+  assert.deepEqual(r, { status: 'included', errors: [], log_key: 'separate', log_key_id: KD_LOG_KID, tree_size: 9, leaf_index: 6 });
+
+  // A refused head still reports which kind of key it named: the receipt key
+  // signing past its range is not a log witness.
+  const late = await verifyReceiptInclusion(receipt, proof, await h.shared(9), h.doc, { receiptKeys: h.receiptKeys });
+  assert.equal(late.status, 'failed');
+  assert.equal(late.log_key, 'shared_with_receipts');
+  assert.deepEqual(late.errors, ['sth: tree_size_out_of_range']);
+});
+
+test('verifySthConsistency key document: a proof spans the cut-over; a receipt-key head past it fails', async () => {
+  const h = await kdHistory();
+  const opts = { receiptKeys: h.receiptKeys };
+  for (const m of [3, KD_M]) {
+    const ok = await verifySthConsistency(await h.shared(m), await h.own(12), h.proof(m, 12), h.doc, opts);
+    assert.equal(ok.valid, true, ok.errors.join('; '));
+  }
+  // Same tree, same valid proof, but the older head is the receipt key
+  // signing above its range.
+  const bad = await verifySthConsistency(await h.shared(KD_M + 2), await h.own(12), h.proof(KD_M + 2, 12), h.doc, opts);
+  assert.equal(bad.valid, false);
+  assert.deepEqual(bad.errors, ['older sth: tree_size_out_of_range']);
+  // A proof for another history does not pass on signatures alone.
+  const forged = await verifySthConsistency(await h.shared(3), await h.own(12), { first: 3, second: 12, proof: PROOF(3, leaves(12, 'other')).map(hex) }, h.doc, opts);
+  assert.equal(forged.valid, false);
+});
+
+test('LogMonitor key document: shared heads, then the first own-key head advances with a consistency proof', async () => {
+  const h = await kdHistory();
+  const mon = new LogMonitor({ logId: KD_LOG_ID, logKeys: h.doc, receiptKeys: h.receiptKeys });
+  assert.equal((await mon.observe(await h.shared(2))).status, 'first');
+  const a = await mon.observe(await h.shared(4), h.proof(2, 4));
+  assert.equal(a.status, 'advanced', a.errors.join('; '));
+  const own = await h.own(8);
+  // Without a proof the cut-over is not taken on the new key's word.
+  assert.equal((await mon.observe(own)).status, 'unproven');
+  const b = await mon.observe(own, h.proof(4, 8));
+  assert.deepEqual(b, { ok: true, status: 'advanced', errors: [], previous_tree_size: 4, tree_size: 8 });
+  assert.deepEqual(await mon.last(), own);
+  // The receipt key cannot sign the log forward any more.
+  const late = await mon.observe(await h.shared(10), h.proof(8, 10));
+  assert.equal(late.status, 'invalid');
+  assert.deepEqual(late.errors, ['tree_size_out_of_range']);
+  assert.deepEqual(await mon.last(), own);
+});
+
+test('LogMonitor key document: the constructor throws on a bad document or one for another log', async () => {
+  const h = await kdHistory();
+  const base = { logId: KD_LOG_ID, receiptKeys: h.receiptKeys };
+  assert.doesNotThrow(() => new LogMonitor({ ...base, logKeys: h.doc }));
+  const noHandover = structuredClone(h.doc);
+  delete noHandover.keys[1].handover;
+  assert.throws(() => new LogMonitor({ ...base, logKeys: noHandover }), (e) => e instanceof TypeError && /handover_missing/.test(e.message));
+  assert.throws(() => new LogMonitor({ ...base, logId: 'other-log', logKeys: h.doc }), TypeError);
+  // Unanchored: the first key is not one of the caller's receipt keys.
+  assert.throws(() => new LogMonitor({ ...base, receiptKeys: [], logKeys: h.doc }), TypeError);
+
+  // A forged hand-over signature cannot be checked synchronously, so the
+  // constructor accepts the document; every head is then refused.
+  const attacker = await makeEphemeralKey();
+  const forged = await kdTwoEntryDoc(h.receipt, h.log, await kdHandover(attacker, h.log, { root_hash: h.root(KD_M) }));
+  const mon = new LogMonitor({ ...base, logKeys: forged });
+  for (const head of [await h.shared(2), await h.own(8)]) {
+    const r = await mon.observe(head);
+    assert.equal(r.status, 'invalid');
+    assert.deepEqual(r.errors, ['invalid_key_doc']);
+  }
+  assert.equal(await mon.last(), null);
+});
+
+test('verifyReceipt key document: a receipt under a log-key head is included, log_key separate', async () => {
+  // verifyReceipt anchors the document on the bundle in use (plus the pinned
+  // one), so the document's first key is the key that signed the receipt.
+  const signer = await makeEphemeralKey();
+  const { receipt } = await makeReceipt({ keyId: KD_RECEIPT_KID, ...signer });
+  const keys = makeKeyBundle([{ key_id: KD_RECEIPT_KID, algorithm: 'Ed25519', public_key: signer.publicKeyB64 }]);
+  const log = await makeEphemeralKey();
+  const { D, path } = await receiptInTree(receipt, 9, 6);
+  const root = (n) => hex(MTH(D.slice(0, n)));
+  const doc = await kdTwoEntryDoc(signer, log, await kdHandover(signer, log, { root_hash: root(KD_M) }));
+  const proof = { leaf_index: 6, tree_size: 9, audit_path: path.map(hex), root_hash: root(9) };
+  const sth = await kdOwnHead(log, 9, { root_hash: root(9) });
+  const opts = (logKeys) => ({ keys, revocations: makeRevocations(), inclusion: { proof, sth, logKeys } });
+
+  const r = await verifyReceipt(receipt, opts(doc));
+  assert.equal(r.valid, true, r.errors.join('; '));
+  assert.deepEqual(r.log, { status: 'included', tree_size: 9, leaf_index: 6, log_key_id: KD_LOG_KID, log_key: 'separate' });
+
+  // The same document with a hand-over the receipt key never signed: refused.
+  const forgedDoc = await kdTwoEntryDoc(signer, log, await kdHandover(log, log, { root_hash: root(KD_M) }));
+  const forged = await verifyReceipt(receipt, opts(forgedDoc));
+  assert.equal(forged.valid, false);
+  assert.equal(forged.log.status, 'failed');
+  assert.deepEqual(forged.errors, ['log inclusion: sth: invalid_key_doc']);
+});
+
+test('key document callers: a signed head with no usable root_hash is refused, never thrown on', async () => {
+  // verifySth in document mode checks the root only at the cut-over size (as
+  // the CLI does), so the callers must refuse such a head themselves.
+  const h = await kdHistory();
+  const opts = { receiptKeys: h.receiptKeys };
+  // (kdHead defaults an undefined root_hash to a valid one, hence null.)
+  for (const root_hash of ['zz', 42, null]) {
+    const bad = await kdOwnHead(h.log, 8, { root_hash });
+    assert.equal((await verifySth(bad, h.doc, opts)).valid, true); // signed by the right key, in range
+
+    const same = await verifySthConsistency(bad, await h.own(8), undefined, h.doc, opts);
+    assert.equal(same.valid, false);
+    assert.deepEqual(same.errors, ['older sth: root_hash: not a 32-byte hex hash']);
+    const both = await verifySthConsistency(bad, bad, undefined, h.doc, opts);
+    assert.equal(both.errors.length, 2);
+    const advance = await verifySthConsistency(await h.shared(4), bad, h.proof(4, 8), h.doc, opts);
+    assert.equal(advance.valid, false);
+    assert.deepEqual(advance.errors, ['newer sth: root_hash: not a 32-byte hex hash']);
+
+    const mon = new LogMonitor({ logId: KD_LOG_ID, logKeys: h.doc, ...opts });
+    const seen = await mon.observe(bad);
+    assert.equal(seen.ok, false);
+    assert.equal(seen.status, 'invalid');
+    assert.equal(await mon.last(), null);
+    // After a good head, the bad one at the same size is still only invalid.
+    const good = await h.own(8);
+    assert.equal((await mon.observe(good)).status, 'first');
+    assert.equal((await mon.observe(bad)).status, 'invalid');
+    assert.deepEqual(await mon.last(), good);
+
+    const { receipt } = await makeReceipt();
+    const inc = await verifyReceiptInclusion(receipt, { leaf_index: 0, tree_size: 8, audit_path: [], root_hash: h.root(8) }, bad, h.doc, opts);
+    assert.equal(inc.status, 'failed');
+    assert.deepEqual(inc.errors, ['sth: root_hash: not a 32-byte hex hash']);
+  }
 });

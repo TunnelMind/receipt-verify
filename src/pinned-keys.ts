@@ -4,6 +4,7 @@
 // refresh it (and the date) whenever the well-known bundle rotates.
 
 import type { KeyBundle } from './keys.js';
+import type { LogKeyDoc } from './log.js';
 
 export const PINNED_KEYS_FETCHED_AT = '2026-10-17';
 
@@ -40,3 +41,26 @@ export const PINNED_KEY_BUNDLE: KeyBundle = {
     "reference_verifier": "https://github.com/TunnelMind/receipt-verify"
   }
 } as KeyBundle;
+
+// The log's key document (key per tree size, ADR-047 §4), checked with
+// checkLogKeyDoc and anchored on the receipt key above.
+export const LOG_KEYS_URL = 'https://data.tunnelmind.ai/.well-known/receipt-log-keys.json';
+
+// On this date LOG_KEYS_URL was not served yet: the log still signed its
+// heads with the receipt key (shared mode). So the document below is written
+// from ADR-047 §4, not copied. After the cut-over, replace the literal with
+// the served document, verbatim, and set the date.
+export const PINNED_LOG_KEYS_FETCHED_AT = '2026-11-13';
+
+export const PINNED_LOG_KEYS: LogKeyDoc = {
+  "log_id": "tunnelmind-receipts-log-v1",
+  "keys": [
+    {
+      "key_id": "tm-receipt-2026-05",
+      "public_key": "U18ONQCXr/Ox3Ac1ShKB1zYRcPIM9Sp9yZrka1jzoCY=",
+      "from_tree_size": 0,
+      "until_tree_size": null,
+      "shared_with_receipts": true
+    }
+  ]
+};
