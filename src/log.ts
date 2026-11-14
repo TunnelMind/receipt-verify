@@ -33,6 +33,9 @@
 // are checked against the STH's own timestamp (keys.ts keyUsableAt), so a
 // key past rotation stops verifying new heads. The timestamp is the log's
 // claim; a stolen rotated key can backdate it, exactly as for receipts.
+// Key document (checkLogKeyDoc): the log's published list of keys by tree
+// size, each later key endorsed by a hand-over the previous key signed, the
+// first key anchored on a receipt key. Checked here only as a document.
 // Fail closed: every function returns errors, never throws on bad input.
 
 import { canonicalizeBytes, type JsonValue } from './jcs.js';
@@ -88,6 +91,39 @@ export interface ConsistencyProof {
  *  log it signs for. Entries with status `revoked` are never used. */
 export interface LogKeyEntry extends SigningKeyEntry {
   log_id?: string;
+}
+
+/** The previous key's signed statement that the log moves to `to_key_id` at
+ *  `tree_size` under `root_hash`. Signed bytes = JCS(hand-over minus `signature`). */
+export interface LogKeyHandover {
+  type: 'tunnelmind.log-key-handover/v1';
+  log_id: string;
+  from_key_id: string;
+  to_key_id: string;
+  to_public_key: string;
+  tree_size: number;
+  root_hash: string;
+  signature: SthSignature;
+  [k: string]: unknown;
+}
+
+/** One key of a key document: it signs heads of tree sizes
+ *  [from_tree_size, until_tree_size], open-ended when `until_tree_size` is null. */
+export interface LogKeyDocEntry {
+  key_id: string;
+  public_key: string;
+  from_tree_size: number;
+  until_tree_size: number | null;
+  shared_with_receipts?: boolean;
+  handover?: LogKeyHandover; // required on every entry but the first
+  [k: string]: unknown;
+}
+
+/** The log's key document (key per tree size). Validate with checkLogKeyDoc. */
+export interface LogKeyDoc {
+  log_id: string;
+  keys: LogKeyDocEntry[];
+  [k: string]: unknown;
 }
 
 export interface SthOptions {
@@ -168,6 +204,93 @@ function logKeyMode(
 
 function isSize(n: unknown): n is number {
   return typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
+}
+
+// ── Key document ──────────────────────────────────────────────────────────────
+
+type Obj = Record<string, unknown>;
+const isObj = (v: unknown): v is Obj => v !== null && typeof v === 'object' && !Array.isArray(v);
+const isStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+// 32-byte hex, optional 0x: the CLI's pattern, kept as a pattern so both
+// verifiers accept the very same spellings.
+const isHex32 = (v: unknown): boolean => typeof v === 'string' && /^(0x)?[0-9a-f]{64}$/i.test(v);
+// tm-log-YYYY-MM, the id every key after the first must carry.
+const LOG_KEY_ID_RE = /^tm-log-[0-9]{4}-(0[1-9]|1[0-2])$/;
+
+/** A key string → its bytes, or null. Standard base64 alphabet only: atob()
+ *  alone forgives ASCII whitespace, which the CLI refuses. Padding is dropped
+ *  before decoding because the CLI's decoder ignores how many `=` there are. */
+function keyBytes(v: unknown): Uint8Array | null {
+  if (!isStr(v) || !/^[A-Za-z0-9+/]*={0,2}$/.test(v)) return null;
+  try { return b64ToBytes(v.replace(/=+$/, '')); } catch { return null; }
+}
+const key32 = (v: unknown): Uint8Array | null => {
+  const b = keyBytes(v);
+  return b && b.length === 32 ? b : null;
+};
+
+/** Why a key document is invalid (a short fixed string), or null when valid.
+ *  Same reasons in the same order as checkLogKeys in scripts/verify-log.mjs
+ *  (first failure wins), then the anchor the CLI applies per head: the first
+ *  key must be, byte for byte, a non-revoked receipt key (`receiptKeys`,
+ *  default the pinned bundle's), else `first_key_not_pinned`. Without the
+ *  anchor anyone could publish a self-consistent chain of hand-overs.
+ *  Resolves on any input; never throws or rejects. */
+export async function checkLogKeyDoc(doc: unknown, receiptKeys?: SigningKeyEntry[]): Promise<string | null> {
+  if (!isObj(doc) || !isStr(doc.log_id) || !Array.isArray(doc.keys) || doc.keys.length === 0) return 'bad_doc';
+  const keys = doc.keys as unknown[];
+  const ids = new Set<string>();
+  const handoverTo = new Set<unknown>();
+  let firstKey: Uint8Array | null = null;
+  let prev: Obj | undefined;      // the previous entry, already checked
+  let prevKey: Uint8Array | null = null;
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    if (!isObj(k) || !isStr(k.key_id)) return 'bad_entry';
+    const pub = key32(k.public_key);
+    if (!pub) return 'bad_entry';
+    if (i === 0) firstKey = pub;
+    if (i > 0 && !LOG_KEY_ID_RE.test(k.key_id)) return 'bad_key_id'; // keys[0] is the receipt key, own id
+    if (!isSize(k.from_tree_size) || k.from_tree_size !== (prev ? prev.until_tree_size : 0)) return 'bad_range';
+    // until > from: a zero-width range lets two hand-overs at one size carry two roots.
+    if (k.until_tree_size === null
+      ? i !== keys.length - 1
+      : !(isSize(k.until_tree_size) && k.until_tree_size > k.from_tree_size)) return 'bad_range';
+    const h = k.handover;
+    // A later key without a hand-over is one the old key never endorsed.
+    if (prev && h === undefined) return 'handover_missing';
+    if (h !== undefined) {
+      if (!prev || !prevKey) return 'handover_on_first_entry';
+      if (!isObj(h) || h.type !== 'tunnelmind.log-key-handover/v1' || !isHex32(h.root_hash)) return 'bad_handover';
+      if (handoverTo.has(h.to_key_id)) return 'handover_replay';
+      handoverTo.add(h.to_key_id);
+      if (h.log_id !== doc.log_id) return 'handover_log_id';
+      if (h.from_key_id !== prev.key_id) return 'handover_from_key';
+      const to = keyBytes(h.to_public_key);
+      if (h.to_key_id !== k.key_id || !to || !bytesEqual(to, pub)) return 'handover_to_key';
+      if (h.tree_size !== k.from_tree_size) return 'handover_tree_size';
+      const { signature: sig, ...body } = h;
+      if (!isObj(sig) || sig.algorithm !== 'Ed25519') return 'handover_signature';
+      let signed: Uint8Array;
+      // canonicalizeBytes throws on a lone surrogate anywhere in the body.
+      try { signed = canonicalizeBytes(body as JsonValue); } catch { return 'handover_signature'; }
+      // The key goes in re-encoded from its bytes, so a spelling accepted
+      // above cannot fail ed25519Verify's own decode.
+      if (!(await ed25519Verify(btoa(String.fromCharCode(...prevKey)), sig.value, signed))) return 'handover_signature';
+    }
+    // Checked after the hand-over so a replayed hand-over reports as one.
+    if (ids.has(k.key_id)) return 'duplicate_key_id';
+    ids.add(k.key_id);
+    prev = k;
+    prevKey = pub;
+  }
+  const rks: unknown[] = Array.isArray(receiptKeys) ? receiptKeys : PINNED_KEY_BUNDLE.keys;
+  const pinned = rks.some((r) => {
+    if (!isObj(r) || r.status === 'revoked') return false;
+    const b = key32(r.public_key);
+    return !!b && !!firstKey && bytesEqual(b, firstKey);
+  });
+  return pinned ? null : 'first_key_not_pinned';
 }
 
 // ── Signed tree heads ─────────────────────────────────────────────────────────

@@ -507,7 +507,13 @@ export {
   keyUsableAt,
   clearKeyCache,
 } from './keys.js';
-export { PINNED_KEY_BUNDLE, PINNED_KEYS_FETCHED_AT } from './pinned-keys.js';
+export {
+  PINNED_KEY_BUNDLE,
+  PINNED_KEYS_FETCHED_AT,
+  PINNED_LOG_KEYS,
+  PINNED_LOG_KEYS_FETCHED_AT,
+  LOG_KEYS_URL,
+} from './pinned-keys.js';
 export {
   DEFAULT_REVOCATIONS_URL,
   REVOCATION_CACHE_TTL_MS,
@@ -536,6 +542,7 @@ export {
   receiptLeafHash,
   LogMonitor,
   MemorySthStore,
+  checkLogKeyDoc,
 } from './log.js';
 export type {
   SignedTreeHead,
@@ -543,6 +550,9 @@ export type {
   InclusionProof,
   ConsistencyProof,
   LogKeyEntry,
+  LogKeyDoc,
+  LogKeyDocEntry,
+  LogKeyHandover,
   SthOptions,
   SthResult,
   LogStatus,
