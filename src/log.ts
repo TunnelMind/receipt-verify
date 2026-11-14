@@ -319,7 +319,11 @@ function checkLogKeyDocSync(
   }
   const rks: unknown[] = Array.isArray(receiptKeys) ? receiptKeys : PINNED_KEY_BUNDLE.keys;
   const pinned = rks.some((r) => {
-    if (!isObj(r) || r.status === 'revoked') return false;
+    if (!isObj(r)) return false;
+    // Allowlist, not a 'revoked' denylist: an unknown status ('suspended',
+    // 'compromised', a typo) must not anchor the document (fail closed).
+    const st = r.status ?? 'active';
+    if (st !== 'active' && st !== 'rotated') return false;
     const b = key32(r.public_key);
     return !!b && !!firstKey && bytesEqual(b, firstKey);
   });

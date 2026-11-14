@@ -804,6 +804,19 @@ test('checkLogKeyDoc: the first key must be a non-revoked receipt key; malformed
   assert.equal(await checkLogKeyDoc(good, [{ key_id: 'x', public_key: attacker.publicKeyB64 }, entry]), null);
   assert.equal(await checkLogKeyDoc(good, []), 'first_key_not_pinned');
   assert.equal(await checkLogKeyDoc(good, [{ ...entry, status: 'revoked' }]), 'first_key_not_pinned');
+  // Status is an allowlist: absent, 'active' and 'rotated' anchor; anything else does not.
+  for (const status of ['active', 'rotated']) assert.equal(await checkLogKeyDoc(good, [{ ...entry, status }]), null, status);
+  for (const status of ['suspended', 'compromised', 'actve', '', 1]) {
+    assert.equal(await checkLogKeyDoc(good, [{ ...entry, status }]), 'first_key_not_pinned', String(status));
+  }
+  // The same through the real pinned document, and through verifySth.
+  const suspended = [{ ...PINNED_KEY_BUNDLE.keys[0], status: 'suspended' }];
+  assert.equal(await checkLogKeyDoc(PINNED_LOG_KEYS, suspended), 'first_key_not_pinned');
+  assert.equal(await checkLogKeyDoc(PINNED_LOG_KEYS, [{ ...PINNED_KEY_BUNDLE.keys[0], status: 'rotated' }]), null);
+  const head = await kdHead(attacker, { key_id: PINNED_KEY_BUNDLE.keys[0].key_id, tree_size: 9, log_id: PINNED_LOG_KEYS.log_id });
+  const viaSth = await verifySth(head, PINNED_LOG_KEYS, { receiptKeys: suspended });
+  assert.equal(viaSth.valid, false);
+  assert.equal(viaSth.reason, 'first_key_not_pinned');
   // A receipt key the document check would refuse matches nothing.
   assert.equal(await checkLogKeyDoc(good, [null, { key_id: 'x' }, { key_id: 'x', public_key: 'AAAA' }]), 'first_key_not_pinned');
   // A document reason comes before the anchor.
