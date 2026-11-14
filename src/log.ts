@@ -222,9 +222,9 @@ function isSize(n: unknown): n is number {
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
-// 32-byte hex, optional 0x: the CLI's pattern, kept as a pattern so both
+// 32-byte hex, lower-case 0x prefix only: the CLI's pattern, kept as a pattern so both
 // verifiers accept the very same spellings.
-const isHex32 = (v: unknown): boolean => typeof v === 'string' && /^(0x)?[0-9a-f]{64}$/i.test(v);
+const isHex32 = (v: unknown): boolean => typeof v === 'string' && /^(0x)?[0-9a-fA-F]{64}$/.test(v);
 // tm-log-YYYY-MM, the id every key after the first must carry.
 const LOG_KEY_ID_RE = /^tm-log-[0-9]{4}-(0[1-9]|1[0-2])$/;
 
@@ -243,7 +243,7 @@ const key32 = (v: unknown): Uint8Array | null => {
 /** Why a key document is invalid (a short fixed string), or null when valid.
  *  Same reasons in the same order as checkLogKeys in scripts/verify-log.mjs
  *  (first failure wins), then the anchor the CLI applies per head: the first
- *  key must be, byte for byte, a non-revoked receipt key (`receiptKeys`,
+ *  key must be, byte for byte, an active or rotated receipt key (`receiptKeys`,
  *  default the pinned bundle's), else `first_key_not_pinned`. Without the
  *  anchor anyone could publish a self-consistent chain of hand-overs.
  *  Resolves on any input; never throws or rejects. */

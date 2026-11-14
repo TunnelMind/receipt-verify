@@ -69,7 +69,7 @@ re-run over the payload and compared with the published verdict.
     bundle and trusted as given, each with a status and time window.
   - *Document mode:* the log's key document (`PINNED_LOG_KEYS`, or the file
     served at `LOG_KEYS_URL`). The document itself is not trusted. Its first
-    key must be, byte for byte, a non-revoked receipt key (the pinned bundle;
+    key must be, byte for byte, an active or rotated receipt key (the pinned bundle;
     in `verifyReceipt`, the bundle in use plus the pinned one), and every
     later key must carry a hand-over signed by the key before it. Each key
     signs only inside its tree-size range, which replaces the time window.

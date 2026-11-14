@@ -14,6 +14,7 @@ import { reconcile } from '../scripts/verdict-lib/reconcile.js';
 import { leafHash as libLeafHash } from '../scripts/verdict-lib/log.js';
 import { b64ToBytes } from '../scripts/verdict-lib/hash.js';
 import { verifySth, verifyInclusion, leafHash, jcs, checkLogKeys, checkSthKey } from '../scripts/verify-log.mjs';
+import { verifySth as verifySthLib, checkLogKeyDoc as libCheckLogKeyDoc } from '../dist/index.js';
 import { makeReceipt, makeEphemeralKey, makeKeyBundle } from './_helpers.mjs';
 
 const subtle = webcrypto.subtle;
@@ -755,4 +756,31 @@ test('CLI inclusion / consistency: exactly one of --key and --log-keys, and --lo
   // Document mode keeps the other requirements: a receipt for inclusion, three files for consistency.
   assert.equal(runOut([...incl.slice(0, 2), ...docArg, t.pin]).status, 2);
   assert.equal(runOut([...cons.slice(0, 3), ...docArg, t.pin]).status, 2);
+});
+
+test('0X-prefixed roots are refused (hand-over root_hash and head root_hash), as the library refuses them', async () => {
+  const { receipt, log } = await makeKeyDocKeys();
+  const pin = receipt.publicKeyB64;
+  const bad0X = `0X${KD_ROOT_M}`;
+  // Hand-over root: signed over the 0X spelling, so only the spelling can refuse it.
+  const badDoc = await makeTwoEntryDoc(receipt, log, await makeHandover(receipt, log, { root_hash: bad0X }));
+  assert.equal(checkLogKeys(badDoc), 'bad_handover');
+  assert.equal(await libCheckLogKeyDoc(badDoc, [{ key_id: KD_RECEIPT_KID, public_key: pin }]), 'bad_handover');
+  // Head root at the cut-over size: refused whatever the reason string.
+  const two = await makeTwoEntryDoc(receipt, log);
+  const head = await ownHead(log, KD_M, { root_hash: bad0X });
+  assert.equal(checkSthKey(head, two, pin), 'root_mismatch');
+  const r = await verifySthLib(head, two, { receiptKeys: [{ key_id: KD_RECEIPT_KID, public_key: pin }] });
+  assert.equal(r.valid, false);
+  assert.equal(r.reason, 'root_mismatch');
+  // Control: the lower-case spelling is accepted.
+  assert.equal(checkSthKey(await ownHead(log, KD_M, { root_hash: `0x${KD_ROOT_M}` }), two, pin), null);
+});
+
+test('key document: a non-integer tree_size is refused (tree_size_out_of_range)', async () => {
+  const { receipt, log } = await makeKeyDocKeys();
+  const pin = receipt.publicKeyB64;
+  const two = await makeTwoEntryDoc(receipt, log);
+  assert.equal(checkSthKey(await ownHead(log, KD_M + 0.5), two, pin), 'tree_size_out_of_range');
+  assert.equal(checkSthKey(await sharedHead(receipt, 3.5), two, pin), 'tree_size_out_of_range');
 });

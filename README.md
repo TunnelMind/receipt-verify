@@ -235,7 +235,7 @@ Limits, stated plainly:
 
 - **A fetched document is only as strong as the receipt key.** Nothing in a
   document is trusted by itself: `keys[0].public_key` must equal, as decoded
-  bytes, a pinned receipt key that is not revoked (otherwise
+  bytes, a pinned receipt key that is active or rotated (otherwise
   `first_key_not_pinned`), and the hand-over to the log key is signed by that
   receipt key. Whoever holds the receipt key can hand the log over to a key
   of their choice.

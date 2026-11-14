@@ -288,3 +288,4 @@ Check-after, from plan.md (4): `npm test` green, and
 prints `{"valid":true,"reason":null}`, and
 `node scripts/verify-log.mjs sth sth.json --log-keys <pinned-copy.json> --receipt-key=<receipt-pub>`
 on the live head prints `valid: true` with `key_id` `<id>`.
+- Version is 3.0.0 and unreleased.

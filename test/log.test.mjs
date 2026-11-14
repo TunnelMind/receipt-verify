@@ -787,6 +787,19 @@ test('checkLogKeyDoc: same answer as the CLI checkLogKeys on every document vect
   ]) assert.ok(seen.has(reason), `no vector reaches ${reason}`);
 });
 
+test('an explicit empty anchor list fails closed on the real pin shape; no fallback to the built-in pin', async () => {
+  const first = PINNED_KEY_BUNDLE.keys[0];
+  // Same shape as PINNED_LOG_KEYS: one shared entry from 0, open-ended, the real key.
+  const doc = { log_id: PINNED_LOG_KEYS.log_id, keys: [{ ...PINNED_LOG_KEYS.keys[0], key_id: first.key_id, public_key: first.public_key, from_tree_size: 0, until_tree_size: null }] };
+  assert.equal(await checkLogKeyDoc(doc), null); // default anchor accepts it
+  assert.equal(await checkLogKeyDoc(doc, []), 'first_key_not_pinned');
+  const attacker = await makeEphemeralKey();
+  const head = await kdHead(attacker, { key_id: first.key_id, tree_size: 9, log_id: doc.log_id });
+  const r = await verifySth(head, doc, { receiptKeys: [] });
+  assert.equal(r.valid, false);
+  assert.equal(r.reason, 'first_key_not_pinned');
+});
+
 test('checkLogKeyDoc: the first key must be a non-revoked receipt key; malformed input is a reason, never a throw', async () => {
   const receipt = await makeEphemeralKey();
   const log = await makeEphemeralKey();
@@ -935,6 +948,7 @@ test('verifySth key document: the same reason as the CLI on every head vector (F
     ['receipt key above m', await kdSharedHead(receipt, KD_M + 1), two],
     ['log key below m', await kdOwnHead(log, KD_M - 1), two],
     ['string tree size', await kdSharedHead(receipt, '3'), two],
+    ['non-integer tree size', await kdOwnHead(log, KD_M + 0.5), two],
     ['receipt key at m, another root', await kdSharedHead(receipt, KD_M), two],
     ['log key at m, another root', await kdOwnHead(log, KD_M), two],
     ['log key at m, root not hex', await kdOwnHead(log, KD_M, { root_hash: 'zz' }), two],

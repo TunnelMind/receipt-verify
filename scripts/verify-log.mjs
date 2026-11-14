@@ -193,7 +193,7 @@ const isSize = (v) => Number.isSafeInteger(v) && v >= 0;
 // (is32) or as equal to the pin (sameKey), and the two verifiers would
 // disagree on one document. A non-string or empty pin equals nothing.
 const is32 = (b64) => isStr(b64) && isB64(b64) && Buffer.from(b64, 'base64').length === 32;
-const isHex32 = (v) => typeof v === 'string' && /^(0x)?[0-9a-f]{64}$/i.test(v); // Buffer hex parsing stops silently at a bad digit
+const isHex32 = (v) => typeof v === 'string' && /^(0x)?[0-9a-fA-F]{64}$/.test(v); // lower-case 0x only (unhex strips just that); Buffer hex parsing stops silently at a bad digit
 const sameKey = (a, b) => isStr(a) && isStr(b) && isB64(a) && isB64(b) && Buffer.from(a, 'base64').equals(Buffer.from(b, 'base64'));
 // tm-log-YYYY-MM. Same pattern as the sequencer's, repeated here so the
 // verifier imports nothing.
