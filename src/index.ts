@@ -35,6 +35,7 @@ import {
   verifyReceiptInclusion,
   type InclusionProof,
   type LogKeyEntry,
+  type LogKeyDoc,
   type LogStatus,
   type LogKeyMode,
   type SignedTreeHead,
@@ -136,11 +137,12 @@ export interface VerifyOptions {
    *  the log: `sth` (else `proof.sth`) must verify under the pinned
    *  `logKeys` (never the receipt bundle), match the proof, and the audit
    *  path must lead from the receipt's recomputed leaf to the signed root.
-   *  A failed proof is always an error. See log.ts. */
+   *  A failed proof is always an error. `logKeys` may be the log's key
+   *  document (e.g. PINNED_LOG_KEYS) instead of a key array. See log.ts. */
   inclusion?: {
     proof: InclusionProof;
     sth?: SignedTreeHead;
-    logKeys: LogKeyEntry[];
+    logKeys: LogKeyEntry[] | LogKeyDoc;
     /** Refuse an STH that names no signature.key_id. */
     requireKeyId?: boolean;
     logId?: string;

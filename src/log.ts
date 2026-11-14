@@ -42,6 +42,9 @@
 // keys[0] must be a receipt key and every later key hangs off it by signed
 // hand-overs. Each key signs only inside its tree-size range, which replaces
 // the time window (no keyUsableAt here), and the head must name its key.
+// verifyReceiptInclusion, verifySthConsistency and LogMonitor take a document
+// in place of the key array too: each head is then judged by verifySth under
+// the document, so a consistency proof may span a key cut-over.
 // Fail closed: every function returns errors, never throws on bad input.
 
 import { canonicalizeBytes, type JsonValue } from './jcs.js';
@@ -194,7 +197,7 @@ function usable(k: LogKeyEntry | null | undefined): k is LogKeyEntry {
  *  bytes, so a re-spelled base64 of a receipt key is still caught. No usable
  *  log key → no mode (verifySth reports that). */
 function logKeyMode(
-  logKeys: LogKeyEntry[] | undefined,
+  logKeys: LogKeyEntry[] | LogKeyDoc | undefined, // a document has no mode here: verifySth reports it per head
   receiptKeys: SigningKeyEntry[] | undefined,
 ): { mode?: LogKeyMode; error?: string } {
   const keys = Array.isArray(logKeys) ? logKeys.filter(usable) : [];
@@ -245,6 +248,26 @@ const key32 = (v: unknown): Uint8Array | null => {
  *  anchor anyone could publish a self-consistent chain of hand-overs.
  *  Resolves on any input; never throws or rejects. */
 export async function checkLogKeyDoc(doc: unknown, receiptKeys?: SigningKeyEntry[]): Promise<string | null> {
+  const sigs: HandoverSigCheck[] = [];
+  const reason = checkLogKeyDocSync(doc, receiptKeys, sigs);
+  // Every collected signature was met before `reason`, so a bad one is the
+  // first failure and wins over it.
+  for (const sigOk of sigs) if (!(await sigOk())) return 'handover_signature';
+  return reason;
+}
+
+type HandoverSigCheck = () => Promise<boolean>;
+
+/** Everything checkLogKeyDoc checks except the hand-over signatures
+ *  themselves (WebCrypto is async-only): those are pushed onto `sigs`, in
+ *  document order, for the caller to await. Returns the first other failure;
+ *  the walk stops there, so no signature after it is collected.
+ *  Synchronous so the LogMonitor constructor can refuse a bad document. */
+function checkLogKeyDocSync(
+  doc: unknown,
+  receiptKeys: SigningKeyEntry[] | undefined,
+  sigs: HandoverSigCheck[],
+): string | null {
   if (!isObj(doc) || !isStr(doc.log_id) || !Array.isArray(doc.keys) || doc.keys.length === 0) return 'bad_doc';
   const keys = doc.keys as unknown[];
   const ids = new Set<string>();
@@ -284,7 +307,9 @@ export async function checkLogKeyDoc(doc: unknown, receiptKeys?: SigningKeyEntry
       try { signed = canonicalizeBytes(body as JsonValue); } catch { return 'handover_signature'; }
       // The key goes in re-encoded from its bytes, so a spelling accepted
       // above cannot fail ed25519Verify's own decode.
-      if (!(await ed25519Verify(btoa(String.fromCharCode(...prevKey)), sig.value, signed))) return 'handover_signature';
+      const signerKey = btoa(String.fromCharCode(...prevKey));
+      const value = sig.value;
+      sigs.push(() => ed25519Verify(signerKey, value, signed));
     }
     // Checked after the hand-over so a replayed hand-over reports as one.
     if (ids.has(k.key_id)) return 'duplicate_key_id';
@@ -483,12 +508,14 @@ export async function receiptLeafHash(receipt: unknown): Promise<Uint8Array> {
 /** Prove `receipt` is in the log: the STH (argument, else proof.sth) must
  *  verify under a pinned log key and match the proof's root_hash and
  *  tree_size, and the audit path must lead from the receipt's recomputed
- *  leaf to that root. */
+ *  leaf to that root. `logKeys` may be a key document (see verifySth): the
+ *  head's key must then cover its tree size (no time window), and `log_key`
+ *  says which kind of key the head named. */
 export async function verifyReceiptInclusion(
   receipt: unknown,
   proof: unknown,
   sth: unknown,
-  logKeys: LogKeyEntry[] | undefined,
+  logKeys: LogKeyEntry[] | LogKeyDoc | undefined,
   opts: SthOptions = {},
 ): Promise<InclusionResult> {
   const errors: string[] = [];
@@ -510,6 +537,9 @@ export async function verifyReceiptInclusion(
     return out;
   }
   const sr = await verifySth(head, logKeys, opts);
+  // Document mode: the kind of key is per head, so it comes from verifySth,
+  // and is set before the refusal so a refused head still reports it.
+  if (isKeyDoc(logKeys) && sr.log_key) out.log_key = sr.log_key;
   if (!sr.valid) {
     errors.push(...sr.errors.map((e) => `sth: ${e}`));
     return out;
@@ -519,6 +549,9 @@ export async function verifyReceiptInclusion(
   const root = parseHash(p.root_hash);
   const sthRoot = parseHash(h.root_hash);
   if (!root) errors.push('proof.root_hash: not a 32-byte hex hash');
+  // Document mode only checks a head's root at the cut-over size (CLI
+  // parity), so a signed head can reach here with no usable root.
+  if (!sthRoot) errors.push('sth: root_hash: not a 32-byte hex hash');
   if (!isSize(p.tree_size) || !isSize(p.leaf_index)) errors.push('proof.tree_size / leaf_index: not non-negative integers');
   if (root && sthRoot && !bytesEqual(root, sthRoot)) errors.push('proof.root_hash does not match the signed tree head');
   if (p.tree_size !== h.tree_size) errors.push(`proof.tree_size ${String(p.tree_size)} does not match the signed tree head ${String(h.tree_size)}`);
@@ -557,12 +590,14 @@ export interface ConsistencyResult {
 
 /** Prove `newer` extends `older` without rewriting history. Both STHs must
  *  verify under pinned log keys, belong to the same log, and the roots come
- *  from the STHs, never from the proof document. */
+ *  from the STHs, never from the proof document. With a key document as
+ *  `logKeys` each head is checked against the key covering its own tree
+ *  size, so the proof may run from a receipt-key head to a log-key head. */
 export async function verifySthConsistency(
   older: unknown,
   newer: unknown,
   proof: unknown,
-  logKeys: LogKeyEntry[] | undefined,
+  logKeys: LogKeyEntry[] | LogKeyDoc | undefined,
   opts: SthOptions = {},
 ): Promise<ConsistencyResult> {
   const errors: string[] = [];
@@ -584,8 +619,14 @@ export async function verifySthConsistency(
   }
   const o = older as SignedTreeHead;
   const n = newer as SignedTreeHead;
-  const oRoot = parseHash(o.root_hash) as Uint8Array;
-  const nRoot = parseHash(n.root_hash) as Uint8Array;
+  const oRoot = parseHash(o.root_hash);
+  const nRoot = parseHash(n.root_hash);
+  // Array mode refused a bad root in verifySth; document mode only checks
+  // it at the cut-over size (CLI parity), so a signed head with no usable
+  // root is refused here instead of being compared.
+  if (!oRoot) errors.push('older sth: root_hash: not a 32-byte hex hash');
+  if (!nRoot) errors.push('newer sth: root_hash: not a 32-byte hex hash');
+  if (!oRoot || !nRoot) return out;
   if (n.tree_size < o.tree_size) {
     errors.push(`newer sth tree_size ${n.tree_size} is smaller than older ${o.tree_size} (rollback)`);
     return out;
@@ -659,7 +700,9 @@ export interface LogMonitorOptions extends SthOptions {
    *  a log_id could sign a head under a fresh log_id and start a new,
    *  unchecked history ('first') instead of being caught as a fork. */
   logId: string;
-  logKeys: LogKeyEntry[];
+  /** Pinned log keys, or the log's key document (tree-size ranges instead of
+   *  time windows; `receiptKeys` anchors its first key). */
+  logKeys: LogKeyEntry[] | LogKeyDoc;
   store?: SthStore;
   /** Fetch a consistency proof from the log when observe() is not given one,
    *  e.g. GET /v1/receipts/log/consistency?first=&second= . */
@@ -670,7 +713,8 @@ export interface LogMonitorOptions extends SthOptions {
  *  come with a consistency proof from the last accepted STH. A smaller tree,
  *  a second root for the same size, or an unprovable advance is reported and
  *  NOT stored, so the monitor keeps its last good view. A fork or rollback is
- *  evidence of log misbehaviour: keep both STHs. */
+ *  evidence of log misbehaviour: keep both STHs. With a key document the
+ *  monitor follows the log across a key cut-over (see verifySth). */
 export class LogMonitor {
   private readonly o: LogMonitorOptions;
   private readonly store: SthStore;
@@ -686,6 +730,19 @@ export class LogMonitor {
     }
     const km = logKeyMode(opts.logKeys, opts.receiptKeys);
     if (km.error) throw new TypeError(`LogMonitor: ${km.error}`);
+    if (isKeyDoc(opts.logKeys)) {
+      // A document that can never verify a head is a misuse too: say so now
+      // instead of answering `invalid` forever. Only the synchronous rules
+      // run here. A bad hand-over signature cannot be caught in a
+      // constructor (WebCrypto verify is async); it is still refused, on
+      // every observe() as `invalid`, because verifySth re-checks the whole
+      // document for each head.
+      const reason = checkLogKeyDocSync(opts.logKeys, opts.receiptKeys, []);
+      if (reason) throw new TypeError(`LogMonitor: invalid key document (${reason})`);
+      if (opts.logKeys.log_id !== opts.logId) {
+        throw new TypeError(`LogMonitor: key document is for log ${opts.logKeys.log_id}, not ${opts.logId}`);
+      }
+    }
     this.o = opts;
     this.store = opts.store ?? new MemorySthStore();
   }
@@ -706,6 +763,12 @@ export class LogMonitor {
     const sr = await verifySth(sth, this.o.logKeys, this.o);
     if (!sr.valid) return { ok: false, status: 'invalid', errors: sr.errors };
     const next = sth as SignedTreeHead;
+    // A document-mode head can be validly signed with no usable root (see
+    // verifySthConsistency). Refused before the store: a stored rootless
+    // head could never be compared or extended.
+    if (!parseHash(next.root_hash)) {
+      return { ok: false, status: 'invalid', errors: ['sth.root_hash: not a 32-byte hex hash'] };
+    }
     const id = this.o.logId;
     const prev = await this.store.get(id);
     if (!prev) {

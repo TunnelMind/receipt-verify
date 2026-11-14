@@ -961,3 +961,162 @@ test('verifySth key document: junk input is a reason, never a throw; opts.logId 
   assert.equal(other.valid, false);
   assert.equal(other.reason, 'log_id_mismatch');
 });
+
+// ── Key document: the library callers (FR-007) ───────────────────────────────
+// A real 20-leaf tree with the cut-over at KD_M: the hand-over carries the
+// tree's real root at KD_M, so heads and proofs on both sides are genuine.
+
+async function kdHistory(D = leaves(20)) {
+  const receipt = await makeEphemeralKey();
+  const log = await makeEphemeralKey();
+  const root = (n) => hex(MTH(D.slice(0, n)));
+  const doc = await kdTwoEntryDoc(receipt, log, await kdHandover(receipt, log, { root_hash: root(KD_M) }));
+  return {
+    receipt, log, doc, root,
+    receiptKeys: [{ key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64 }],
+    shared: (n) => kdSharedHead(receipt, n, { root_hash: root(n) }),
+    own: (n) => kdOwnHead(log, n, { root_hash: root(n) }),
+    proof: (m, n) => ({ first: m, second: n, proof: PROOF(m, D.slice(0, n)).map(hex) }),
+  };
+}
+
+test('verifyReceiptInclusion key document: a receipt under a log-key head is included, log_key separate', async () => {
+  const { receipt } = await makeReceipt();
+  const { D, path } = await receiptInTree(receipt, 9, 6);
+  const h = await kdHistory(D);
+  const proof = { leaf_index: 6, tree_size: 9, audit_path: path.map(hex), root_hash: h.root(9) };
+  const sth = await h.own(9);
+  assert.equal(sth.key_id, KD_LOG_KID); // an own-key head: top-level key_id
+  const r = await verifyReceiptInclusion(receipt, proof, sth, h.doc, { receiptKeys: h.receiptKeys });
+  assert.deepEqual(r, { status: 'included', errors: [], log_key: 'separate', log_key_id: KD_LOG_KID, tree_size: 9, leaf_index: 6 });
+
+  // A refused head still reports which kind of key it named: the receipt key
+  // signing past its range is not a log witness.
+  const late = await verifyReceiptInclusion(receipt, proof, await h.shared(9), h.doc, { receiptKeys: h.receiptKeys });
+  assert.equal(late.status, 'failed');
+  assert.equal(late.log_key, 'shared_with_receipts');
+  assert.deepEqual(late.errors, ['sth: tree_size_out_of_range']);
+});
+
+test('verifySthConsistency key document: a proof spans the cut-over; a receipt-key head past it fails', async () => {
+  const h = await kdHistory();
+  const opts = { receiptKeys: h.receiptKeys };
+  for (const m of [3, KD_M]) {
+    const ok = await verifySthConsistency(await h.shared(m), await h.own(12), h.proof(m, 12), h.doc, opts);
+    assert.equal(ok.valid, true, ok.errors.join('; '));
+  }
+  // Same tree, same valid proof, but the older head is the receipt key
+  // signing above its range.
+  const bad = await verifySthConsistency(await h.shared(KD_M + 2), await h.own(12), h.proof(KD_M + 2, 12), h.doc, opts);
+  assert.equal(bad.valid, false);
+  assert.deepEqual(bad.errors, ['older sth: tree_size_out_of_range']);
+  // A proof for another history does not pass on signatures alone.
+  const forged = await verifySthConsistency(await h.shared(3), await h.own(12), { first: 3, second: 12, proof: PROOF(3, leaves(12, 'other')).map(hex) }, h.doc, opts);
+  assert.equal(forged.valid, false);
+});
+
+test('LogMonitor key document: shared heads, then the first own-key head advances with a consistency proof', async () => {
+  const h = await kdHistory();
+  const mon = new LogMonitor({ logId: KD_LOG_ID, logKeys: h.doc, receiptKeys: h.receiptKeys });
+  assert.equal((await mon.observe(await h.shared(2))).status, 'first');
+  const a = await mon.observe(await h.shared(4), h.proof(2, 4));
+  assert.equal(a.status, 'advanced', a.errors.join('; '));
+  const own = await h.own(8);
+  // Without a proof the cut-over is not taken on the new key's word.
+  assert.equal((await mon.observe(own)).status, 'unproven');
+  const b = await mon.observe(own, h.proof(4, 8));
+  assert.deepEqual(b, { ok: true, status: 'advanced', errors: [], previous_tree_size: 4, tree_size: 8 });
+  assert.deepEqual(await mon.last(), own);
+  // The receipt key cannot sign the log forward any more.
+  const late = await mon.observe(await h.shared(10), h.proof(8, 10));
+  assert.equal(late.status, 'invalid');
+  assert.deepEqual(late.errors, ['tree_size_out_of_range']);
+  assert.deepEqual(await mon.last(), own);
+});
+
+test('LogMonitor key document: the constructor throws on a bad document or one for another log', async () => {
+  const h = await kdHistory();
+  const base = { logId: KD_LOG_ID, receiptKeys: h.receiptKeys };
+  assert.doesNotThrow(() => new LogMonitor({ ...base, logKeys: h.doc }));
+  const noHandover = structuredClone(h.doc);
+  delete noHandover.keys[1].handover;
+  assert.throws(() => new LogMonitor({ ...base, logKeys: noHandover }), (e) => e instanceof TypeError && /handover_missing/.test(e.message));
+  assert.throws(() => new LogMonitor({ ...base, logId: 'other-log', logKeys: h.doc }), TypeError);
+  // Unanchored: the first key is not one of the caller's receipt keys.
+  assert.throws(() => new LogMonitor({ ...base, receiptKeys: [], logKeys: h.doc }), TypeError);
+
+  // A forged hand-over signature cannot be checked synchronously, so the
+  // constructor accepts the document; every head is then refused.
+  const attacker = await makeEphemeralKey();
+  const forged = await kdTwoEntryDoc(h.receipt, h.log, await kdHandover(attacker, h.log, { root_hash: h.root(KD_M) }));
+  const mon = new LogMonitor({ ...base, logKeys: forged });
+  for (const head of [await h.shared(2), await h.own(8)]) {
+    const r = await mon.observe(head);
+    assert.equal(r.status, 'invalid');
+    assert.deepEqual(r.errors, ['invalid_key_doc']);
+  }
+  assert.equal(await mon.last(), null);
+});
+
+test('verifyReceipt key document: a receipt under a log-key head is included, log_key separate', async () => {
+  // verifyReceipt anchors the document on the bundle in use (plus the pinned
+  // one), so the document's first key is the key that signed the receipt.
+  const signer = await makeEphemeralKey();
+  const { receipt } = await makeReceipt({ keyId: KD_RECEIPT_KID, ...signer });
+  const keys = makeKeyBundle([{ key_id: KD_RECEIPT_KID, algorithm: 'Ed25519', public_key: signer.publicKeyB64 }]);
+  const log = await makeEphemeralKey();
+  const { D, path } = await receiptInTree(receipt, 9, 6);
+  const root = (n) => hex(MTH(D.slice(0, n)));
+  const doc = await kdTwoEntryDoc(signer, log, await kdHandover(signer, log, { root_hash: root(KD_M) }));
+  const proof = { leaf_index: 6, tree_size: 9, audit_path: path.map(hex), root_hash: root(9) };
+  const sth = await kdOwnHead(log, 9, { root_hash: root(9) });
+  const opts = (logKeys) => ({ keys, revocations: makeRevocations(), inclusion: { proof, sth, logKeys } });
+
+  const r = await verifyReceipt(receipt, opts(doc));
+  assert.equal(r.valid, true, r.errors.join('; '));
+  assert.deepEqual(r.log, { status: 'included', tree_size: 9, leaf_index: 6, log_key_id: KD_LOG_KID, log_key: 'separate' });
+
+  // The same document with a hand-over the receipt key never signed: refused.
+  const forgedDoc = await kdTwoEntryDoc(signer, log, await kdHandover(log, log, { root_hash: root(KD_M) }));
+  const forged = await verifyReceipt(receipt, opts(forgedDoc));
+  assert.equal(forged.valid, false);
+  assert.equal(forged.log.status, 'failed');
+  assert.deepEqual(forged.errors, ['log inclusion: sth: invalid_key_doc']);
+});
+
+test('key document callers: a signed head with no usable root_hash is refused, never thrown on', async () => {
+  // verifySth in document mode checks the root only at the cut-over size (as
+  // the CLI does), so the callers must refuse such a head themselves.
+  const h = await kdHistory();
+  const opts = { receiptKeys: h.receiptKeys };
+  // (kdHead defaults an undefined root_hash to a valid one, hence null.)
+  for (const root_hash of ['zz', 42, null]) {
+    const bad = await kdOwnHead(h.log, 8, { root_hash });
+    assert.equal((await verifySth(bad, h.doc, opts)).valid, true); // signed by the right key, in range
+
+    const same = await verifySthConsistency(bad, await h.own(8), undefined, h.doc, opts);
+    assert.equal(same.valid, false);
+    assert.deepEqual(same.errors, ['older sth: root_hash: not a 32-byte hex hash']);
+    const both = await verifySthConsistency(bad, bad, undefined, h.doc, opts);
+    assert.equal(both.errors.length, 2);
+    const advance = await verifySthConsistency(await h.shared(4), bad, h.proof(4, 8), h.doc, opts);
+    assert.equal(advance.valid, false);
+    assert.deepEqual(advance.errors, ['newer sth: root_hash: not a 32-byte hex hash']);
+
+    const mon = new LogMonitor({ logId: KD_LOG_ID, logKeys: h.doc, ...opts });
+    const seen = await mon.observe(bad);
+    assert.equal(seen.ok, false);
+    assert.equal(seen.status, 'invalid');
+    assert.equal(await mon.last(), null);
+    // After a good head, the bad one at the same size is still only invalid.
+    const good = await h.own(8);
+    assert.equal((await mon.observe(good)).status, 'first');
+    assert.equal((await mon.observe(bad)).status, 'invalid');
+    assert.deepEqual(await mon.last(), good);
+
+    const { receipt } = await makeReceipt();
+    const inc = await verifyReceiptInclusion(receipt, { leaf_index: 0, tree_size: 8, audit_path: [], root_hash: h.root(8) }, bad, h.doc, opts);
+    assert.equal(inc.status, 'failed');
+    assert.deepEqual(inc.errors, ['sth: root_hash: not a 32-byte hex hash']);
+  }
+});
