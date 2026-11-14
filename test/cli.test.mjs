@@ -13,7 +13,7 @@ import { verifyReceipt } from '../scripts/verdict-lib/verify-receipt.js';
 import { reconcile } from '../scripts/verdict-lib/reconcile.js';
 import { leafHash as libLeafHash } from '../scripts/verdict-lib/log.js';
 import { b64ToBytes } from '../scripts/verdict-lib/hash.js';
-import { verifySth, verifyInclusion, leafHash, jcs } from '../scripts/verify-log.mjs';
+import { verifySth, verifyInclusion, leafHash, jcs, checkLogKeys, checkSthKey } from '../scripts/verify-log.mjs';
 import { makeReceipt, makeEphemeralKey, makeKeyBundle } from './_helpers.mjs';
 
 const subtle = webcrypto.subtle;
@@ -332,4 +332,296 @@ test('receipt_signature passes with no ceiling, and names the package error when
   const ok = await verifyReceipt(v.receipt, { keys, witnessKeys: [v.witness.publicKeyB64] });
   assert.equal(check(ok, 'receipt_signature').pass, true, JSON.stringify(ok.checks));
   assert.equal(check(ok, 'receipt_signature').detail, `key_id=${v.receipt.signature.key_id}`);
+});
+
+// ── verify-log.mjs key document (ADR-047 key-per-tree-size rules) ────────────
+// Every key is made in the test run. The builders below are plain top-level
+// functions so later tests can reuse the same vectors.
+
+const KD_LOG_ID = 'test-log';
+const KD_RECEIPT_KID = 'test-receipt-2026-05';
+const KD_LOG_KID = 'tm-log-2026-11';
+const KD_M = 5; // cut-over tree size
+const KD_ROOT_M = 'cd'.repeat(32); // the root the receipt key hands over at KD_M
+const KD_ROOT = 'ab'.repeat(32);
+const toB64Url = (s) => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+// A key whose standard base64 carries + or /, so its base64url spelling differs.
+async function makeKeyWithB64OnlyChars() {
+  let k = await makeEphemeralKey();
+  while (!/[+/]/.test(k.publicKeyB64)) k = await makeEphemeralKey();
+  return k;
+}
+
+// Hand-over at KD_M to `to`, signed by `signer` over jcs(hand-over minus signature).
+async function makeHandover(signer, to, over = {}) {
+  const body = {
+    type: 'tunnelmind.log-key-handover/v1', log_id: KD_LOG_ID,
+    from_key_id: KD_RECEIPT_KID, to_key_id: KD_LOG_KID, to_public_key: to.publicKeyB64,
+    tree_size: KD_M, root_hash: KD_ROOT_M, ...over,
+  };
+  return { ...body, signature: { algorithm: 'Ed25519', value: await sign(signer.kp, Buffer.from(jcs(body))) } };
+}
+
+// Today's document: the receipt key alone, open-ended.
+function makeOneEntryDoc(receipt) {
+  return { log_id: KD_LOG_ID, keys: [{ key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64, from_tree_size: 0, until_tree_size: null }] };
+}
+
+// After a cut-over: receipt key [0, KD_M], log key [KD_M, open) with its hand-over.
+async function makeTwoEntryDoc(receipt, log, handover) {
+  return {
+    log_id: KD_LOG_ID,
+    keys: [
+      { key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64, from_tree_size: 0, until_tree_size: KD_M },
+      { key_id: KD_LOG_KID, public_key: log.publicKeyB64, from_tree_size: KD_M, until_tree_size: null,
+        handover: handover ?? await makeHandover(receipt, log) },
+    ],
+  };
+}
+
+// Live dialect: log_id + signature.key_id. A shared (receipt-key) head has no
+// top-level key_id; an own-key head carries it inside the signed body.
+async function makeKeyedSth(signer, { key_id, tree_size, root_hash = KD_ROOT, own = false, log_id = KD_LOG_ID, body: extra = {} }) {
+  const body = { log_id, tree_size, root_hash, timestamp: new Date().toISOString(), ...(own && { key_id }), ...extra };
+  return { ...body, signature: { algorithm: 'Ed25519', key_id, value: await sign(signer.kp, Buffer.from(jcs(body))) } };
+}
+const sharedHead = (receipt, tree_size, o = {}) => makeKeyedSth(receipt, { key_id: KD_RECEIPT_KID, tree_size, ...o });
+const ownHead = (log, tree_size, o = {}) => makeKeyedSth(log, { key_id: KD_LOG_KID, tree_size, own: true, ...o });
+
+async function makeKeyDocKeys() {
+  return { receipt: await makeEphemeralKey(), log: await makeEphemeralKey(), attacker: await makeEphemeralKey() };
+}
+
+test('key document: valid shared head (one entry), shared head <= m and own-key head >= m (two entries)', async () => {
+  const { receipt, log } = await makeKeyDocKeys();
+  const pin = receipt.publicKeyB64;
+  const one = makeOneEntryDoc(receipt);
+  const two = await makeTwoEntryDoc(receipt, log);
+  assert.equal(checkLogKeys(one), null);
+  assert.equal(checkLogKeys(two), null);
+  assert.equal(checkSthKey(await sharedHead(receipt, 3), one, pin), null);
+  assert.equal(checkSthKey(await sharedHead(receipt, 1000), one, pin), null);
+  assert.equal(checkSthKey(await sharedHead(receipt, 3), two, pin), null);
+  assert.equal(checkSthKey(await sharedHead(receipt, KD_M, { root_hash: KD_ROOT_M }), two, pin), null);
+  assert.equal(checkSthKey(await ownHead(log, KD_M, { root_hash: KD_ROOT_M }), two, pin), null);
+  assert.equal(checkSthKey(await ownHead(log, KD_M + 4), two, pin), null);
+});
+
+// The spellings the Data API emits: padded standard base64 keys and
+// signatures, 0x + lower-case hex roots, the signer's key in the signature.
+test('key document: a Data-API-shaped document and heads are valid', async () => {
+  const { receipt, log } = await makeKeyDocKeys();
+  const rootM = `0x${KD_ROOT_M}`;
+  const hBody = {
+    type: 'tunnelmind.log-key-handover/v1', log_id: KD_LOG_ID, tree_size: KD_M, root_hash: rootM,
+    sth_timestamp: new Date().toISOString(), from_key_id: KD_RECEIPT_KID, to_key_id: KD_LOG_KID, to_public_key: log.publicKeyB64,
+  };
+  const handover = { ...hBody, signature: {
+    algorithm: 'Ed25519', key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64, value: await sign(receipt.kp, Buffer.from(jcs(hBody))),
+  } };
+  const doc = await makeTwoEntryDoc(receipt, log, handover);
+  const head = async (signer, key_id, tree_size, root_hash, own) => {
+    const body = { log_id: KD_LOG_ID, tree_size, root_hash, timestamp: new Date().toISOString(), ...(own && { key_id }) };
+    return { ...body, signature: { algorithm: 'Ed25519', key_id, public_key: signer.publicKeyB64, value: await sign(signer.kp, Buffer.from(jcs(body))) } };
+  };
+  const shared = await head(receipt, KD_RECEIPT_KID, KD_M, rootM, false);
+  const own = await head(log, KD_LOG_KID, KD_M, rootM, true);
+  assert.match(receipt.publicKeyB64, /^[A-Za-z0-9+/]{43}=$/);
+  assert.match(shared.signature.value, /^[A-Za-z0-9+/]{86}==$/);
+  assert.match(shared.root_hash, /^0x[0-9a-f]{64}$/);
+  assert.equal(checkLogKeys(doc), null);
+  assert.equal(checkSthKey(shared, doc, receipt.publicKeyB64), null);
+  assert.equal(checkSthKey(own, doc, receipt.publicKeyB64), null);
+  assert.equal(checkSthKey(await head(log, KD_LOG_KID, KD_M + 1, `0x${KD_ROOT}`, true), doc, receipt.publicKeyB64), null);
+  // The key a signature carries must be the document's key for that id.
+  const lying = { ...own, signature: { ...own.signature, public_key: receipt.publicKeyB64 } };
+  assert.equal(checkSthKey(lying, doc, receipt.publicKeyB64), 'public_key_mismatch');
+});
+
+test('checkLogKeys: hand-over reasons', async () => {
+  const { receipt, log, attacker } = await makeKeyDocKeys();
+  const two = await makeTwoEntryDoc(receipt, log);
+  const { handover, ...noHandover } = two.keys[1];
+
+  assert.equal(checkLogKeys({ ...two, keys: [two.keys[0], noHandover] }), 'handover_missing');
+  // Signed by a key that is not the previous entry's.
+  assert.equal(checkLogKeys(await makeTwoEntryDoc(receipt, log, await makeHandover(attacker, log))), 'handover_signature');
+  // Tampered after signing.
+  assert.equal(checkLogKeys(await makeTwoEntryDoc(receipt, log, { ...handover, root_hash: KD_ROOT })), 'handover_signature');
+  // The same hand-over offered again for a third entry.
+  const third = await makeEphemeralKey();
+  assert.equal(checkLogKeys({ ...two, keys: [
+    two.keys[0],
+    { ...two.keys[1], until_tree_size: 9 },
+    { key_id: 'tm-log-2026-12', public_key: third.publicKeyB64, from_tree_size: 9, until_tree_size: null, handover },
+  ] }), 'handover_replay');
+  const one = makeOneEntryDoc(receipt);
+  assert.equal(checkLogKeys({ ...one, keys: [{ ...one.keys[0], handover }] }), 'handover_on_first_entry');
+  assert.equal(checkLogKeys(await makeTwoEntryDoc(receipt, log, { ...handover, type: 'other' })), 'bad_handover');
+  assert.equal(checkLogKeys(await makeTwoEntryDoc(receipt, log, await makeHandover(receipt, log, { log_id: 'other-log' }))), 'handover_log_id');
+  assert.equal(checkLogKeys(await makeTwoEntryDoc(receipt, log, await makeHandover(receipt, log, { from_key_id: 'other' }))), 'handover_from_key');
+  assert.equal(checkLogKeys(await makeTwoEntryDoc(receipt, log, await makeHandover(receipt, attacker))), 'handover_to_key');
+  assert.equal(checkLogKeys(await makeTwoEntryDoc(receipt, log, await makeHandover(receipt, log, { tree_size: KD_M - 1 }))), 'handover_tree_size');
+});
+
+test('checkLogKeys: bad_range (gap, zero width), bad_key_id, bad_entry (base64url key), bad_doc', async () => {
+  const { receipt, log } = await makeKeyDocKeys();
+  const two = await makeTwoEntryDoc(receipt, log);
+  const withKeys = (k0, k1) => ({ ...two, keys: [{ ...two.keys[0], ...k0 }, { ...two.keys[1], ...k1 }] });
+
+  assert.equal(checkLogKeys(withKeys({}, { from_tree_size: KD_M + 1 })), 'bad_range'); // gap
+  assert.equal(checkLogKeys(withKeys({ from_tree_size: 1 }, {})), 'bad_range'); // first entry not from 0
+  assert.equal(checkLogKeys(withKeys({ until_tree_size: 0 }, { from_tree_size: 0 })), 'bad_range'); // zero width
+  assert.equal(checkLogKeys(withKeys({}, { until_tree_size: KD_M })), 'bad_range'); // zero width, last entry
+  assert.equal(checkLogKeys(withKeys({ until_tree_size: null }, {})), 'bad_range'); // open range before the last entry
+  assert.equal(checkLogKeys(withKeys({}, { key_id: 'log-key-2' })), 'bad_key_id');
+  assert.equal(checkLogKeys(withKeys({}, { key_id: 'tm-log-2026-13' })), 'bad_key_id');
+  assert.equal(checkLogKeys({ ...two, keys: [two.keys[0], two.keys[0]] }), 'bad_key_id');
+
+  // Buffer.from(s, 'base64') would decode the base64url spelling to the same
+  // 32 bytes; the document must be refused, as the package's decoder refuses it.
+  const k = await makeKeyWithB64OnlyChars();
+  const one = makeOneEntryDoc(k);
+  assert.equal(checkLogKeys(one), null);
+  assert.equal(checkLogKeys({ ...one, keys: [{ ...one.keys[0], public_key: toB64Url(k.publicKeyB64) }] }), 'bad_entry');
+  assert.equal(checkLogKeys({ ...one, keys: [{ ...one.keys[0], public_key: `${k.publicKeyB64.slice(0, 20)} ${k.publicKeyB64.slice(20)}` }] }), 'bad_entry');
+  assert.equal(checkLogKeys({ ...one, keys: [{ ...one.keys[0], public_key: 'AAAA' }] }), 'bad_entry');
+  assert.equal(checkLogKeys({ ...one, keys: [] }), 'bad_doc');
+  assert.equal(checkLogKeys({ keys: one.keys }), 'bad_doc');
+});
+
+test('checkSthKey: the document is anchored on the pinned receipt key (first_key_not_pinned)', async () => {
+  const receipt = await makeKeyWithB64OnlyChars();
+  const attacker = await makeEphemeralKey();
+  const doc = makeOneEntryDoc(receipt);
+  const head = await sharedHead(receipt, 3);
+  assert.equal(checkSthKey(head, doc, receipt.publicKeyB64), null);
+  for (const pin of [attacker.publicKeyB64, '', undefined, null, 42, toB64Url(receipt.publicKeyB64)]) {
+    assert.equal(checkSthKey(head, doc, pin), 'first_key_not_pinned', String(pin));
+  }
+  // A whole document made by the attacker, internally valid, is still not the pinned one.
+  const log = await makeEphemeralKey();
+  const forged = await makeTwoEntryDoc(attacker, log);
+  assert.equal(checkLogKeys(forged), null);
+  assert.equal(checkSthKey(await ownHead(log, KD_M + 1), forged, receipt.publicKeyB64), 'first_key_not_pinned');
+});
+
+test('checkSthKey: head reasons', async () => {
+  const { receipt, log, attacker } = await makeKeyDocKeys();
+  const pin = receipt.publicKeyB64;
+  const two = await makeTwoEntryDoc(receipt, log);
+
+  assert.equal(checkSthKey(await sharedHead(receipt, 3), null, pin), 'invalid_key_doc');
+  assert.equal(checkSthKey(await sharedHead(receipt, 3), { ...two, keys: [two.keys[0], { ...two.keys[1], handover: undefined }] }, pin), 'invalid_key_doc');
+  const { signature, ...unsigned } = await sharedHead(receipt, 3);
+  assert.equal(checkSthKey(unsigned, two, pin), 'no_signature');
+  assert.equal(checkSthKey({ ...unsigned, signature: { ...signature, key_id: undefined } }, two, pin), 'no_signature');
+  assert.equal(checkSthKey(await makeKeyedSth(attacker, { key_id: 'tm-log-2027-01', tree_size: 3, own: true }), two, pin), 'unknown_key_id');
+  // A log-key head must carry key_id in its signed body.
+  assert.equal(checkSthKey(await makeKeyedSth(log, { key_id: KD_LOG_KID, tree_size: KD_M + 1 }), two, pin), 'key_id_missing');
+  assert.equal(checkSthKey(await makeKeyedSth(log, { key_id: KD_LOG_KID, tree_size: KD_M + 1, body: { key_id: KD_RECEIPT_KID } }), two, pin), 'key_id_mismatch');
+  assert.equal(checkSthKey(await sharedHead(receipt, 3, { log_id: 'other-log' }), two, pin), 'log_id_mismatch');
+  const { log_id, ...noLogId } = await sharedHead(receipt, 3);
+  assert.equal(checkSthKey(noLogId, two, pin), 'log_id_mismatch');
+  // Signed by the attacker under a known key id.
+  assert.equal(checkSthKey(await sharedHead(attacker, 3), two, pin), 'bad_signature');
+  assert.equal(checkSthKey(await ownHead(attacker, KD_M + 1), two, pin), 'bad_signature');
+  // Each key signs only inside its tree-size range.
+  assert.equal(checkSthKey(await sharedHead(receipt, KD_M + 1), two, pin), 'tree_size_out_of_range');
+  assert.equal(checkSthKey(await ownHead(log, KD_M - 1), two, pin), 'tree_size_out_of_range');
+  assert.equal(checkSthKey(await sharedHead(receipt, '3'), two, pin), 'tree_size_out_of_range');
+  // At the cut-over size either key must sign the handed-over root.
+  assert.equal(checkSthKey(await sharedHead(receipt, KD_M), two, pin), 'root_mismatch');
+  assert.equal(checkSthKey(await ownHead(log, KD_M), two, pin), 'root_mismatch');
+});
+
+test('checkLogKeys / checkSthKey never throw: a reason string for any input', async () => {
+  const { receipt, log } = await makeKeyDocKeys();
+  const pin = receipt.publicKeyB64;
+  const one = makeOneEntryDoc(receipt);
+  const two = await makeTwoEntryDoc(receipt, log);
+  const head = await sharedHead(receipt, 3);
+  for (const junk of [null, undefined, 42, 'x', [], {}, { log_id: KD_LOG_ID, keys: [null] }, { log_id: KD_LOG_ID, keys: [42, []] }]) {
+    assert.equal(typeof checkLogKeys(junk), 'string', JSON.stringify(junk));
+    assert.equal(typeof checkSthKey(head, junk, pin), 'string', JSON.stringify(junk));
+    assert.equal(typeof checkSthKey(junk, one, pin), 'string', JSON.stringify(junk));
+    assert.equal(typeof checkSthKey(junk, junk, junk), 'string', JSON.stringify(junk));
+  }
+  // Hand-over signatures of the wrong type, and a body jcs() refuses.
+  const h = two.keys[1].handover;
+  for (const sig of [null, 42, 'x', [], {}, { algorithm: 'Ed25519' }, { algorithm: 'Ed25519', value: 42 }, { algorithm: 'Ed25519', value: null }]) {
+    assert.equal(checkLogKeys(await makeTwoEntryDoc(receipt, log, { ...h, signature: sig })), 'handover_signature', JSON.stringify(sig));
+  }
+  assert.equal(checkLogKeys(await makeTwoEntryDoc(receipt, log, { ...h, note: '\ud800' })), 'handover_signature');
+  for (const sig of [{ key_id: KD_RECEIPT_KID }, { key_id: KD_RECEIPT_KID, algorithm: 'Ed25519', value: 42 }]) {
+    assert.equal(checkSthKey({ ...head, signature: sig }, one, pin), 'bad_signature', JSON.stringify(sig));
+  }
+  assert.equal(checkSthKey({ ...head, note: '\ud800' }, one, pin), 'bad_signature');
+});
+
+// Exit code and stdout of one CLI run (stdout is the JSON verdict line).
+const runOut = (args) => {
+  try { return { status: 0, stdout: execFileSync(process.execPath, ['scripts/verify-log.mjs', ...args], { stdio: 'pipe' }).toString() }; }
+  catch (e) { return { status: e.status, stdout: String(e.stdout) }; }
+};
+
+test('CLI sth --log-keys and handover: 0 valid, 1 refused, 2 without --receipt-key', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cli-test-'));
+  const f = (name, obj) => { const p = join(dir, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+  const { receipt, log, attacker } = await makeKeyDocKeys();
+  const two = await makeTwoEntryDoc(receipt, log);
+  const docPath = f('log-keys.json', two);
+  const pin = `--receipt-key=${receipt.publicKeyB64}`;
+  const wrongPin = `--receipt-key=${attacker.publicKeyB64}`;
+  const own = f('own.json', await ownHead(log, KD_M + 1));
+  const shared = f('shared.json', await sharedHead(receipt, 3));
+  const late = f('late.json', await sharedHead(receipt, KD_M + 1));
+
+  let r = runOut(['sth', own, '--log-keys', docPath, pin]);
+  assert.deepEqual(r, { status: 0, stdout: `{"valid":true,"key_id":"${KD_LOG_KID}","reason":null}\n` });
+  r = runOut(['sth', shared, '--log-keys', docPath, pin]);
+  assert.deepEqual(r, { status: 0, stdout: `{"valid":true,"key_id":"${KD_RECEIPT_KID}","reason":null}\n` });
+  r = runOut(['sth', own, '--log-keys', docPath, wrongPin]);
+  assert.deepEqual(r, { status: 1, stdout: `{"valid":false,"key_id":"${KD_LOG_KID}","reason":"first_key_not_pinned"}\n` });
+  r = runOut(['sth', late, '--log-keys', docPath, pin]);
+  assert.deepEqual(r, { status: 1, stdout: `{"valid":false,"key_id":"${KD_RECEIPT_KID}","reason":"tree_size_out_of_range"}\n` });
+  assert.equal(runOut(['sth', own, '--log-keys', docPath]).status, 2);
+  assert.equal(runOut(['sth', own, '--log-keys', docPath, '--receipt-key=']).status, 2);
+  assert.equal(runOut(['sth', '--log-keys', docPath, pin]).status, 2);
+
+  r = runOut(['handover', docPath, pin]);
+  assert.deepEqual(r, { status: 0, stdout: '{"valid":true,"reason":null}\n' });
+  r = runOut(['handover', docPath, wrongPin]);
+  assert.deepEqual(r, { status: 1, stdout: '{"valid":false,"reason":"first_key_not_pinned"}\n' });
+  const tampered = f('tampered.json', { ...two, keys: [two.keys[0], { ...two.keys[1], handover: { ...two.keys[1].handover, root_hash: KD_ROOT } }] });
+  r = runOut(['handover', tampered, pin]);
+  assert.deepEqual(r, { status: 1, stdout: '{"valid":false,"reason":"handover_signature"}\n' });
+  assert.equal(runOut(['handover', docPath]).status, 2);
+  assert.equal(runOut(['handover', pin]).status, 2);
+});
+
+test('CLI sth <sth> <pub>: --receipt-key reports own / shared_with_receipts; without it the output is unchanged', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cli-test-'));
+  const f = (name, obj) => { const p = join(dir, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+  const signer = await makeKeyWithB64OnlyChars();
+  const other = await makeEphemeralKey();
+  const pub = signer.publicKeyB64;
+  const sth = f('sth.json', await makeSth(signer, { root_hash: KD_ROOT, tree_size: 1 }));
+
+  assert.deepEqual(runOut(['sth', sth, pub]), { status: 0, stdout: '{"sth_signature":true}\n' });
+  assert.deepEqual(runOut(['sth', sth, other.publicKeyB64]), { status: 1, stdout: '{"sth_signature":false}\n' });
+
+  assert.deepEqual(runOut(['sth', sth, pub, `--receipt-key=${pub}`]),
+    { status: 1, stdout: '{"sth_signature":true,"log_key":"shared_with_receipts"}\n' });
+  assert.deepEqual(runOut(['sth', sth, pub, `--receipt-key=${pub}`, '--allow-shared']),
+    { status: 0, stdout: '{"sth_signature":true,"log_key":"shared_with_receipts"}\n' });
+  assert.deepEqual(runOut(['sth', sth, pub, `--receipt-key=${other.publicKeyB64}`]),
+    { status: 0, stdout: '{"sth_signature":true,"log_key":"own"}\n' });
+  // A bad signature is never rescued by --allow-shared.
+  assert.equal(runOut(['sth', sth, other.publicKeyB64, `--receipt-key=${other.publicKeyB64}`, '--allow-shared']).status, 1);
+  // A receipt key that is not a standard-base64 32-byte key cannot be compared,
+  // so the same key in base64url must not come out as "own".
+  assert.equal(runOut(['sth', sth, pub, `--receipt-key=${toB64Url(pub)}`]).status, 2);
+  assert.equal(runOut(['sth', sth, pub, '--receipt-key=']).status, 2);
 });
