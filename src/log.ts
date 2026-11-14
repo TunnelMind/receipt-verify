@@ -35,7 +35,13 @@
 // claim; a stolen rotated key can backdate it, exactly as for receipts.
 // Key document (checkLogKeyDoc): the log's published list of keys by tree
 // size, each later key endorsed by a hand-over the previous key signed, the
-// first key anchored on a receipt key. Checked here only as a document.
+// first key anchored on a receipt key.
+// Key-document mode: verifySth(sth, doc) with such a document (PINNED_LOG_KEYS,
+// or the served file) instead of a key array applies ADR-047 §7 as the CLI's
+// checkSthKey does. The trust anchor is the receipt key, not the document:
+// keys[0] must be a receipt key and every later key hangs off it by signed
+// hand-overs. Each key signs only inside its tree-size range, which replaces
+// the time window (no keyUsableAt here), and the head must name its key.
 // Fail closed: every function returns errors, never throws on bad input.
 
 import { canonicalizeBytes, type JsonValue } from './jcs.js';
@@ -143,6 +149,8 @@ export interface SthResult {
   errors: string[];
   /** Set once the pinned log keys were evaluated (any usable one). */
   log_key?: LogKeyMode;
+  /** Key-document mode only: why the head was refused, the CLI's fixed string. */
+  reason?: string;
   key_id?: string;
   log_id?: string;
   tree_size?: number;
@@ -295,15 +303,89 @@ export async function checkLogKeyDoc(doc: unknown, receiptKeys?: SigningKeyEntry
 
 // ── Signed tree heads ─────────────────────────────────────────────────────────
 
+/** verifySth with a key document: the same checks in the same order as
+ *  checkSthKey in scripts/verify-log.mjs (first failure wins), reported as
+ *  `reason`. The head must name its key (`signature.key_id`); no other key is
+ *  ever tried. `log_key` says which kind of entry that key is. Never throws. */
+// A type guard, so that past the early return in verifySth `logKeys` is the
+// key array again and the array-mode code compiles untouched.
+const isKeyDoc = (v: unknown): v is LogKeyDoc => isObj(v) && Array.isArray(v.keys);
+
+async function verifySthDoc(sth: unknown, doc: LogKeyDoc, opts: SthOptions): Promise<SthResult> {
+  const out: SthResult = { valid: false, errors: [] };
+  const refuse = (reason: string): SthResult => {
+    out.reason = reason;
+    out.errors.push(reason);
+    return out;
+  };
+  // The document first, anchored on the receipt key: nothing in an
+  // unanchored or malformed document is used to judge a head.
+  const docReason = await checkLogKeyDoc(doc, opts.receiptKeys);
+  if (docReason !== null) return refuse(docReason === 'first_key_not_pinned' ? docReason : 'invalid_key_doc');
+  const keys = doc.keys;
+
+  const sig = isObj(sth) ? sth.signature : null;
+  if (!isObj(sth) || !isObj(sig) || !isStr(sig.key_id)) return refuse('no_signature');
+  // opts.logId has no CLI counterpart: a document for another log than the
+  // caller expects is refused here too (fail closed).
+  if (sth.log_id !== doc.log_id || (opts.logId && doc.log_id !== opts.logId)) return refuse('log_id_mismatch');
+  if ('key_id' in sth && sth.key_id !== sig.key_id) return refuse('key_id_mismatch');
+  const idx = keys.findIndex((k) => k.key_id === sig.key_id);
+  const e = keys[idx];
+  if (!e) return refuse('unknown_key_id');
+  out.log_key = e.handover ? 'separate' : 'shared_with_receipts';
+  // Own-key heads sign their key id; only first-entry (shared) heads may lack it.
+  if (e.handover && !('key_id' in sth)) return refuse('key_id_missing');
+  const pub = keyBytes(e.public_key) as Uint8Array; // decodes: checkLogKeyDoc passed
+  if ('public_key' in sig) {
+    const carried = keyBytes(sig.public_key);
+    if (!carried || !bytesEqual(carried, pub)) return refuse('public_key_mismatch');
+  }
+  if (sig.algorithm !== 'Ed25519') return refuse('bad_signature');
+  const { signature: _sig, ...body } = sth;
+  void _sig;
+  let signed: Uint8Array;
+  try { signed = canonicalizeBytes(body as JsonValue); } catch { return refuse('bad_signature'); }
+  // Canonical base64 signatures only (ed25519Verify); the CLI also takes
+  // unpadded ones. The key goes in re-encoded from its bytes, as in checkLogKeyDoc.
+  if (!(await ed25519Verify(btoa(String.fromCharCode(...pub)), sig.value, signed))) return refuse('bad_signature');
+  const n = sth.tree_size;
+  if (!isSize(n) || n < e.from_tree_size || (e.until_tree_size !== null && n > e.until_tree_size)) {
+    return refuse('tree_size_out_of_range');
+  }
+  // At the cut-over size both keys must sign the very tree the old key handed over.
+  const rootIs = (h: LogKeyHandover): boolean => {
+    const a = isHex32(sth.root_hash) ? parseHash(sth.root_hash) : null;
+    const b = parseHash(h.root_hash);
+    return !!a && !!b && bytesEqual(a, b);
+  };
+  if (e.handover && n === e.from_tree_size && !rootIs(e.handover)) return refuse('root_mismatch');
+  const next = keys[idx + 1];
+  if (next?.handover && n === e.until_tree_size && !rootIs(next.handover)) return refuse('root_mismatch');
+
+  out.valid = true;
+  out.key_id = e.key_id;
+  out.log_id = doc.log_id;
+  out.tree_size = n;
+  return out;
+}
+
 /** Verify an STH's Ed25519 signature against the pinned `logKeys` only.
  *  If the STH names `signature.key_id`, only that pinned key is tried;
  *  otherwise (legacy dialect, unless `requireKeyId`) each usable pinned key
- *  is tried. A key or STH bound to a different log_id than expected fails. */
+ *  is tried. A key or STH bound to a different log_id than expected fails.
+ *
+ *  `logKeys` may instead be a key document (`LogKeyDoc`, e.g. PINNED_LOG_KEYS):
+ *  then the ADR-047 §7 rules apply (see verifySthDoc and the header). The
+ *  head must name its key, the key must cover the head's tree size, and a
+ *  refusal carries the CLI's fixed string as `reason`. `requireKeyId` is
+ *  moot in that mode (always required) and no time window is applied. */
 export async function verifySth(
   sth: unknown,
-  logKeys: LogKeyEntry[] | undefined,
+  logKeys: LogKeyEntry[] | LogKeyDoc | undefined,
   opts: SthOptions = {},
 ): Promise<SthResult> {
+  if (isKeyDoc(logKeys)) return verifySthDoc(sth, logKeys, opts);
   const errors: string[] = [];
   const out: SthResult = { valid: false, errors };
   // Key load first: a mixed log-key set is refused before the STH is read.

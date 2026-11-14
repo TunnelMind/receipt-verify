@@ -811,3 +811,153 @@ test('checkLogKeyDoc: the first key must be a non-revoked receipt key; malformed
 
   for (const bad of [undefined, 42, { keys: 'x' }]) assert.equal(await checkLogKeyDoc(bad), 'bad_doc');
 });
+
+// ── Key document: the library head check against the CLI's (ADR-047 §7) ─────
+// verifySth(sth, doc) must refuse exactly the heads the CLI's checkSthKey
+// refuses, with the same reason. Heads are in the live dialect: log_id and
+// signature.key_id always; a top-level key_id only on an own-key head.
+
+async function kdHead(signer, { key_id, tree_size, root_hash = 'ab'.repeat(32), own = false, log_id = KD_LOG_ID, body: extra = {}, sig = {} }) {
+  const body = { log_id, tree_size, root_hash, timestamp: new Date().toISOString(), ...(own && { key_id }), ...extra };
+  return { ...body, signature: { algorithm: 'Ed25519', key_id, ...sig, value: await kdSign(signer, body) } };
+}
+const kdSharedHead = (receipt, tree_size, o = {}) => kdHead(receipt, { key_id: KD_RECEIPT_KID, tree_size, ...o });
+const kdOwnHead = (log, tree_size, o = {}) => kdHead(log, { key_id: KD_LOG_KID, tree_size, own: true, ...o });
+
+test('verifySth key document: a live-dialect shared head is valid under a one-entry document', async () => {
+  const receipt = await makeEphemeralKey();
+  const receiptKeys = [{ key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64 }];
+  // Shaped like PINNED_LOG_KEYS: one shared entry, from 0, open-ended.
+  const doc = kdOneEntryDoc(receipt);
+  doc.keys[0].shared_with_receipts = true;
+  assert.deepEqual(Object.keys(doc.keys[0]).sort(), Object.keys(PINNED_LOG_KEYS.keys[0]).sort());
+
+  const head = await kdSharedHead(receipt, 1234, { root_hash: `0x${'ab'.repeat(32)}` });
+  assert.equal('key_id' in head, false);
+  const r = await verifySth(head, doc, { receiptKeys });
+  assert.deepEqual(r, {
+    valid: true, errors: [], log_key: 'shared_with_receipts',
+    key_id: KD_RECEIPT_KID, log_id: KD_LOG_ID, tree_size: 1234,
+  });
+  assert.equal(r.reason, undefined);
+  assert.equal(oracle.checkSthKey(head, doc, receipt.publicKeyB64), null);
+});
+
+test('verifySth key document: under the real PINNED_LOG_KEYS a tm-log-* head and a forged receipt-key head are refused', async () => {
+  const attacker = await makeEphemeralKey();
+  const log_id = PINNED_LOG_KEYS.log_id;
+  // Default anchor: the pinned receipt bundle.
+  const own = await verifySth(await kdHead(attacker, { key_id: 'tm-log-2026-11', tree_size: 9, own: true, log_id }), PINNED_LOG_KEYS);
+  assert.equal(own.valid, false);
+  assert.equal(own.reason, 'unknown_key_id');
+  assert.deepEqual(own.errors, ['unknown_key_id']);
+  const forged = await verifySth(await kdHead(attacker, { key_id: 'tm-receipt-2026-05', tree_size: 9, log_id }), PINNED_LOG_KEYS);
+  assert.equal(forged.valid, false);
+  assert.equal(forged.reason, 'bad_signature');
+  assert.equal(forged.log_key, 'shared_with_receipts');
+});
+
+test('verifySth key document: an own-key head is valid above the cut-over and at it with the handed-over root', async () => {
+  const receipt = await makeEphemeralKey();
+  const log = await makeEphemeralKey();
+  const receiptKeys = [{ key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64 }];
+  const doc = await kdTwoEntryDoc(receipt, log);
+  for (const head of [
+    await kdOwnHead(log, KD_M + 4),
+    await kdOwnHead(log, KD_M, { root_hash: KD_ROOT_M }),
+    await kdOwnHead(log, KD_M, { root_hash: `0x${KD_ROOT_M.toUpperCase()}` }),
+  ]) {
+    assert.deepEqual(await verifySth(head, doc, { receiptKeys }), {
+      valid: true, errors: [], log_key: 'separate',
+      key_id: KD_LOG_KID, log_id: KD_LOG_ID, tree_size: head.tree_size,
+    });
+  }
+  // The receipt key still signs up to and including the cut-over size.
+  const shared = await verifySth(await kdSharedHead(receipt, KD_M, { root_hash: KD_ROOT_M }), doc, { receiptKeys });
+  assert.equal(shared.valid, true);
+  assert.equal(shared.log_key, 'shared_with_receipts');
+});
+
+test('verifySth key document: the same reason as the CLI on every head vector (FR-008)', async () => {
+  const receipt = await makeEphemeralKey();
+  const log = await makeEphemeralKey();
+  const attacker = await makeEphemeralKey();
+  const pin = receipt.publicKeyB64;
+  const receiptKeys = [{ key_id: KD_RECEIPT_KID, public_key: pin }];
+  const one = kdOneEntryDoc(receipt);
+  const two = await kdTwoEntryDoc(receipt, log);
+  const { signature, ...unsigned } = await kdSharedHead(receipt, 3);
+  const { log_id: _l, ...noLogId } = await kdSharedHead(receipt, 3);
+  const ownAtM = await kdOwnHead(log, KD_M, { root_hash: KD_ROOT_M });
+
+  // [name, head, document]
+  const vectors = [
+    ['shared head, one entry', await kdSharedHead(receipt, 3), one],
+    ['shared head far out, one entry', await kdSharedHead(receipt, 1000), one],
+    ['shared head below m', await kdSharedHead(receipt, 3), two],
+    ['shared head at m, hand-over root', await kdSharedHead(receipt, KD_M, { root_hash: KD_ROOT_M }), two],
+    ['own head at m, hand-over root', ownAtM, two],
+    ['own head at m, 0x root', await kdOwnHead(log, KD_M, { root_hash: `0x${KD_ROOT_M}` }), two],
+    ['own head above m', await kdOwnHead(log, KD_M + 4), two],
+    ['own head carrying its key', await kdOwnHead(log, KD_M + 1, { sig: { public_key: log.publicKeyB64 } }), two],
+    ['document without a hand-over', await kdSharedHead(receipt, 3), { ...two, keys: [two.keys[0], { ...two.keys[1], handover: undefined }] }],
+    ['document with no keys', await kdSharedHead(receipt, 3), { ...two, keys: [] }],
+    ['document from an attacker', await kdOwnHead(log, KD_M + 1), await kdTwoEntryDoc(attacker, log)],
+    ['no signature', unsigned, two],
+    ['signature not an object', { ...unsigned, signature: 'x' }, two],
+    ['signature without key_id', { ...unsigned, signature: { ...signature, key_id: undefined } }, two],
+    ['another log', await kdSharedHead(receipt, 3, { log_id: 'other-log' }), two],
+    ['no log_id', noLogId, two],
+    ['top-level key_id is not the signature key_id', await kdHead(log, { key_id: KD_LOG_KID, tree_size: KD_M + 1, body: { key_id: KD_RECEIPT_KID } }), two],
+    ['top-level key_id undefined', { ...await kdSharedHead(receipt, 3), key_id: undefined }, two],
+    ['unknown key id', await kdHead(attacker, { key_id: 'tm-log-2027-01', tree_size: 3, own: true }), two],
+    ['log-key head without top-level key_id', await kdHead(log, { key_id: KD_LOG_KID, tree_size: KD_M + 1 }), two],
+    ['signature carries another key', { ...ownAtM, signature: { ...ownAtM.signature, public_key: pin } }, two],
+    ['signature carries junk for a key', { ...ownAtM, signature: { ...ownAtM.signature, public_key: 42 } }, two],
+    ['attacker under the receipt key id', await kdSharedHead(attacker, 3), two],
+    ['attacker under the log key id', await kdOwnHead(attacker, KD_M + 1), two],
+    ['wrong algorithm', await kdSharedHead(receipt, 3, { sig: { algorithm: 'RSA' } }), two],
+    ['body changed after signing', { ...await kdSharedHead(receipt, 3), tree_size: 4 }, two],
+    ['lone surrogate in the body', { ...await kdSharedHead(receipt, 3), note: '\ud800' }, two],
+    ['receipt key above m', await kdSharedHead(receipt, KD_M + 1), two],
+    ['log key below m', await kdOwnHead(log, KD_M - 1), two],
+    ['string tree size', await kdSharedHead(receipt, '3'), two],
+    ['receipt key at m, another root', await kdSharedHead(receipt, KD_M), two],
+    ['log key at m, another root', await kdOwnHead(log, KD_M), two],
+    ['log key at m, root not hex', await kdOwnHead(log, KD_M, { root_hash: 'zz' }), two],
+  ];
+  const seen = new Set();
+  for (const [name, sth, doc] of vectors) {
+    const want = oracle.checkSthKey(sth, doc, pin);
+    const r = await verifySth(sth, doc, { receiptKeys });
+    assert.deepEqual(r.reason ?? null, want, name);
+    assert.equal(r.valid, want === null, name);
+    assert.deepEqual(r.errors, want === null ? [] : [want], name);
+    seen.add(want);
+  }
+  for (const reason of [
+    null, 'invalid_key_doc', 'first_key_not_pinned', 'no_signature', 'log_id_mismatch',
+    'key_id_mismatch', 'unknown_key_id', 'key_id_missing', 'public_key_mismatch',
+    'bad_signature', 'tree_size_out_of_range', 'root_mismatch',
+  ]) assert.ok(seen.has(reason), `no vector reaches ${reason}`);
+});
+
+test('verifySth key document: junk input is a reason, never a throw; opts.logId must be the document log', async () => {
+  const receipt = await makeEphemeralKey();
+  const receiptKeys = [{ key_id: KD_RECEIPT_KID, public_key: receipt.publicKeyB64 }];
+  const doc = kdOneEntryDoc(receipt);
+  for (const junk of [null, 42, [], {}, undefined, 'x']) {
+    const r = await verifySth(junk, doc, { receiptKeys });
+    assert.equal(r.valid, false);
+    assert.equal(typeof r.reason, 'string');
+    assert.equal(r.reason, oracle.checkSthKey(junk, doc, receipt.publicKeyB64));
+  }
+  // A document with junk inside still resolves.
+  assert.equal((await verifySth({}, { keys: [null] }, { receiptKeys })).reason, 'invalid_key_doc');
+
+  const head = await kdSharedHead(receipt, 3);
+  assert.equal((await verifySth(head, doc, { receiptKeys, logId: KD_LOG_ID })).valid, true);
+  const other = await verifySth(head, doc, { receiptKeys, logId: 'other-log' });
+  assert.equal(other.valid, false);
+  assert.equal(other.reason, 'log_id_mismatch');
+});
