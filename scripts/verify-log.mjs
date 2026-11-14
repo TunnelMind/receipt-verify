@@ -16,8 +16,8 @@
 // 2 on bad usage.
 //
 // Usage:
-//   node scripts/verify-log.mjs inclusion   <proof.json> [sth.json] --key <public_key_b64> --receipt <receipt.json>
-//   node scripts/verify-log.mjs consistency <proof.json> <older_sth.json> <newer_sth.json> --key <public_key_b64>
+//   node scripts/verify-log.mjs inclusion   <proof.json> [sth.json] (--key <public_key_b64> | --log-keys <doc.json> --receipt-key=<b64>) --receipt <receipt.json>
+//   node scripts/verify-log.mjs consistency <proof.json> <older_sth.json> <newer_sth.json> (--key <public_key_b64> | --log-keys <doc.json> --receipt-key=<b64>)
 //   node scripts/verify-log.mjs sth         <sth.json> <public_key_b64> [--receipt-key=<b64> [--allow-shared]]
 //   node scripts/verify-log.mjs sth         <sth.json> --log-keys <doc.json> --receipt-key=<b64>
 //   node scripts/verify-log.mjs handover    <doc.json> --receipt-key=<b64>
@@ -58,6 +58,16 @@
 // stripped, matching the sequencer's `leaf = SHA-256(0x00 || JCS(receipt))`
 // (verdict receipts are logged with their self-verification triple) — the proof's
 // leaf_hash is ignored. Missing --key, --receipt or an STH exits 2.
+//
+// inclusion / consistency --log-keys: for a log whose signing key was handed
+// over, give the key document instead of --key. Each head is then checked
+// against the document exactly as `sth --log-keys` checks it (anchored on
+// --receipt-key, key chosen by signature.key_id, tree size inside that key's
+// range), so a consistency proof may run from a head under the first key to a
+// head under the handed-over key. Nothing else changes: roots and sizes still
+// come from the heads. Output gains "reason" (the head check's, or null).
+// Exactly one of --key and --log-keys; both, neither, or --log-keys without
+// --receipt-key exits 2.
 
 import { createHash, verify as edVerify, createPublicKey } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -255,8 +265,8 @@ export function checkSthKey(sth, doc, receiptKeyB64) {
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
-const USAGE = 'usage: verify-log.mjs inclusion <proof.json> [sth.json] --key <b64> --receipt <receipt.json>'
-  + ' | consistency <proof.json> <older_sth.json> <newer_sth.json> --key <b64>'
+const USAGE = 'usage: verify-log.mjs inclusion <proof.json> [sth.json] (--key <b64> | --log-keys <doc.json> --receipt-key=<b64>) --receipt <receipt.json>'
+  + ' | consistency <proof.json> <older_sth.json> <newer_sth.json> (--key <b64> | --log-keys <doc.json> --receipt-key=<b64>)'
   + ' | sth <sth.json> <public_key_b64> [--receipt-key=<b64> [--allow-shared]]'
   + ' | sth <sth.json> --log-keys <doc.json> --receipt-key=<b64> | handover <doc.json> --receipt-key=<b64>'
   + " (use the '=' form: a key starting with '-' is refused otherwise)";
@@ -276,12 +286,18 @@ function main() {
   const [mode, ...args] = positionals;
   const load = (p) => JSON.parse(readFileSync(p, 'utf8'));
   const unwrap = (j) => (j && j.ok === true && j.data ? j.data : j);
+  // inclusion / consistency take exactly one trust anchor: --key (one pinned
+  // log key), or --log-keys anchored on --receipt-key exactly as `sth
+  // --log-keys` (no pin, no verification: the document alone proves nothing).
+  const docMode = values['log-keys'] !== undefined;
+  const anchorOk = docMode ? values.key === undefined && !!values['receipt-key'] : !!values.key;
+  const ANCHOR = '--key <public_key_b64> or --log-keys <doc.json> --receipt-key=<b64> (not both)';
 
   if (mode === 'inclusion') {
     const p = unwrap(load(args[0]));
     const sth = args[1] ? unwrap(load(args[1])) : p.sth;
-    if (!values.key || !values.receipt || !sth) {
-      console.error('inclusion requires --key <public_key_b64>, --receipt <receipt.json> and an STH (arg 2 or proof.sth)');
+    if (!anchorOk || !values.receipt || !sth) {
+      console.error(`inclusion requires ${ANCHOR}, --receipt <receipt.json> and an STH (arg 2 or proof.sth)\n${USAGE}`);
       process.exit(2);
     }
     // Accept a bare receipt, a { receipt }, or a /v1/verdict-style response.
@@ -291,23 +307,32 @@ function main() {
       leafIndex: p.leaf_index, treeSize: p.tree_size,
       leaf: leafHash(Buffer.from(jcs(receipt))), path: p.audit_path.map(unhex), root: unhex(p.root_hash),
     });
-    const okSig = verifySth(sth, values.key)
+    // Only the head-signature step differs by mode; the head must match the proof either way.
+    const reason = docMode ? checkSthKey(sth, unwrap(load(values['log-keys'])), values['receipt-key']) : null;
+    const okSig = (docMode ? reason === null : verifySth(sth, values.key))
       && sth.root_hash === p.root_hash && sth.tree_size === p.tree_size;
-    console.log(JSON.stringify({ inclusion: okIncl, sth_signature: okSig }));
+    console.log(JSON.stringify({ inclusion: okIncl, sth_signature: okSig, ...(docMode && { reason }) }));
     process.exit(okIncl && okSig ? 0 : 1);
   }
   if (mode === 'consistency') {
-    // The roots come from the two STHs, each verified under the pinned --key;
+    // The roots come from the two STHs, each verified under the pinned --key
+    // (or, with --log-keys, each on its own against the key document: the
+    // older may be under the first key, the newer under the handed-over one);
     // the proof's own first_root/second_root are only checked against them.
     // A proof alone is self-consistent by construction and proves nothing.
-    if (!values.key || args.length !== 3) {
-      console.error('consistency requires <proof.json> <older_sth.json> <newer_sth.json> --key <public_key_b64>');
+    if (!anchorOk || args.length !== 3) {
+      console.error(`consistency requires <proof.json> <older_sth.json> <newer_sth.json> and ${ANCHOR}\n${USAGE}`);
       process.exit(2);
     }
     const p = unwrap(load(args[0]));
     const older = unwrap(load(args[1]));
     const newer = unwrap(load(args[2]));
-    const okSigs = verifySth(older, values.key) && verifySth(newer, values.key);
+    let reason = null;
+    if (docMode) {
+      const doc = unwrap(load(values['log-keys']));
+      reason = checkSthKey(older, doc, values['receipt-key']) ?? checkSthKey(newer, doc, values['receipt-key']);
+    }
+    const okSigs = docMode ? reason === null : verifySth(older, values.key) && verifySth(newer, values.key);
     const rootsAgree = (p.first_root === undefined || String(p.first_root).replace(/^0x/, '') === String(older.root_hash).replace(/^0x/, ''))
       && (p.second_root === undefined || String(p.second_root).replace(/^0x/, '') === String(newer.root_hash).replace(/^0x/, ''));
     const sizesAgree = p.first === older.tree_size && p.second === newer.tree_size;
@@ -316,7 +341,7 @@ function main() {
       firstRoot: unhex(older.root_hash), secondRoot: unhex(newer.root_hash),
       proof: (p.proof ?? []).map(unhex),
     });
-    console.log(JSON.stringify({ consistency: okc, sth_signatures: okSigs }));
+    console.log(JSON.stringify({ consistency: okc, sth_signatures: okSigs, ...(docMode && { reason }) }));
     process.exit(okc ? 0 : 1);
   }
   if (mode === 'sth' && values['log-keys'] !== undefined) {

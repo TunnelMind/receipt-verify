@@ -625,3 +625,134 @@ test('CLI sth <sth> <pub>: --receipt-key reports own / shared_with_receipts; wit
   assert.equal(runOut(['sth', sth, pub, `--receipt-key=${toB64Url(pub)}`]).status, 2);
   assert.equal(runOut(['sth', sth, pub, '--receipt-key=']).status, 2);
 });
+
+// ── inclusion / consistency across a key cut-over (--log-keys) ───────────────
+
+// Recursive RFC 6962 reference tree, copied from test/log.test.mjs (MTH, PATH, PROOF).
+import { createHash } from 'node:crypto';
+const H = (...parts) => { const h = createHash('sha256'); for (const p of parts) h.update(p); return h.digest(); };
+const refLeaf = (data) => H(Buffer.from([0]), data);
+const refNode = (l, r) => H(Buffer.from([1]), l, r);
+const splitK = (n) => { let k = 1; while (k * 2 < n) k *= 2; return k; };
+function MTH(D) {
+  if (D.length === 0) return H(Buffer.alloc(0));
+  if (D.length === 1) return D[0];
+  const k = splitK(D.length);
+  return refNode(MTH(D.slice(0, k)), MTH(D.slice(k)));
+}
+function PATH(m, D) {
+  if (D.length <= 1) return [];
+  const k = splitK(D.length);
+  return m < k ? [...PATH(m, D.slice(0, k)), MTH(D.slice(k))]
+               : [...PATH(m - k, D.slice(k)), MTH(D.slice(0, k))];
+}
+function SUBPROOF(m, D, b) {
+  if (m === D.length) return b ? [] : [MTH(D)];
+  const k = splitK(D.length);
+  return m <= k ? [...SUBPROOF(m, D.slice(0, k), b), MTH(D.slice(k))]
+                : [...SUBPROOF(m - k, D.slice(k), false), MTH(D.slice(0, k))];
+}
+const PROOF = (m, D) => SUBPROOF(m, D, true);
+const hex = (b) => Buffer.from(b).toString('hex');
+
+// An 8-leaf log cut over at KD_M: the receipt key signs heads up to KD_M, the
+// log key from KD_M on, and the hand-over carries the true root at KD_M. Leaf
+// KD_M + 1 is a real receipt, so it is only ever under a log-key head.
+async function makeCutOverLog() {
+  const dir = mkdtempSync(join(tmpdir(), 'cli-test-'));
+  const f = (name, obj) => { const p = join(dir, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+  const { receipt, log, attacker } = await makeKeyDocKeys();
+  const { receipt: logged } = await makeVerdict();
+  const index = KD_M + 1;
+  const D = Array.from({ length: 8 }, (_, i) => (i === index ? leafHash(Buffer.from(jcs(logged))) : refLeaf(Buffer.from(`leaf-${i}`))));
+  const root = (n) => hex(MTH(D.slice(0, n)));
+  const doc = await makeTwoEntryDoc(receipt, log, await makeHandover(receipt, log, { root_hash: root(KD_M) }));
+  return {
+    f, D, root, index, receipt, log,
+    docPath: f('log-keys.json', doc),
+    receiptPath: f('receipt.json', logged),
+    pin: `--receipt-key=${receipt.publicKeyB64}`,
+    wrongPin: `--receipt-key=${attacker.publicKeyB64}`,
+    shared: (n) => sharedHead(receipt, n, { root_hash: root(n) }),
+    own: (n) => ownHead(log, n, { root_hash: root(n) }),
+    // The /v1/receipts/log/consistency `data` shape for sizes a -> b.
+    consistencyProof: (a, b) => ({ first: a, second: b, first_root: root(a), second_root: root(b), proof: PROOF(a, D.slice(0, b)).map(hex) }),
+  };
+}
+
+test('CLI consistency --log-keys: a receipt-key head <= m to a log-key head > m passes', async () => {
+  const t = await makeCutOverLog();
+  const ok = { status: 0, stdout: '{"consistency":true,"sth_signatures":true,"reason":null}\n' };
+  const cons = (name, a, b, older, newer, pin = t.pin) => runOut(['consistency', t.f(`${name}-proof.json`, t.consistencyProof(a, b)),
+    t.f(`${name}-older.json`, older), t.f(`${name}-newer.json`, newer), '--log-keys', t.docPath, pin]);
+
+  // Below the cut-over, and at it (where the head must carry the hand-over root).
+  assert.deepEqual(cons('below', 3, 8, await t.shared(3), await t.own(8)), ok);
+  assert.deepEqual(cons('at', KD_M, 8, await t.shared(KD_M), await t.own(8)), ok);
+  // Both heads under the log key, and both under the receipt key.
+  assert.deepEqual(cons('own', KD_M, 8, await t.own(KD_M), await t.own(8)), ok);
+  assert.deepEqual(cons('old', 3, KD_M, await t.shared(3), await t.shared(KD_M)), ok);
+
+  // A document that is not anchored on the pinned receipt key proves nothing.
+  assert.deepEqual(cons('pin', 3, 8, await t.shared(3), await t.own(8), t.wrongPin),
+    { status: 1, stdout: '{"consistency":false,"sth_signatures":false,"reason":"first_key_not_pinned"}\n' });
+  // Heads are good but the proof is for another pair of sizes.
+  const r = runOut(['consistency', t.f('other-proof.json', t.consistencyProof(4, 8)),
+    t.f('other-older.json', await t.shared(3)), t.f('other-newer.json', await t.own(8)), '--log-keys', t.docPath, t.pin]);
+  assert.deepEqual(r, { status: 1, stdout: '{"consistency":false,"sth_signatures":true,"reason":null}\n' });
+});
+
+test('CLI consistency --log-keys: a receipt-key head > m fails as either head (tree_size_out_of_range)', async () => {
+  const t = await makeCutOverLog();
+  const refused = { status: 1, stdout: '{"consistency":false,"sth_signatures":false,"reason":"tree_size_out_of_range"}\n' };
+  const cons = (name, a, b, older, newer) => runOut(['consistency', t.f(`${name}-proof.json`, t.consistencyProof(a, b)),
+    t.f(`${name}-older.json`, older), t.f(`${name}-newer.json`, newer), '--log-keys', t.docPath, t.pin]);
+
+  // The retired key signing past its range: true roots, valid proof, still refused.
+  assert.deepEqual(cons('older', KD_M + 1, 8, await t.shared(KD_M + 1), await t.own(8)), refused);
+  assert.deepEqual(cons('newer', 3, 8, await t.shared(3), await t.shared(8)), refused);
+  assert.deepEqual(cons('both', KD_M + 1, 8, await t.shared(KD_M + 1), await t.shared(8)), refused);
+});
+
+test('CLI inclusion --log-keys: a receipt under a log-key head passes; a wrong pin is first_key_not_pinned', async () => {
+  const t = await makeCutOverLog();
+  const proof = { leaf_index: t.index, tree_size: 8, audit_path: PATH(t.index, t.D).map(hex), root_hash: t.root(8) };
+  const head = await t.own(8);
+  const embedded = t.f('proof.json', { ...proof, sth: head });
+  const incl = (...args) => runOut(['inclusion', ...args, '--receipt', t.receiptPath]);
+  const ok = { status: 0, stdout: '{"inclusion":true,"sth_signature":true,"reason":null}\n' };
+
+  assert.deepEqual(incl(embedded, '--log-keys', t.docPath, t.pin), ok);
+  // The head as a separate file (arg 2).
+  assert.deepEqual(incl(t.f('bare-proof.json', proof), t.f('sth.json', head), '--log-keys', t.docPath, t.pin), ok);
+  assert.deepEqual(incl(embedded, '--log-keys', t.docPath, t.wrongPin),
+    { status: 1, stdout: '{"inclusion":true,"sth_signature":false,"reason":"first_key_not_pinned"}\n' });
+  // The same tree signed by the retired receipt key.
+  assert.deepEqual(incl(t.f('late.json', { ...proof, sth: await t.shared(8) }), '--log-keys', t.docPath, t.pin),
+    { status: 1, stdout: '{"inclusion":true,"sth_signature":false,"reason":"tree_size_out_of_range"}\n' });
+  // A valid log-key head for a different tree size does not cover this proof.
+  assert.deepEqual(incl(t.f('bare-proof.json', proof), t.f('sth7.json', await t.own(7)), '--log-keys', t.docPath, t.pin),
+    { status: 1, stdout: '{"inclusion":true,"sth_signature":false,"reason":null}\n' });
+});
+
+test('CLI inclusion / consistency: exactly one of --key and --log-keys, and --log-keys needs --receipt-key (exit 2)', async () => {
+  const t = await makeCutOverLog();
+  const proof = { leaf_index: t.index, tree_size: 8, audit_path: PATH(t.index, t.D).map(hex), root_hash: t.root(8) };
+  const incl = ['inclusion', t.f('proof.json', { ...proof, sth: await t.own(8) }), '--receipt', t.receiptPath];
+  const cons = ['consistency', t.f('c-proof.json', t.consistencyProof(3, 8)), t.f('older.json', await t.shared(3)), t.f('newer.json', await t.own(8))];
+  const key = ['--key', t.log.publicKeyB64];
+  const docArg = ['--log-keys', t.docPath];
+
+  for (const base of [incl, cons]) {
+    assert.equal(runOut([...base, ...docArg, t.pin]).status, 0, base[0]);
+    assert.equal(runOut([...base, ...key, ...docArg, t.pin]).status, 2, `${base[0]}: both`);
+    assert.equal(runOut([...base, ...key, ...docArg]).status, 2, `${base[0]}: both, no pin`);
+    assert.equal(runOut(base).status, 2, `${base[0]}: neither`);
+    assert.equal(runOut([...base, t.pin]).status, 2, `${base[0]}: pin alone`);
+    assert.equal(runOut([...base, ...docArg]).status, 2, `${base[0]}: no pin`);
+    assert.equal(runOut([...base, ...docArg, '--receipt-key=']).status, 2, `${base[0]}: empty pin`);
+  }
+  // Document mode keeps the other requirements: a receipt for inclusion, three files for consistency.
+  assert.equal(runOut([...incl.slice(0, 2), ...docArg, t.pin]).status, 2);
+  assert.equal(runOut([...cons.slice(0, 3), ...docArg, t.pin]).status, 2);
+});
