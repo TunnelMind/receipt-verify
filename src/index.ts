@@ -23,7 +23,7 @@ import {
   keyUsableAt,
   type AttestationStrength,
 } from './keys.js';
-import { PINNED_KEY_BUNDLE } from './pinned-keys.js';
+import { PINNED_KEY_BUNDLE, PINNED_LOG_KEYS } from './pinned-keys.js';
 import { b64ToBytes, signatureBytes, toAB } from './bytes.js';
 import {
   fetchRevocations,
@@ -33,6 +33,8 @@ import {
 } from './revocation.js';
 import {
   verifyReceiptInclusion,
+  fetchInclusionProof,
+  LogProofUnavailable,
   type InclusionProof,
   type LogKeyEntry,
   type LogKeyDoc,
@@ -133,12 +135,13 @@ export interface VerifyOptions {
   previous?: Receipt;
   /** Custom fetch (e.g., for offline tests). */
   fetcher?: typeof fetch;
-  /** Transparency-log inclusion. When given, the receipt must be proven in
-   *  the log: `sth` (else `proof.sth`) must verify under the pinned
-   *  `logKeys` (never the receipt bundle), match the proof, and the audit
-   *  path must lead from the receipt's recomputed leaf to the signed root.
-   *  A failed proof is always an error. `logKeys` may be the log's key
-   *  document (e.g. PINNED_LOG_KEYS) instead of a key array. See log.ts. */
+  /** Transparency-log inclusion from a proof you already hold (offline
+   *  callers, other logs): `sth` (else `proof.sth`) must verify under the
+   *  pinned `logKeys` (never the receipt bundle), match the proof, and the
+   *  audit path must lead from the receipt's recomputed leaf to the signed
+   *  root. A failed proof is always an error. `logKeys` may be the log's key
+   *  document (e.g. PINNED_LOG_KEYS) instead of a key array. See log.ts.
+   *  Without it, see `requireInclusion`. */
   inclusion?: {
     proof: InclusionProof;
     sth?: SignedTreeHead;
@@ -147,11 +150,27 @@ export interface VerifyOptions {
     requireKeyId?: boolean;
     logId?: string;
   };
-  /** Make a missing inclusion proof an error. Default false in 2.x, because
-   *  the log does not yet issue inclusion promises and a freshly issued
-   *  receipt has no proof until the next tree head; `result.log.status`
-   *  reports `not_checked` so callers can see the gap either way. */
+  /** Inclusion is required by default (4.0.0): a receipt that is not proven
+   *  in the transparency log is invalid. With no `inclusion` given and the
+   *  pinned key bundle in use, the proof is fetched from `logProofUrl` by
+   *  receipt_id and checked under PINNED_LOG_KEYS; a failed fetch (a
+   *  receipt not sequenced yet, for one) is an error. With `keys` or
+   *  `keysUrl` (another issuer) nothing is fetched: pass `inclusion`.
+   *  UNSAFE to set false: the signature is then checked but log membership
+   *  is NOT, so a receipt the issuer never logged verifies; `result.log.status`
+   *  reports `not_checked`. */
   requireInclusion?: boolean;
+  /** Override the proof endpoint used when `inclusion` is not given
+   *  (default DEFAULT_LOG_PROOF_URL). Fetched with `fetcher`. */
+  logProofUrl?: string;
+  /** Deadline (RFC 3339): the receipt must be proven in a tree head whose
+   *  signed timestamp is at or before it, e.g. a commit that must be logged
+   *  before a market closes. A proof against a later head fails, though the
+   *  receipt may sit in an earlier one: pass a proof against a head signed by
+   *  then (the default fetch only gets the latest head). A receipt still
+   *  `pending` after the deadline fails. The head's timestamp is the log's
+   *  claim, signed by the log key. */
+  includedBy?: string;
 }
 
 export interface VerifyResult {
@@ -162,10 +181,12 @@ export interface VerifyResult {
   receipt_id?: string;
   key_id?: string;
   attestation_strength?: AttestationStrength;
-  /** Transparency-log status: `included` (proven under a pinned log key),
-   *  `failed` (a proof was given and did not verify), or `not_checked` (no
-   *  proof given: the signature is checked, log membership is NOT). */
-  log: { status: LogStatus; tree_size?: number; leaf_index?: number; log_key_id?: string; log_key?: LogKeyMode };
+  /** Transparency-log status (log.ts LogStatus): `included` (proven under a
+   *  pinned log key), `pending` (logged, not in a signed head yet: verify
+   *  again later), `absent` (the log has no record), `failed` (a proof did not
+   *  verify or missed `includedBy`), or `not_checked` (no proof). Every status
+   *  but `included` is an error unless requireInclusion was false. */
+  log: { status: LogStatus; tree_size?: number; leaf_index?: number; log_key_id?: string; log_key?: LogKeyMode; sth_timestamp?: string };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -210,9 +231,10 @@ function buildSigningObject(receipt: Receipt): JsonValue {
  *   6. optional revocation check (key + receipt)
  *   7. chain sequence sanity (warn-only); with opts.previous, the hash link
  *      and sequence+1 are checked and mismatches are errors
- *   8. with opts.inclusion, transparency-log inclusion under pinned log
- *      keys (result.log.status); with opts.requireInclusion, a missing
- *      proof is an error
+ *   8. transparency-log inclusion under pinned log keys (result.log.status):
+ *      opts.inclusion, else a proof fetched by receipt_id (pinned bundle
+ *      only); anything but `included` is an error unless requireInclusion:
+ *      false; with opts.includedBy the proving head must be dated by then
  */
 /** Push one error per number anywhere in `v` that fails Number.isSafeInteger
  *  (-0 passes). Mirrors rune-record check_numbers. */
@@ -471,10 +493,48 @@ export async function verifyReceipt(
     }
   }
 
-  // 8. Transparency-log inclusion (log.ts). The leaf is the receipt exactly
-  // as supplied; the root comes only from an STH under a pinned log key.
-  if (opts.inclusion) {
-    const inc = opts.inclusion;
+  // 8. Transparency-log inclusion (log.ts), required unless the caller opts
+  // out. The leaf is the receipt exactly as supplied; the root comes only
+  // from an STH under a pinned log key, so a fetched proof is no more
+  // trusted than a supplied one.
+  let deadline: number | undefined;
+  if (opts.includedBy !== undefined) {
+    deadline = Date.parse(opts.includedBy);
+    if (!Number.isFinite(deadline)) errors.push(`includedBy: not a valid date: ${String(opts.includedBy)}`);
+  }
+  const pastDeadline = deadline !== undefined && Number.isFinite(deadline) && Date.now() > deadline;
+  let inc = opts.inclusion;
+  if (!inc && opts.requireInclusion !== false) {
+    // Fetch only for TunnelMind's own receipts: another issuer's receipt
+    // is not in this log, and its id would leak to it.
+    if (bundle === PINNED_KEY_BUNDLE) {
+      try {
+        const proof = await fetchInclusionProof(receipt.receipt_id, { url: opts.logProofUrl, fetcher: opts.fetcher });
+        inc = { proof, logKeys: PINNED_LOG_KEYS, logId: PINNED_LOG_KEYS.log_id };
+      } catch (e) {
+        const kind = e instanceof LogProofUnavailable ? e.kind : 'unavailable';
+        const msg = (e as Error).message;
+        // Pending is never a pass: until a signed head holds the receipt, a
+        // key holder could still be withholding it. Past the deadline it can
+        // no longer be logged in time, so it is a failure, not a wait.
+        if (kind === 'pending' && pastDeadline) {
+          out.log = { status: 'failed' };
+          errors.push(`log inclusion: not in a tree head signed by includedBy ${opts.includedBy}: ${msg}`);
+        } else if (kind === 'pending') {
+          out.log = { status: 'pending' };
+          errors.push(`log inclusion: pending: ${msg}; verify again after the next head`);
+        } else if (kind === 'absent') {
+          out.log = { status: 'absent' };
+          errors.push(`log inclusion: ${msg}`);
+        } else {
+          errors.push(`log inclusion: proof fetch failed: ${msg}`);
+        }
+      }
+    } else {
+      errors.push('log inclusion: required but no inclusion proof was supplied (pass inclusion, or requireInclusion: false)');
+    }
+  }
+  if (inc) {
     // Receipt keys = the bundle in use plus the pinned one, so a log key
     // that is also a receipt key is caught whichever bundle signed.
     const receiptKeys = [...(Array.isArray(bundle?.keys) ? bundle.keys : []), ...PINNED_KEY_BUNDLE.keys];
@@ -489,8 +549,20 @@ export async function verifyReceipt(
     if (r.log_key_id !== undefined) out.log.log_key_id = r.log_key_id;
     if (r.log_key !== undefined) out.log.log_key = r.log_key;
     for (const e of r.errors) errors.push(`log inclusion: ${e}`);
-  } else if (opts.requireInclusion) {
-    errors.push('log inclusion: required but no inclusion proof was supplied');
+    // The head that proved it: inc.sth, else proof.sth (as verifyReceiptInclusion).
+    const head = (inc.sth ?? (inc.proof as InclusionProof | undefined)?.sth) as SignedTreeHead | undefined;
+    const headTs = typeof head?.timestamp === 'string' ? head.timestamp : undefined;
+    if (r.status === 'included' && headTs !== undefined) out.log.sth_timestamp = headTs;
+    if (r.status === 'included' && deadline !== undefined && Number.isFinite(deadline)) {
+      const headMs = headTs === undefined ? NaN : Date.parse(headTs);
+      if (!Number.isFinite(headMs)) {
+        out.log.status = 'failed';
+        errors.push('log inclusion: includedBy needs a tree head with a valid timestamp');
+      } else if (headMs > deadline) {
+        out.log.status = 'failed';
+        errors.push(`log inclusion: the proving tree head is dated ${headTs}, after includedBy ${opts.includedBy}; pass a proof against a head signed by then`);
+      }
+    }
   }
 
   out.valid = errors.length === 0;
@@ -542,6 +614,9 @@ export {
   verifyReceiptInclusion,
   verifySthConsistency,
   receiptLeafHash,
+  fetchInclusionProof,
+  LogProofUnavailable,
+  DEFAULT_LOG_PROOF_URL,
   LogMonitor,
   MemorySthStore,
   checkLogKeyDoc,
@@ -560,6 +635,7 @@ export type {
   LogStatus,
   LogKeyMode,
   InclusionResult,
+  FetchProofOptions,
   ConsistencyResult,
   SthStore,
   MonitorStatus,

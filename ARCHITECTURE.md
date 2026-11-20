@@ -40,10 +40,11 @@ receipt (untrusted JSON)
    │ 5 attestation_strength ∈ four tiers and ≤ entry.attestation_strength
    │ 6 feed = opts.revocations > fetch(revocationsUrl); key + receipt lookups   ← revocation.ts
    │ 7 chain sanity (warning), or hard hash+sequence link when opts.previous is given
-   │ 8 opts.inclusion: STH verified under logKeys: a pinned key array (never the       ← log.ts
+   │ 8 inclusion, required by default: opts.inclusion, else (pinned bundle only)       ← log.ts
+   │   fetchInclusionProof(receipt_id) checked under PINNED_LOG_KEYS. STH verified under logKeys: a pinned key array (never the
    │   receipt bundle), or a key document, which is rooted in a receipt key;
    │   proof root/size must equal the STH's; leaf = SHA-256(0x00||JCS(receipt));
-   │   audit path → signed root (merkle.ts). opts.requireInclusion: no proof = error
+   │   audit path → signed root (merkle.ts). No proof = error unless requireInclusion: false
    ▼
 VerifyResult { valid: errors.length === 0, errors, warnings, receipt_id, key_id, attestation_strength }
 ```
