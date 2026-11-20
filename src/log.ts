@@ -159,7 +159,14 @@ export interface SthResult {
   tree_size?: number;
 }
 
-export type LogStatus = 'included' | 'failed' | 'not_checked';
+/** `included`: proven under a pinned log key. `pending`: the log says it
+ *  holds the receipt but has not put it in a signed tree head yet.
+ *  `absent`: the log says it has no record of the receipt. `failed`: a proof
+ *  did not verify, or did not meet `includedBy`. `not_checked`: no proof was
+ *  obtained. Only `included` is ever valid; `pending` and `absent` are the
+ *  log's word, not proofs, and are reported so callers can tell "check again
+ *  later" from "never logged". */
+export type LogStatus = 'included' | 'pending' | 'absent' | 'failed' | 'not_checked';
 
 export interface InclusionResult {
   status: LogStatus;
@@ -592,6 +599,16 @@ export const DEFAULT_LOG_PROOF_URL = 'https://data.tunnelmind.ai/v1/receipts/log
 // The endpoint's own receipt_id rule, checked here so no other id is sent.
 const RECEIPT_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 
+/** Why fetchInclusionProof got no proof: `pending` (the log holds the
+ *  receipt, not sequenced yet), `absent` (the log has no record of it) or
+ *  `unavailable` (anything else: network, HTTP error, bad body, no head). */
+export class LogProofUnavailable extends Error {
+  constructor(message: string, readonly kind: 'pending' | 'absent' | 'unavailable') {
+    super(message);
+    this.name = 'LogProofUnavailable';
+  }
+}
+
 export interface FetchProofOptions {
   /** Override the proof endpoint (e.g. a mirror of the same log). */
   url?: string;
@@ -599,24 +616,45 @@ export interface FetchProofOptions {
 }
 
 /** Fetch the inclusion proof for `receiptId` against the latest signed tree
- *  head (the response carries that head as `proof.sth`). Throws on a bad id,
- *  a network or HTTP failure, or a body that is not `{ ok: true, data }`.
- *  Nothing fetched is trusted: verifyReceiptInclusion recomputes the leaf
- *  from the receipt and checks the head under the caller's pinned log keys. */
+ *  head (the response carries that head as `proof.sth`). Throws
+ *  LogProofUnavailable on a bad id, a network or HTTP failure, or a body that
+ *  is not `{ ok: true, data }`; a 404 is told apart by the endpoint's own
+ *  error text (data-api receipt-log.js getInclusionProof): `pending` for
+ *  "not yet sequenced", `absent` for "no receipt". That text only labels a
+ *  failure, it never makes one pass. Nothing fetched is trusted:
+ *  verifyReceiptInclusion recomputes the leaf from the receipt and checks
+ *  the head under the caller's pinned log keys. */
 export async function fetchInclusionProof(receiptId: unknown, opts: FetchProofOptions = {}): Promise<InclusionProof> {
   if (typeof receiptId !== 'string' || !RECEIPT_ID_RE.test(receiptId)) {
-    throw new Error('receipt_id is not a log id ([A-Za-z0-9-]{1,64})');
+    throw new LogProofUnavailable('receipt_id is not a log id ([A-Za-z0-9-]{1,64})', 'unavailable');
   }
   const u = new URL(opts.url ?? DEFAULT_LOG_PROOF_URL);
   u.searchParams.set('receipt_id', receiptId);
   const f = opts.fetcher ?? fetch;
-  const r = await f(u.toString());
-  if (r.status === 404) {
-    throw new Error(`receipt ${receiptId} is not in the log: not sequenced yet (a new tree head is signed about hourly) or never logged`);
+  let r: Response;
+  try {
+    r = await f(u.toString());
+  } catch (e) {
+    throw new LogProofUnavailable((e as Error).message, 'unavailable');
   }
-  if (!r.ok) throw new Error(`${u.origin}${u.pathname} returned ${r.status}`);
-  const j: unknown = await r.json();
-  if (!isObj(j) || j.ok !== true || !isObj(j.data)) throw new Error('proof response is not { ok: true, data }');
+  if (r.status === 404) {
+    let why = '';
+    try {
+      const j: unknown = await r.json();
+      if (isObj(j) && typeof j.error === 'string') why = j.error;
+    } catch { /* no body: unavailable below */ }
+    if (/ is not yet sequenced into the log$/.test(why)) {
+      throw new LogProofUnavailable(`receipt ${receiptId} is not in a signed tree head yet (a new head is signed about hourly)`, 'pending');
+    }
+    if (/^no receipt /.test(why)) {
+      throw new LogProofUnavailable(`the log has no record of receipt ${receiptId}`, 'absent');
+    }
+    throw new LogProofUnavailable(`${u.origin}${u.pathname} returned 404`, 'unavailable');
+  }
+  if (!r.ok) throw new LogProofUnavailable(`${u.origin}${u.pathname} returned ${r.status}`, 'unavailable');
+  let j: unknown;
+  try { j = await r.json(); } catch (e) { throw new LogProofUnavailable(`proof response: ${(e as Error).message}`, 'unavailable'); }
+  if (!isObj(j) || j.ok !== true || !isObj(j.data)) throw new LogProofUnavailable('proof response is not { ok: true, data }', 'unavailable');
   return j.data as unknown as InclusionProof;
 }
 

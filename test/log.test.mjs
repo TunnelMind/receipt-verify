@@ -287,7 +287,7 @@ test('verifyReceipt: a receipt proven in a 7-leaf log is included', async () => 
   const s = await setup();
   const r = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, inclusion: { proof: s.proof, sth: s.sth, logKeys: s.logKeys } });
   assert.equal(r.valid, true, r.errors.join('; '));
-  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: 'log-1', log_key: 'separate' });
+  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: 'log-1', log_key: 'separate', sth_timestamp: s.sth.timestamp });
   // STH may ride inside the proof, as /v1/receipts/log/proof serves it.
   const r2 = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, inclusion: { proof: { ...s.proof, sth: s.sth }, logKeys: s.logKeys } });
   assert.equal(r2.log.status, 'included', r2.errors.join('; '));
@@ -538,7 +538,7 @@ test('log key mode: log keys that are all receipt keys verify as today, log_key 
   const sth = await signSth(issuer, { tree_size: 7, root_hash: hex(root), timestamp: ts() }, { keyId });
   const r = await verifyReceipt(receipt, { keys, revocations: makeRevocations(), inclusion: { proof, sth, logKeys } });
   assert.equal(r.valid, true, r.errors.join('; '));
-  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: keyId, log_key: 'shared_with_receipts' });
+  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: keyId, log_key: 'shared_with_receipts', sth_timestamp: sth.timestamp });
   const sr = await verifySth(sth, logKeys, { receiptKeys: keys.keys });
   assert.equal(sr.valid, true, sr.errors.join('; '));
   assert.equal(sr.log_key, 'shared_with_receipts');
@@ -1107,7 +1107,7 @@ test('verifyReceipt key document: a receipt under a log-key head is included, lo
 
   const r = await verifyReceipt(receipt, opts(doc));
   assert.equal(r.valid, true, r.errors.join('; '));
-  assert.deepEqual(r.log, { status: 'included', tree_size: 9, leaf_index: 6, log_key_id: KD_LOG_KID, log_key: 'separate' });
+  assert.deepEqual(r.log, { status: 'included', tree_size: 9, leaf_index: 6, log_key_id: KD_LOG_KID, log_key: 'separate', ...(sth.timestamp ? { sth_timestamp: sth.timestamp } : {}) });
 
   // The same document with a hand-over the receipt key never signed: refused.
   const forgedDoc = await kdTwoEntryDoc(signer, log, await kdHandover(log, log, { root_hash: root(KD_M) }));

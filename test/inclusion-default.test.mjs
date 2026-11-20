@@ -83,7 +83,7 @@ test('default: the proof is fetched by receipt_id and the receipt is included', 
   const { urls, fetcher } = serve(() => json({ ok: true, data }));
   const r = await verifyReceipt(receipt, { ...base(), fetcher });
   assert.equal(r.valid, true, r.errors.join('; '));
-  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: KEY_ID, log_key: 'shared_with_receipts' });
+  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: KEY_ID, log_key: 'shared_with_receipts', sth_timestamp: data.sth.timestamp });
   assert.deepEqual(urls, [`${DEFAULT_LOG_PROOF_URL}?receipt_id=${receipt.receipt_id}`]);
   // Same through the text entry point.
   const t = await verifyReceiptJson(JSON.stringify(receipt), { ...base(), fetcher });
@@ -114,7 +114,8 @@ test('default: a fetched proof is trusted no more than a supplied one', async ()
 test('default: no proof available is an error, never a pass', async () => {
   const { receipt } = await logged();
   const cases = [
-    [() => json({ ok: false, error: 'not yet sequenced' }, 404), /not in the log: not sequenced yet/, '404'],
+    [() => json({ ok: false, error: 'no signed tree head published yet', code: 404 }, 404), /proof fetch failed: .* returned 404/, 'no head'],
+    [() => new Response('', { status: 404 }), /returned 404/, 'bare 404'],
     [() => json({ ok: false }, 503), /returned 503/, '503'],
     [() => json({ data: {} }), /not \{ ok: true, data \}/, 'no envelope'],
     [() => new Response('<html>', { status: 200 }), /proof fetch failed/, 'not JSON'],
@@ -127,6 +128,72 @@ test('default: no proof available is an error, never a pass', async () => {
     assert.equal(r.log.status, 'not_checked', why);
     assert.match(r.errors.join(';'), want, why);
   }
+});
+
+// The endpoint's own 404 texts (data-api receipt-log.js getInclusionProof).
+const notSequenced = (id) => () => json({ ok: false, error: `receipt ${id} is not yet sequenced into the log`, code: 404 }, 404);
+const noReceipt = (id) => () => json({ ok: false, error: `no receipt ${id}`, code: 404 }, 404);
+
+test('pending: logged but not in a signed head yet reads pending, never valid', async () => {
+  const { receipt } = await logged();
+  const { fetcher } = serve(notSequenced(receipt.receipt_id));
+  const r = await verifyReceipt(receipt, { ...base(), fetcher });
+  assert.equal(r.valid, false);
+  assert.equal(r.log.status, 'pending');
+  assert.match(r.errors.join(';'), /^log inclusion: pending: .*verify again after the next head$/m);
+  // Every other check still ran and passed: pending is the only error.
+  assert.equal(r.errors.length, 1, r.errors.join('; '));
+});
+
+test('absent: the log has no record of the receipt', async () => {
+  const { receipt } = await logged();
+  const { fetcher } = serve(noReceipt(receipt.receipt_id));
+  const r = await verifyReceipt(receipt, { ...base(), fetcher });
+  assert.equal(r.valid, false);
+  assert.equal(r.log.status, 'absent');
+  assert.match(r.errors.join(';'), /the log has no record of receipt/);
+});
+
+test('includedBy: a commit before market close must sit in a head signed before close', async () => {
+  const { receipt, data } = await logged();
+  const headMs = Date.parse(data.sth.timestamp);
+  const at = (ms) => new Date(ms).toISOString();
+  const ok = serve(() => json({ ok: true, data }));
+  // Head signed before the deadline: included.
+  const r1 = await verifyReceipt(receipt, { ...base(), fetcher: ok.fetcher, includedBy: at(headMs + 60_000) });
+  assert.equal(r1.valid, true, r1.errors.join('; '));
+  assert.equal(r1.log.status, 'included');
+  assert.equal(r1.log.sth_timestamp, data.sth.timestamp);
+  // The only proof is against a head signed after close: fails, though the
+  // receipt is in the log (it may have been sequenced only after the outcome).
+  const r2 = await verifyReceipt(receipt, { ...base(), fetcher: ok.fetcher, includedBy: at(headMs - 60_000) });
+  assert.equal(r2.valid, false);
+  assert.equal(r2.log.status, 'failed');
+  assert.match(r2.errors.join(';'), /after includedBy/);
+  // A supplied proof is held to the same deadline.
+  const r3 = await verifyReceipt(receipt, { ...base(), inclusion: { proof: data, logKeys: PINNED_LOG_KEYS }, includedBy: at(headMs - 1) });
+  assert.equal(r3.log.status, 'failed');
+  // Committed in the last hour, close not reached yet: pending.
+  const q = serve(notSequenced(receipt.receipt_id));
+  const r4 = await verifyReceipt(receipt, { ...base(), fetcher: q.fetcher, includedBy: at(Date.now() + 3_600_000) });
+  assert.equal(r4.log.status, 'pending');
+  // Close has passed and it is still unsequenced: it can no longer be logged
+  // in time, so it fails rather than waits.
+  const r5 = await verifyReceipt(receipt, { ...base(), fetcher: q.fetcher, includedBy: at(Date.now() - 1000) });
+  assert.equal(r5.valid, false);
+  assert.equal(r5.log.status, 'failed');
+  assert.match(r5.errors.join(';'), /not in a tree head signed by includedBy/);
+  // A head with no timestamp cannot meet a deadline; a bad deadline is an error.
+  const { signature: _s, timestamp: _t, ...body } = data.sth;
+  const bare = await signSth(issuer, body);
+  const noDeadline = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data: { ...data, sth: bare } })).fetcher });
+  assert.equal(noDeadline.log.status, 'included', noDeadline.errors.join('; '));
+  const r6 = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data: { ...data, sth: bare } })).fetcher, includedBy: at(headMs + 60_000) });
+  assert.equal(r6.valid, false);
+  assert.match(r6.errors.join(';'), /needs a tree head with a valid timestamp/);
+  const r7 = await verifyReceipt(receipt, { ...base(), fetcher: ok.fetcher, includedBy: 'before close' });
+  assert.equal(r7.valid, false);
+  assert.match(r7.errors.join(';'), /includedBy: not a valid date/);
 });
 
 test('requireInclusion: false skips the log without fetching', async () => {
