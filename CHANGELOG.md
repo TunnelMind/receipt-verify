@@ -1,6 +1,20 @@
 # Changelog
 
-## 3.0.0 — unreleased (not published)
+## 4.0.0 — unreleased (not published)
+
+### Breaking
+
+Major bump 3.0.0 -> 4.0.0: log inclusion is on by default.
+
+- `verifyReceipt()` and `verifyReceiptJson()` now require transparency-log inclusion: `requireInclusion` defaults to `true`. With no `inclusion` given and the pinned key bundle in use, the proof is fetched from `DEFAULT_LOG_PROOF_URL` (`https://data.tunnelmind.ai/v1/receipts/log/proof?receipt_id=…`, override with `logProofUrl`, fetched with `fetcher`) and checked under `PINNED_LOG_KEYS`; the fetched proof, head and leaf hash are trusted no more than a supplied proof. A receipt not in the log, not sequenced yet (the log signs a new head about hourly), or whose proof cannot be fetched is invalid with `log inclusion: proof fetch failed: …` and `log.status` `not_checked`. With `keys` or `keysUrl` (another issuer) nothing is fetched and no `inclusion` is an error `log inclusion: required but no inclusion proof was supplied …`, so another issuer's receipt id never reaches TunnelMind's log. Before, a receipt that was never logged verified with `log.status` `not_checked`. Migration: pass `inclusion` when you hold the proof (offline), or `requireInclusion: false` to keep the 3.x behaviour (signature checked, log membership not). Old receipts: every receipt that went into data-api's ledger is in the log, so its proof is served; a receipt issued before the ledger, or one returned with `receipt_logged: false`, has no proof and now fails unless you opt out (2026-11-20).
+- `scripts/verdict-lib` passes `requireInclusion: false` to its envelope check: a verdict receipt's own inclusion check is the checkpoint proof, unchanged (2026-11-20).
+
+### Added
+
+- `fetchInclusionProof(receiptId, { url?, fetcher? })`, `DEFAULT_LOG_PROOF_URL` and the `FetchProofOptions` type. Only ids matching the endpoint's `[A-Za-z0-9-]{1,64}` are sent (2026-11-20).
+- Tests: the default fetch path end to end, a forged head, a lying leaf hash, wrong index and another log's head from the fetched proof, every way a fetch can fail, the opt-out, the URL override and a refused receipt id (test/inclusion-default.test.mjs) (2026-11-20).
+
+## 3.0.0 — 2026-11-17 (published to npm)
 
 ### Breaking
 

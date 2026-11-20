@@ -293,14 +293,20 @@ test('verifyReceipt: a receipt proven in a 7-leaf log is included', async () => 
   assert.equal(r2.log.status, 'included', r2.errors.join('; '));
 });
 
-test('verifyReceipt: without a proof the log is not_checked; requireInclusion makes that an error', async () => {
+test('verifyReceipt: inclusion is required by default; requireInclusion: false is the explicit opt-out', async () => {
   const s = await setup();
-  const r = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations });
-  assert.equal(r.valid, true);
-  assert.equal(r.log.status, 'not_checked');
-  const strict = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, requireInclusion: true });
-  assert.equal(strict.valid, false);
-  assert.match(strict.errors.join(';'), /required but no inclusion proof/);
+  let calls = 0;
+  const fetcher = async () => { calls++; throw new Error('must not fetch'); };
+  // Another issuer's bundle: no proof is fetched, and none given is an error.
+  const def = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, fetcher });
+  assert.equal(def.valid, false);
+  assert.equal(def.log.status, 'not_checked');
+  assert.match(def.errors.join(';'), /required but no inclusion proof/);
+  // Opt-out: signature checked, log membership not, nothing fetched.
+  const lax = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, fetcher, requireInclusion: false });
+  assert.equal(lax.valid, true, lax.errors.join('; '));
+  assert.equal(lax.log.status, 'not_checked');
+  assert.equal(calls, 0);
 });
 
 test('verifyReceipt: failed inclusion is an error (other receipt, lying root, wrong size, STH from the receipt key, no log keys)', async () => {

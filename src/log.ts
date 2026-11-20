@@ -585,6 +585,41 @@ export async function verifyReceiptInclusion(
   return out;
 }
 
+/** The log's inclusion-proof endpoint, queried by receipt_id (data-api
+ *  api/routes/receipt-log.js getInclusionProof). */
+export const DEFAULT_LOG_PROOF_URL = 'https://data.tunnelmind.ai/v1/receipts/log/proof';
+
+// The endpoint's own receipt_id rule, checked here so no other id is sent.
+const RECEIPT_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
+
+export interface FetchProofOptions {
+  /** Override the proof endpoint (e.g. a mirror of the same log). */
+  url?: string;
+  fetcher?: typeof fetch;
+}
+
+/** Fetch the inclusion proof for `receiptId` against the latest signed tree
+ *  head (the response carries that head as `proof.sth`). Throws on a bad id,
+ *  a network or HTTP failure, or a body that is not `{ ok: true, data }`.
+ *  Nothing fetched is trusted: verifyReceiptInclusion recomputes the leaf
+ *  from the receipt and checks the head under the caller's pinned log keys. */
+export async function fetchInclusionProof(receiptId: unknown, opts: FetchProofOptions = {}): Promise<InclusionProof> {
+  if (typeof receiptId !== 'string' || !RECEIPT_ID_RE.test(receiptId)) {
+    throw new Error('receipt_id is not a log id ([A-Za-z0-9-]{1,64})');
+  }
+  const u = new URL(opts.url ?? DEFAULT_LOG_PROOF_URL);
+  u.searchParams.set('receipt_id', receiptId);
+  const f = opts.fetcher ?? fetch;
+  const r = await f(u.toString());
+  if (r.status === 404) {
+    throw new Error(`receipt ${receiptId} is not in the log: not sequenced yet (a new tree head is signed about hourly) or never logged`);
+  }
+  if (!r.ok) throw new Error(`${u.origin}${u.pathname} returned ${r.status}`);
+  const j: unknown = await r.json();
+  if (!isObj(j) || j.ok !== true || !isObj(j.data)) throw new Error('proof response is not { ok: true, data }');
+  return j.data as unknown as InclusionProof;
+}
+
 // ── Consistency between two signed tree heads ─────────────────────────────────
 
 export interface ConsistencyResult {

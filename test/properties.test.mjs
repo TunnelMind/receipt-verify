@@ -5,7 +5,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { verifyReceipt, canonicalize } from '../dist/index.js';
+import { verifyReceipt as verifyAll, canonicalize } from '../dist/index.js';
+// These tests cover §4 steps 1-7. Log inclusion (step 8) is required by
+// default and is tested in log.test.mjs, so here it is switched off.
+const verifyReceipt = (r, o = {}) => verifyAll(r, { requireInclusion: false, ...o });
 import { canonicalize as verdictCanonicalize } from '../scripts/verdict-lib/jcs.js';
 import { jcs as logCanonicalize } from '../scripts/verify-log.mjs';
 import { makeReceipt, makeEphemeralKey, makeKeyBundle, makeRevocations } from './_helpers.mjs';

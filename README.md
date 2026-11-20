@@ -27,6 +27,7 @@ const receipt = await (
   })
 ).json();
 
+// A receipt is provable once the log signs its next tree head (about hourly).
 const result = await verifyReceipt(receipt);
 
 if (result.valid) {
@@ -50,7 +51,9 @@ if (result.valid) {
    - if `receipt_id` is in `revoked_receipts`, reject
 7. **Chain sanity** — warn (not reject) if `chain.sequence` and `previous_receipt_hash` are inconsistent. Pass `previous` (the prior receipt) to make it a hard check: `previous_receipt_hash` must equal the SHA-256 of the previous receipt's `signature.value` (UTF-8 bytes), `0x`-prefixed and `sequence` must be its sequence + 1
 
-Checks 1-5 need no network by default: the key bundle is the pinned one unless you pass `keysUrl`. Check 6 fetches the revocation feed unless you pass `revocations`; it can only be turned off with `unsafeSkipRevocations`.
+8. **Log inclusion** (on by default since 4.0.0) — the receipt must be proven in the transparency log: `opts.inclusion` if given, else (pinned bundle only) the proof fetched by `receipt_id` from `https://data.tunnelmind.ai/v1/receipts/log/proof`, checked under `PINNED_LOG_KEYS`. No proof is an error; a receipt minutes old is not sequenced yet and fails until the next tree head. See "Transparency-log inclusion" below
+
+Checks 1-5 need no network by default: the key bundle is the pinned one unless you pass `keysUrl`. Check 6 fetches the revocation feed unless you pass `revocations`; it can only be turned off with `unsafeSkipRevocations`. Check 8 fetches the inclusion proof unless you pass `inclusion`; it can only be turned off with `requireInclusion: false`.
 
 ## Offline + pinned modes
 
@@ -78,18 +81,21 @@ const result = await verifyReceipt(receipt, { keys, revocations });
 ### Fully offline
 
 `noFetchKeys: true` uses the pinned bundle (or `opts.keys`) and never touches
-the network for keys. Revocation still needs a feed: pass one you fetched
-earlier.
+the network for keys. Revocation still needs a feed and inclusion a proof:
+pass ones you fetched earlier.
 
 ```ts
 const result = await verifyReceipt(receipt, {
   noFetchKeys: true,
   revocations, // pre-fetched RevocationFeed
+  inclusion: { proof, logKeys: PINNED_LOG_KEYS }, // proof with its sth
 });
 ```
 
 `unsafeSkipRevocations: true` turns revocation checking off instead. It is
 **unsafe**: a receipt signed by a revoked or compromised key then verifies.
+`requireInclusion: false` does the same for the log: a receipt the issuer
+never logged then verifies.
 
 ## Rotation-overlap mode
 
@@ -134,8 +140,9 @@ interface VerifyResult {
 | `allowKeyMismatch` | `false` | Accept (with a warning) an embedded `public_key` that is another usable entry in the same bundle; see Rotation-overlap mode |
 | `previous` | (none) | The prior receipt; makes the chain check hard (hash link + `sequence` + 1) |
 | `fetcher` | `globalThis.fetch` | Custom fetch (e.g., for tests) |
-| `inclusion` | (none) | `{ proof, sth?, logKeys, requireKeyId?, logId? }`: prove the receipt is in the transparency log under pinned **log** keys (`logKeys`: the log's key document, e.g. `PINNED_LOG_KEYS`, or a key array); a failed proof is an error. See below |
-| `requireInclusion` | `false` | Make a missing inclusion proof an error. `result.log.status` reports `not_checked` either way |
+| `inclusion` | (fetched) | `{ proof, sth?, logKeys, requireKeyId?, logId? }`: a proof you already hold, checked under pinned **log** keys (`logKeys`: the log's key document, e.g. `PINNED_LOG_KEYS`, or a key array); a failed proof is an error. Without it, see `requireInclusion`. See below |
+| `requireInclusion` | `true` | The receipt must be proven in the log. With no `inclusion` and the pinned bundle, the proof is fetched from `logProofUrl` by `receipt_id` and checked under `PINNED_LOG_KEYS`; a failed fetch is an error. With `keys`/`keysUrl` nothing is fetched and no `inclusion` is an error. **UNSAFE** to set `false`: a receipt the issuer never logged then verifies (`result.log.status` `not_checked`) |
+| `logProofUrl` | `data.tunnelmind.ai/v1/receipts/log/proof` | Proof endpoint for the default fetch (a mirror of the same log) |
 
 ### Lower-level exports
 
@@ -144,8 +151,21 @@ interface VerifyResult {
 ## Transparency-log inclusion and consistency (in the library)
 
 A signature proves who issued a receipt. It does not prove the receipt is in
-the log, or that the log was never rewritten. Both now run wherever
-`verifyReceipt()` runs (WebCrypto, no Node builtins):
+the log, or that the log was never rewritten. Both run wherever
+`verifyReceipt()` runs (WebCrypto, no Node builtins), and since 4.0.0
+inclusion is checked by default:
+
+```ts
+import { verifyReceipt } from '@tunnelmindai/receipt-verify';
+
+// Fetches the proof by receipt_id and checks it under PINNED_LOG_KEYS.
+const r = await verifyReceipt(receipt);
+r.log; // { status: 'included', … }, or valid: false when it is not in the log
+```
+
+A receipt is sequenced into the log when the next tree head is signed (about
+hourly), so a receipt minutes old is not provable yet and fails until then.
+Offline, or with a proof already in hand, pass it:
 
 ```ts
 import { verifyReceipt, LogMonitor, PINNED_LOG_KEYS } from '@tunnelmindai/receipt-verify';
@@ -155,12 +175,13 @@ const logKeys = PINNED_LOG_KEYS;
 const logId = 'tunnelmind-receipts-log-v1';
 const proof = (await (await fetch(`https://data.tunnelmind.ai/v1/receipts/log/proof?receipt_id=${id}`)).json()).data;
 
-const r = await verifyReceipt(receipt, { inclusion: { proof, logKeys, logId, requireKeyId: true }, requireInclusion: true });
+const r = await verifyReceipt(receipt, { inclusion: { proof, logKeys, logId, requireKeyId: true } });
 r.log; // { status: 'included', tree_size, leaf_index, log_key_id, log_key: 'shared_with_receipts' }
 ```
 
-- `result.log.status` is `included` (proven), `failed` (a proof was given and
-  did not verify: also an error), or `not_checked` (no proof given).
+- `result.log.status` is `included` (proven), `failed` (a proof was given or
+  fetched and did not verify: also an error), or `not_checked` (no proof: an
+  error unless `requireInclusion: false`).
 - The leaf is recomputed from the receipt bytes: `SHA-256(0x00 || JCS(receipt))`.
   The proof's `leaf_hash` and roots are never trusted; the root and tree size
   come only from a signed tree head (the `sth` argument, else `proof.sth`).
