@@ -162,7 +162,7 @@ export interface SthResult {
 /** `included`: proven under a pinned log key. `pending`: the log says it
  *  holds the receipt but has not put it in a signed tree head yet.
  *  `absent`: the log says it has no record of the receipt. `failed`: a proof
- *  did not verify, or did not meet `includedBy`. `not_checked`: no proof was
+ *  did not verify. `not_checked`: no proof was
  *  obtained. Only `included` is ever valid; `pending` and `absent` are the
  *  log's word, not proofs, and are reported so callers can tell "check again
  *  later" from "never logged". */

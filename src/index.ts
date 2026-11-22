@@ -163,14 +163,14 @@ export interface VerifyOptions {
   /** Override the proof endpoint used when `inclusion` is not given
    *  (default DEFAULT_LOG_PROOF_URL). Fetched with `fetcher`. */
   logProofUrl?: string;
-  /** Deadline (RFC 3339): the receipt must be proven in a tree head whose
-   *  signed timestamp is at or before it, e.g. a commit that must be logged
-   *  before a market closes. A proof against a later head fails, though the
-   *  receipt may sit in an earlier one: pass a proof against a head signed by
-   *  then (the default fetch only gets the latest head). A receipt still
-   *  `pending` after the deadline fails. The head's timestamp is the log's
-   *  claim, signed by the log key. */
-  includedBy?: string;
+  /** The log's key document for the default fetch path, in place of
+   *  PINNED_LOG_KEYS: e.g. the document served at LOG_KEYS_URL after a
+   *  log-key change, so heads under the new key verify without a new release.
+   *  Trusted only as far as it chains back to the pins: its first key must be
+   *  a pinned receipt key, each later key needs a hand-over signed by the key
+   *  before it (checkLogKeyDoc), and its log_id must be the pinned log's.
+   *  Anything else fails inclusion. */
+  logKeys?: LogKeyDoc;
 }
 
 export interface VerifyResult {
@@ -184,7 +184,7 @@ export interface VerifyResult {
   /** Transparency-log status (log.ts LogStatus): `included` (proven under a
    *  pinned log key), `pending` (logged, not in a signed head yet: verify
    *  again later), `absent` (the log has no record), `failed` (a proof did not
-   *  verify or missed `includedBy`), or `not_checked` (no proof). Every status
+   *  verify), or `not_checked` (no proof). Every status
    *  but `included` is an error unless requireInclusion was false. */
   log: { status: LogStatus; tree_size?: number; leaf_index?: number; log_key_id?: string; log_key?: LogKeyMode; sth_timestamp?: string };
 }
@@ -234,7 +234,7 @@ function buildSigningObject(receipt: Receipt): JsonValue {
  *   8. transparency-log inclusion under pinned log keys (result.log.status):
  *      opts.inclusion, else a proof fetched by receipt_id (pinned bundle
  *      only); anything but `included` is an error unless requireInclusion:
- *      false; with opts.includedBy the proving head must be dated by then
+ *      false; result.log.sth_timestamp is the proving head's signed date
  */
 /** Push one error per number anywhere in `v` that fails Number.isSafeInteger
  *  (-0 passes). Mirrors rune-record check_numbers. */
@@ -262,16 +262,6 @@ export async function verifyReceiptJson(
     return { valid: false, errors: [error], warnings: [], log: { status: 'not_checked' } };
   }
   return verifyReceipt(parsed as unknown as Receipt, opts);
-}
-
-/** RFC 3339 date-time with a zone (Z or an offset), as epoch ms; undefined
- *  for anything else. Date.parse alone also takes "2027", local-zone
- *  times and engine-specific forms. */
-const RFC3339_RE = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2})$/;
-function parseRfc3339(v: unknown): number | undefined {
-  if (typeof v !== 'string' || !RFC3339_RE.test(v)) return undefined;
-  const ms = Date.parse(v);
-  return Number.isFinite(ms) ? ms : undefined;
 }
 
 /** Verify one receipt (steps above). Never throws: anything that would
@@ -522,12 +512,6 @@ async function verifyReceiptUnguarded(
   // out. The leaf is the receipt exactly as supplied; the root comes only
   // from an STH under a pinned log key, so a fetched proof is no more
   // trusted than a supplied one.
-  let deadline: number | undefined;
-  if (opts.includedBy !== undefined) {
-    deadline = parseRfc3339(opts.includedBy);
-    if (deadline === undefined) errors.push('includedBy: not an RFC 3339 date-time with a zone (e.g. 2026-11-21T20:00:00Z)');
-  }
-  const pastDeadline = deadline !== undefined && Date.now() > deadline;
   let inc = opts.inclusion;
   if (!inc && opts.requireInclusion !== false) {
     // Fetch only for TunnelMind's own receipts: another issuer's receipt
@@ -541,17 +525,15 @@ async function verifyReceiptUnguarded(
     } else {
       try {
         const proof = await fetchInclusionProof(receipt.receipt_id, { url: opts.logProofUrl, fetcher: opts.fetcher });
-        inc = { proof, logKeys: ACTIVE_PINS.logKeys, logId: ACTIVE_PINS.logKeys.log_id };
+        // logId stays the pinned log's, and verifyReceiptInclusion anchors
+        // the document's first key on the pinned receipt keys.
+        inc = { proof, logKeys: opts.logKeys ?? ACTIVE_PINS.logKeys, logId: ACTIVE_PINS.logKeys.log_id };
       } catch (e) {
         const kind = e instanceof LogProofUnavailable ? e.kind : 'unavailable';
         const msg = (e as Error).message;
         // Pending is never a pass: until a signed head holds the receipt, a
-        // key holder could still be withholding it. Past the deadline it can
-        // no longer be logged in time, so it is a failure, not a wait.
-        if (kind === 'pending' && pastDeadline) {
-          out.log = { status: 'failed' };
-          errors.push(`log inclusion: not in a tree head signed by includedBy ${opts.includedBy}: ${msg}`);
-        } else if (kind === 'pending') {
+        // key holder could still be withholding it.
+        if (kind === 'pending') {
           out.log = { status: 'pending' };
           errors.push(`log inclusion: pending: ${msg}; verify again after the next head`);
         } else if (kind === 'absent') {
@@ -582,16 +564,6 @@ async function verifyReceiptUnguarded(
     const head = (inc.sth ?? (inc.proof as InclusionProof | undefined)?.sth) as SignedTreeHead | undefined;
     const headTs = typeof head?.timestamp === 'string' ? head.timestamp : undefined;
     if (r.status === 'included' && headTs !== undefined) out.log.sth_timestamp = headTs;
-    if (r.status === 'included' && deadline !== undefined) {
-      const headMs = parseRfc3339(headTs);
-      if (headMs === undefined) {
-        out.log.status = 'failed';
-        errors.push('log inclusion: includedBy needs a tree head with an RFC 3339 timestamp');
-      } else if (headMs > deadline) {
-        out.log.status = 'failed';
-        errors.push(`log inclusion: the proving tree head is dated ${headTs}, after includedBy ${opts.includedBy}; pass a proof against a head signed by then`);
-      }
-    }
   }
 
   out.valid = errors.length === 0;

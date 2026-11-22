@@ -153,7 +153,7 @@ interface VerifyResult {
 | `inclusion` | (fetched) | `{ proof, sth?, logKeys, requireKeyId?, logId? }`: a proof you already hold, checked under pinned **log** keys (`logKeys`: the log's key document, e.g. `PINNED_LOG_KEYS`, or a key array); a failed proof is an error. Without it, see `requireInclusion`. See below |
 | `requireInclusion` | `true` | The receipt must be proven in the log. With no `inclusion` and the pinned bundle, the proof is fetched from `logProofUrl` by `receipt_id` and checked under `PINNED_LOG_KEYS`; a failed fetch is an error. With `keys`/`keysUrl` nothing is fetched and no `inclusion` is an error. **UNSAFE** to set `false`: a receipt the issuer never logged then verifies (`result.log.status` `not_checked`) |
 | `logProofUrl` | `data.tunnelmind.ai/v1/receipts/log/proof` | Proof endpoint for the default fetch (a mirror of the same log); https only, no user name or password. The receipt_id is sent only after every other check has passed; the fetch gives up after 10 s or 64 KiB |
-| `includedBy` | (none) | RFC 3339 deadline: the proving tree head must be dated at or before it (e.g. a commit logged before market close). A proof against a later head fails; a receipt still `pending` after it fails |
+| `logKeys` | `PINNED_LOG_KEYS` | The log's key document for the default fetch, e.g. the one served at `LOG_KEYS_URL` after a log-key change. Trusted only as far as it chains back to the pins: first key a pinned receipt key, each later key handed over by the one before, `log_id` the pinned log's |
 
 ### Lower-level exports
 
@@ -193,15 +193,16 @@ r.log; // { status: 'included', tree_size, leaf_index, log_key_id, log_key: 'sha
 - `result.log.status` is `included` (proven), `pending` (the log holds the
   receipt but has not put it in a signed tree head yet: verify again after
   the next head), `absent` (the log has no record of it), `failed` (a proof
-  did not verify, or missed `includedBy`), or `not_checked` (no proof). Only
+  did not verify), or `not_checked` (no proof). Only
   `included` is valid: `pending` and `absent` are the log's word, not
   proofs, and a key holder could leave a receipt pending forever. Every other
   status is an error unless `requireInclusion: false`.
-- A deadline: `includedBy` makes the receipt prove it was in a tree head
-  signed by then. A commit made in the hour before a market closes is in no
-  head until after close, so it reads `pending` until close and `failed`
-  after unless the proof is against a head signed before close. Inclusion
-  after close does not show the commit was logged before the outcome.
+- `result.log.sth_timestamp` is the proving head's own date. It is signed
+  by the log key, today the receipt key, so it says when the issuer claims
+  the head was signed, not when an independent party saw it. It does not
+  show a commit was logged before a deadline (a market close, say): the key
+  holder can date a head as it likes. That needs a promise from the log at
+  write time or a head that someone else archived in time.
 - The leaf is recomputed from the receipt bytes: `SHA-256(0x00 || JCS(receipt))`.
   The proof's `leaf_hash` and roots are never trusted; the root and tree size
   come only from a signed tree head (the `sth` argument, else `proof.sth`).
@@ -294,7 +295,8 @@ Limits, stated plainly:
   only the receipt key, open-ended. Log-key heads fail with
   `unknown_key_id`, and receipt-key heads above the hand-over size are still
   accepted, until the pin is refreshed in a new release or you pass the
-  served document.
+  served document (`logKeys` on `verifyReceipt`; `inclusion.logKeys` when
+  you supply the proof).
 
 ### Array mode
 

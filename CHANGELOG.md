@@ -14,14 +14,14 @@ Major bump 3.0.0 -> 4.0.0: log inclusion is on by default.
 
 ### Added
 
-- `includedBy` (RFC 3339): the proving tree head must be dated at or before it, e.g. a weather commit that must be logged before market close. A proof against a later head fails, and a receipt still pending after the deadline fails. `result.log.sth_timestamp` reports the proving head's timestamp (2026-11-20).
+- `logKeys` on `verifyReceipt`: the log's key document for the default fetch path, in place of `PINNED_LOG_KEYS`, so heads signed after a log-key change verify on an installed 4.0.0 without a new release. It is trusted only as far as it chains back to the pins (first key a pinned receipt key, each later key handed over by the one before, `log_id` the pinned log's) (2026-11-22).
+- `result.log.sth_timestamp`: the proving head's own signed date. It is the issuer's claim (the log key is the receipt key today), so it does not prove a receipt was logged before a deadline; a draft `includedBy` option that implied it would was dropped before release (2026-11-22).
 - `fetchInclusionProof(receiptId, { url?, fetcher?, timeoutMs? })`, `LogProofUnavailable` (its `kind`: `pending`, `absent`, `unavailable`), `DEFAULT_LOG_PROOF_URL`, `DEFAULT_LOG_PROOF_TIMEOUT_MS`, `MAX_LOG_PROOF_BYTES` and the `FetchProofOptions` type. Only ids matching the endpoint's `[A-Za-z0-9-]{1,64}` are sent, only to an https URL with no user name or password; it throws nothing but `LogProofUnavailable` (2026-11-20, hardened 2026-11-22).
 
 ### Fixed
 
 - `verifyReceipt` never throws: a receipt nested too deep to walk, or a hostile option value, is returned as an error with `valid: false` (it threw a RangeError or TypeError before) (2026-11-22).
-- `includedBy` and the proving head's timestamp must be RFC 3339 date-times with a zone; `Date.parse` alone took "2027", local-zone times and engine-specific forms (2026-11-22).
-- Tests: review hardening (test/hardening.test.mjs: frozen pins, never throws, bad endpoint, timeout, size cap), strict dates, the deadline boundary, a 400 past the head, whole-text matching, no fetch for an already-invalid receipt; pending, absent, and `includedBy` before and after close, with supplied and fetched proofs; the default fetch path end to end, a forged head, a lying leaf hash, wrong index and another log's head from the fetched proof, every way a fetch can fail, the opt-out, the URL override and a refused receipt id (test/inclusion-default.test.mjs) (2026-11-20).
+- Tests: review hardening (test/hardening.test.mjs: frozen pins, never throws, bad endpoint, timeout, size cap), a log-key change through `logKeys` (and three documents that do not chain to the pins), a 400 past the head, whole-text matching, no fetch for an already-invalid receipt; pending, absent; the default fetch path end to end, a forged head, a lying leaf hash, wrong index and another log's head from the fetched proof, every way a fetch can fail, the opt-out, the URL override and a refused receipt id (test/inclusion-default.test.mjs) (2026-11-20).
 
 ## 3.0.0 — 2026-11-17 (published to npm)
 

@@ -161,65 +161,67 @@ test('absent: the log has no record of the receipt', async () => {
   assert.match(r.errors.join(';'), /the log has no record of receipt/);
 });
 
-test('includedBy: a commit before market close must sit in a head signed before close', async () => {
+test('the head reports its own signed date as sth_timestamp', async () => {
   const { receipt, data } = await logged();
-  const headMs = Date.parse(data.sth.timestamp);
-  const at = (ms) => new Date(ms).toISOString();
-  const ok = serve(() => json({ ok: true, data }));
-  // Head signed before the deadline: included.
-  const r1 = await verifyReceipt(receipt, { ...base(), fetcher: ok.fetcher, includedBy: at(headMs + 60_000) });
-  assert.equal(r1.valid, true, r1.errors.join('; '));
-  assert.equal(r1.log.status, 'included');
-  assert.equal(r1.log.sth_timestamp, data.sth.timestamp);
-  // The only proof is against a head signed after close: fails, though the
-  // receipt is in the log (it may have been sequenced only after the outcome).
-  const r2 = await verifyReceipt(receipt, { ...base(), fetcher: ok.fetcher, includedBy: at(headMs - 60_000) });
-  assert.equal(r2.valid, false);
-  assert.equal(r2.log.status, 'failed');
-  assert.match(r2.errors.join(';'), /after includedBy/);
-  // A supplied proof is held to the same deadline.
-  const r3 = await verifyReceipt(receipt, { ...base(), inclusion: { proof: data, logKeys: ACTIVE_PINS.logKeys }, includedBy: at(headMs - 1) });
-  assert.equal(r3.log.status, 'failed');
-  assert.match(r3.errors.join(';'), /after includedBy/);
-  // The boundary: a head signed at the deadline itself meets it.
-  const r3b = await verifyReceipt(receipt, { ...base(), fetcher: ok.fetcher, includedBy: data.sth.timestamp });
-  assert.equal(r3b.log.status, 'included', r3b.errors.join('; '));
-  // Committed in the last hour, close not reached yet: pending.
-  const q = serve(notSequenced(receipt.receipt_id));
-  const r4 = await verifyReceipt(receipt, { ...base(), fetcher: q.fetcher, includedBy: at(Date.now() + 3_600_000) });
-  assert.equal(r4.log.status, 'pending');
-  // Close has passed and it is still unsequenced: it can no longer be logged
-  // in time, so it fails rather than waits.
-  const r5 = await verifyReceipt(receipt, { ...base(), fetcher: q.fetcher, includedBy: at(Date.now() - 1000) });
-  assert.equal(r5.valid, false);
-  assert.equal(r5.log.status, 'failed');
-  assert.match(r5.errors.join(';'), /not in a tree head signed by includedBy/);
-  // A head with no timestamp cannot meet a deadline; a bad deadline is an error.
+  const r = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data })).fetcher });
+  assert.equal(r.log.sth_timestamp, data.sth.timestamp);
+  // A head with no timestamp still proves inclusion; it just has no date.
   const { signature: _s, timestamp: _t, ...body } = data.sth;
   const bare = await signSth(issuer, body);
-  const noDeadline = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data: { ...data, sth: bare } })).fetcher });
-  assert.equal(noDeadline.log.status, 'included', noDeadline.errors.join('; '));
-  const r6 = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data: { ...data, sth: bare } })).fetcher, includedBy: at(headMs + 60_000) });
-  assert.equal(r6.valid, false);
-  assert.match(r6.errors.join(';'), /needs a tree head with an RFC 3339 timestamp/);
+  const r2 = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data: { ...data, sth: bare } })).fetcher });
+  assert.equal(r2.log.status, 'included', r2.errors.join('; '));
+  assert.equal(r2.log.sth_timestamp, undefined);
 });
 
-test('includedBy and head dates must be RFC 3339 with a zone; a bad value never throws', async () => {
+// After a log-key change: the served document hands the log over from the
+// receipt key to a new log key at tree size 5, and heads past it are signed
+// by the new key. Hand-over as log.test.mjs kdHandover builds it.
+const NEW_KID = 'tm-log-2026-12';
+async function handedOver(from, to, over = {}) {
+  const body = {
+    type: 'tunnelmind.log-key-handover/v1', log_id: PINNED_LOG_KEYS.log_id,
+    from_key_id: KEY_ID, to_key_id: NEW_KID, to_public_key: to.publicKeyB64,
+    tree_size: 5, root_hash: hex(Buffer.alloc(32, 0x55)), ...over,
+  };
+  const sig = await subtle.sign('Ed25519', from.kp.privateKey, canonicalizeBytes(body));
+  return {
+    log_id: body.log_id,
+    keys: [
+      { key_id: KEY_ID, public_key: issuer.publicKeyB64, from_tree_size: 0, until_tree_size: 5 },
+      { key_id: NEW_KID, public_key: to.publicKeyB64, from_tree_size: 5, until_tree_size: null,
+        handover: { ...body, signature: { algorithm: 'Ed25519', value: Buffer.from(sig).toString('base64') } } },
+    ],
+  };
+}
+
+test('logKeys: after a log-key change the served document lets new heads verify', async () => {
+  const logKey = await makeEphemeralKey();
   const { receipt, data } = await logged();
-  const ok = serve(() => json({ ok: true, data }));
-  // Date.parse takes all of these; none is a dated instant every verifier
-  // reads the same way (a zone-less time is the verifier's local time).
-  for (const bad of ['before close', '2027', 2027, new Date(), '2026-11-21T12:00:00', 'Nov 21 2026 13:00', Symbol('x'), null]) {
-    const r = await verifyReceipt(receipt, { ...base(), fetcher: ok.fetcher, includedBy: bad });
-    assert.equal(r.valid, false, String(typeof bad));
-    assert.match(r.errors.join(';'), /includedBy: not an RFC 3339 date-time with a zone/, String(typeof bad));
-  }
-  // A signed head whose timestamp is not RFC 3339 cannot meet a deadline.
-  for (const ts of ['2026', 'Sat Nov 21 2026', '2026-11-21T12:00:00']) {
-    const sth = await signSth(issuer, { ...(({ signature, ...b }) => b)(data.sth), timestamp: ts });
-    const r = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data: { ...data, sth } })).fetcher, includedBy: '2099-01-01T00:00:00Z' });
-    assert.equal(r.log.status, 'failed', ts);
-    assert.match(r.errors.join(';'), /needs a tree head with an RFC 3339 timestamp/, ts);
+  const { signature: _s, ...body } = data.sth;
+  const sig = await subtle.sign('Ed25519', logKey.kp.privateKey, canonicalizeBytes({ ...body, key_id: NEW_KID }));
+  const sth = { ...body, key_id: NEW_KID, signature: { algorithm: 'Ed25519', key_id: NEW_KID, value: Buffer.from(sig).toString('base64') } };
+  const { fetcher } = serve(() => json({ ok: true, data: { ...data, sth } }));
+  // The pins alone do not know the new key: every receipt fails.
+  const pinned = await verifyReceipt(receipt, { ...base(), fetcher });
+  assert.equal(pinned.log.status, 'failed');
+  assert.match(pinned.errors.join(';'), /unknown_key_id/);
+  // The served document, chained from the pinned receipt key: included.
+  const served = await handedOver(issuer, logKey);
+  const r = await verifyReceipt(receipt, { ...base(), fetcher, logKeys: served });
+  assert.equal(r.valid, true, r.errors.join('; '));
+  assert.equal(r.log.log_key_id, NEW_KID);
+  assert.equal(r.log.log_key, 'separate');
+  // Not chained to the pins, or for another log: refused.
+  const attacker = await makeEphemeralKey();
+  const cases = [
+    [await handedOver(attacker, logKey), 'hand-over signed by an unpinned key'],
+    [{ ...served, keys: [{ ...served.keys[0], public_key: attacker.publicKeyB64 }, served.keys[1]] }, 'first key not a pinned receipt key'],
+    [await handedOver(issuer, logKey, { log_id: 'other-log' }).then((d) => ({ ...d, log_id: 'other-log' })), 'document for another log'],
+  ];
+  for (const [doc, why] of cases) {
+    const x = await verifyReceipt(receipt, { ...base(), fetcher, logKeys: doc });
+    assert.equal(x.valid, false, why);
+    assert.equal(x.log.status, 'failed', why);
   }
 });
 
