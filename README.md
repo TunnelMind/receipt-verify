@@ -2,7 +2,7 @@
 
 > **Part of TunnelMind — a research house. Facts, not verdicts.**
 > Four lenses on one signed corpus: **Scry** (*who is attacking?*) · **Sigil** (*who can you trust?*) · **Tracker** (*who is watching?*) · **GhostRoute** (*where does traffic actually go?*). Exhibits return as Ed25519-signed receipts (RFC 8785 JCS) that verify offline without trusting TunnelMind; the same receipt is the foundation of the accountability kit for agents that spend money (public demo: [tunnelmind.ai/weather](https://tunnelmind.ai/weather)).
-> This package serves: **the receipt verifier** — the offline check under the kit: a Receipt v1 from the Data API, tm-crawl or the weather agent verifies here with a pinned key bundle and no call to TunnelMind. Apache-2.0. See [tunnelmind.ai/standards/receipt-format/v1](https://tunnelmind.ai/standards/receipt-format/v1).
+> This package serves: **the receipt verifier** — the offline check under the kit: a Receipt v1 from the Data API, tm-crawl or the weather agent verifies here against a key bundle (the pinned one for the Data API; tm-crawl's own key for tm-crawl). Since 4.0.0 the default call also proves a Data API receipt is in TunnelMind's transparency log, which sends its receipt_id to data.tunnelmind.ai; pass `inclusion` (a proof you hold) and `revocations` to verify fully offline. tm-crawl receipts are in tm-crawl's own store log and weather-agent receipts are not in a log yet, so pass their `inclusion` or `requireInclusion: false`. Apache-2.0. See [tunnelmind.ai/standards/receipt-format/v1](https://tunnelmind.ai/standards/receipt-format/v1).
 
 Reference TypeScript verifier for the [TunnelMind Receipt Format v1.0](https://tunnelmind.ai/standards/receipt-format/v1). Implements §4 (Verification procedure) end-to-end plus §8 (Revocation) lookups.
 
@@ -27,11 +27,14 @@ const receipt = await (
   })
 ).json();
 
-// A receipt is provable once the log signs its next tree head (about hourly).
 const result = await verifyReceipt(receipt);
 
 if (result.valid) {
   console.log('✓ verified', result.receipt_id, 'signed by', result.key_id);
+} else if (result.log.status === 'pending' && result.errors.length === 1) {
+  // A fresh receipt: genuine, but the log signs a tree head only about
+  // hourly. Not valid yet. Verify it again after the next head.
+  console.log('… not in a signed tree head yet; verify again later');
 } else {
   console.error('rejected:', result.errors);
   console.warn('warnings:', result.warnings);
@@ -119,6 +122,13 @@ interface VerifyResult {
   receipt_id?: string;
   key_id?: string;
   attestation_strength?: 'self-asserted' | 'software' | 'tee-tpm' | 'silicon-root';
+  // Transparency-log result. Every status but 'included' is an error
+  // unless requireInclusion is false.
+  log: {
+    status: 'included' | 'pending' | 'absent' | 'failed' | 'not_checked';
+    tree_size?: number; leaf_index?: number; log_key_id?: string;
+    log_key?: 'shared_with_receipts' | 'separate'; sth_timestamp?: string;
+  };
 }
 ```
 
@@ -142,7 +152,7 @@ interface VerifyResult {
 | `fetcher` | `globalThis.fetch` | Custom fetch (e.g., for tests) |
 | `inclusion` | (fetched) | `{ proof, sth?, logKeys, requireKeyId?, logId? }`: a proof you already hold, checked under pinned **log** keys (`logKeys`: the log's key document, e.g. `PINNED_LOG_KEYS`, or a key array); a failed proof is an error. Without it, see `requireInclusion`. See below |
 | `requireInclusion` | `true` | The receipt must be proven in the log. With no `inclusion` and the pinned bundle, the proof is fetched from `logProofUrl` by `receipt_id` and checked under `PINNED_LOG_KEYS`; a failed fetch is an error. With `keys`/`keysUrl` nothing is fetched and no `inclusion` is an error. **UNSAFE** to set `false`: a receipt the issuer never logged then verifies (`result.log.status` `not_checked`) |
-| `logProofUrl` | `data.tunnelmind.ai/v1/receipts/log/proof` | Proof endpoint for the default fetch (a mirror of the same log) |
+| `logProofUrl` | `data.tunnelmind.ai/v1/receipts/log/proof` | Proof endpoint for the default fetch (a mirror of the same log); https only, no user name or password. The receipt_id is sent only after every other check has passed; the fetch gives up after 10 s or 64 KiB |
 | `includedBy` | (none) | RFC 3339 deadline: the proving tree head must be dated at or before it (e.g. a commit logged before market close). A proof against a later head fails; a receipt still `pending` after it fails |
 
 ### Lower-level exports

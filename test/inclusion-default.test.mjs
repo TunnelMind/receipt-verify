@@ -1,9 +1,11 @@
 // verifyReceipt step 8 default path (4.0.0): with no `inclusion` and the
 // pinned bundle in use, the proof is fetched by receipt_id and checked under
-// PINNED_LOG_KEYS. The real pinned keys have no private half here, so this
-// file swaps the pinned receipt key and the first log-key entry for a test
-// key, in this process only (node --test runs each file in its own process),
-// and serves the log through an injected fetcher. Proofs come from the same
+// PINNED_LOG_KEYS. The real pinned keys have no private half here, and the
+// exported PINNED_* objects are frozen, so this file points the internal
+// dist/active-pins.js (not reachable through the package's exports) at a
+// test bundle and log-key document, in this process only (node --test runs
+// each file in its own process), and serves the log through an injected
+// fetcher. Proofs come from the same
 // recursive RFC 6962 reference as log.test.mjs.
 
 import { test, before } from 'node:test';
@@ -18,6 +20,7 @@ import {
   PINNED_KEY_BUNDLE,
   PINNED_LOG_KEYS,
 } from '../dist/index.js';
+import { ACTIVE_PINS } from '../dist/active-pins.js';
 import { makeReceipt, makeEphemeralKey, makeRevocations } from './_helpers.mjs';
 
 const subtle = webcrypto.subtle;
@@ -43,13 +46,17 @@ const hex = (b) => '0x' + Buffer.from(b).toString('hex');
 let issuer;
 before(async () => {
   issuer = await makeEphemeralKey();
-  PINNED_KEY_BUNDLE.keys.splice(0, PINNED_KEY_BUNDLE.keys.length, {
-    key_id: KEY_ID, algorithm: 'Ed25519', public_key: issuer.publicKeyB64, status: 'active',
-    created_at: '2026-01-01T00:00:00Z', rotation_after: '2099-01-01T00:00:00Z', attestation_strength: 'software',
-  });
-  PINNED_LOG_KEYS.keys.splice(0, PINNED_LOG_KEYS.keys.length, {
-    key_id: KEY_ID, public_key: issuer.publicKeyB64, from_tree_size: 0, until_tree_size: null, shared_with_receipts: true,
-  });
+  ACTIVE_PINS.bundle = {
+    ...PINNED_KEY_BUNDLE,
+    keys: [{
+      key_id: KEY_ID, algorithm: 'Ed25519', public_key: issuer.publicKeyB64, status: 'active',
+      created_at: '2026-01-01T00:00:00Z', rotation_after: '2099-01-01T00:00:00Z', attestation_strength: 'software',
+    }],
+  };
+  ACTIVE_PINS.logKeys = {
+    log_id: PINNED_LOG_KEYS.log_id,
+    keys: [{ key_id: KEY_ID, public_key: issuer.publicKeyB64, from_tree_size: 0, until_tree_size: null, shared_with_receipts: true }],
+  };
 });
 
 async function signSth(signer, body) {
@@ -171,8 +178,12 @@ test('includedBy: a commit before market close must sit in a head signed before 
   assert.equal(r2.log.status, 'failed');
   assert.match(r2.errors.join(';'), /after includedBy/);
   // A supplied proof is held to the same deadline.
-  const r3 = await verifyReceipt(receipt, { ...base(), inclusion: { proof: data, logKeys: PINNED_LOG_KEYS }, includedBy: at(headMs - 1) });
+  const r3 = await verifyReceipt(receipt, { ...base(), inclusion: { proof: data, logKeys: ACTIVE_PINS.logKeys }, includedBy: at(headMs - 1) });
   assert.equal(r3.log.status, 'failed');
+  assert.match(r3.errors.join(';'), /after includedBy/);
+  // The boundary: a head signed at the deadline itself meets it.
+  const r3b = await verifyReceipt(receipt, { ...base(), fetcher: ok.fetcher, includedBy: data.sth.timestamp });
+  assert.equal(r3b.log.status, 'included', r3b.errors.join('; '));
   // Committed in the last hour, close not reached yet: pending.
   const q = serve(notSequenced(receipt.receipt_id));
   const r4 = await verifyReceipt(receipt, { ...base(), fetcher: q.fetcher, includedBy: at(Date.now() + 3_600_000) });
@@ -190,10 +201,53 @@ test('includedBy: a commit before market close must sit in a head signed before 
   assert.equal(noDeadline.log.status, 'included', noDeadline.errors.join('; '));
   const r6 = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data: { ...data, sth: bare } })).fetcher, includedBy: at(headMs + 60_000) });
   assert.equal(r6.valid, false);
-  assert.match(r6.errors.join(';'), /needs a tree head with a valid timestamp/);
-  const r7 = await verifyReceipt(receipt, { ...base(), fetcher: ok.fetcher, includedBy: 'before close' });
-  assert.equal(r7.valid, false);
-  assert.match(r7.errors.join(';'), /includedBy: not a valid date/);
+  assert.match(r6.errors.join(';'), /needs a tree head with an RFC 3339 timestamp/);
+});
+
+test('includedBy and head dates must be RFC 3339 with a zone; a bad value never throws', async () => {
+  const { receipt, data } = await logged();
+  const ok = serve(() => json({ ok: true, data }));
+  // Date.parse takes all of these; none is a dated instant every verifier
+  // reads the same way (a zone-less time is the verifier's local time).
+  for (const bad of ['before close', '2027', 2027, new Date(), '2026-11-21T12:00:00', 'Nov 21 2026 13:00', Symbol('x'), null]) {
+    const r = await verifyReceipt(receipt, { ...base(), fetcher: ok.fetcher, includedBy: bad });
+    assert.equal(r.valid, false, String(typeof bad));
+    assert.match(r.errors.join(';'), /includedBy: not an RFC 3339 date-time with a zone/, String(typeof bad));
+  }
+  // A signed head whose timestamp is not RFC 3339 cannot meet a deadline.
+  for (const ts of ['2026', 'Sat Nov 21 2026', '2026-11-21T12:00:00']) {
+    const sth = await signSth(issuer, { ...(({ signature, ...b }) => b)(data.sth), timestamp: ts });
+    const r = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data: { ...data, sth } })).fetcher, includedBy: '2099-01-01T00:00:00Z' });
+    assert.equal(r.log.status, 'failed', ts);
+    assert.match(r.errors.join(';'), /needs a tree head with an RFC 3339 timestamp/, ts);
+  }
+});
+
+test('pending also covers a receipt sequenced past the latest signed head (400)', async () => {
+  const { receipt } = await logged();
+  const past = serve(() => json({ ok: false, error: 'leaf_index 9 is outside tree_size 7', code: 400 }, 400));
+  const r = await verifyReceipt(receipt, { ...base(), fetcher: past.fetcher });
+  assert.equal(r.valid, false);
+  assert.equal(r.log.status, 'pending');
+  // Any other 400 is not a label: fetch failed.
+  const other = serve(() => json({ ok: false, error: 'malformed receipt_id', code: 400 }, 400));
+  const r2 = await verifyReceipt(receipt, { ...base(), fetcher: other.fetcher });
+  assert.equal(r2.log.status, 'not_checked');
+  // The 404 texts are matched whole: one that mixes both reads as neither.
+  const mixed = serve(() => json({ ok: false, error: 'no receipt x is not yet sequenced into the log', code: 404 }, 404));
+  const r3 = await verifyReceipt(receipt, { ...base(), fetcher: mixed.fetcher });
+  assert.equal(r3.log.status, 'not_checked');
+});
+
+test('a receipt that already failed is not sent to the log', async () => {
+  const { receipt } = await logged();
+  const bad = { ...receipt, signature: { ...receipt.signature, value: Buffer.alloc(64).toString('base64') } };
+  const { urls, fetcher } = serve(() => { throw new Error('must not fetch'); });
+  const r = await verifyReceipt(bad, { ...base(), fetcher });
+  assert.equal(r.valid, false);
+  assert.equal(r.log.status, 'not_checked');
+  assert.match(r.errors.join(';'), /log inclusion: not checked: the receipt already failed/);
+  assert.equal(urls.length, 0);
 });
 
 test('requireInclusion: false skips the log without fetching', async () => {

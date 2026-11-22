@@ -12,7 +12,17 @@ export const PINNED_KEYS_FETCHED_AT = '2026-10-17';
 // `verification` field the KeyBundle type does not model and without a
 // `$schema`, which the live file does not carry either: a verifier that pins
 // a stale or edited copy accepts a different set of keys than the issuer publishes.
-export const PINNED_KEY_BUNDLE: KeyBundle = {
+/** Freeze `o` and everything under it, so a trust root cannot be edited
+ *  through the export (a caller that pushes a key would trust it). */
+function deepFreeze<T>(o: T): T {
+  if (o && typeof o === 'object' && !Object.isFrozen(o)) {
+    for (const v of Object.values(o)) deepFreeze(v);
+    Object.freeze(o);
+  }
+  return o;
+}
+
+export const PINNED_KEY_BUNDLE: KeyBundle = deepFreeze({
   "service": "TunnelMind Receipt Format v1.0",
   "spec": "https://tunnelmind.ai/standards/receipt-format/v1",
   "format_version": "1.0",
@@ -40,7 +50,7 @@ export const PINNED_KEY_BUNDLE: KeyBundle = {
     "instructions": "Resolve the active key whose key_id matches the receipt's signature.key_id. Verify Ed25519 signature against JCS(receipt with payload and signature.value omitted). Reject if the receipt's attestation_strength exceeds this key's attestation_strength. See https://tunnelmind.ai/standards/receipt-format/v1 §4.",
     "reference_verifier": "https://github.com/TunnelMind/receipt-verify"
   }
-} as KeyBundle;
+} as KeyBundle);
 
 // The log's key document (key per tree size, ADR-047 §4), checked with
 // checkLogKeyDoc and anchored on the receipt key above.
@@ -52,7 +62,7 @@ export const LOG_KEYS_URL = 'https://data.tunnelmind.ai/.well-known/receipt-log-
 // the served document, verbatim, and set the date.
 export const PINNED_LOG_KEYS_FETCHED_AT = '2026-11-13';
 
-export const PINNED_LOG_KEYS: LogKeyDoc = {
+export const PINNED_LOG_KEYS: LogKeyDoc = deepFreeze({
   "log_id": "tunnelmind-receipts-log-v1",
   "keys": [
     {
@@ -63,4 +73,4 @@ export const PINNED_LOG_KEYS: LogKeyDoc = {
       "shared_with_receipts": true
     }
   ]
-};
+});

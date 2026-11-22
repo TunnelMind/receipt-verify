@@ -600,8 +600,9 @@ export const DEFAULT_LOG_PROOF_URL = 'https://data.tunnelmind.ai/v1/receipts/log
 const RECEIPT_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 
 /** Why fetchInclusionProof got no proof: `pending` (the log holds the
- *  receipt, not sequenced yet), `absent` (the log has no record of it) or
- *  `unavailable` (anything else: network, HTTP error, bad body, no head). */
+ *  receipt but no signed head covers it yet), `absent` (the log has no record
+ *  of it) or `unavailable` (anything else: bad id or url, network, timeout,
+ *  HTTP error, bad or oversized body). */
 export class LogProofUnavailable extends Error {
   constructor(message: string, readonly kind: 'pending' | 'absent' | 'unavailable') {
     super(message);
@@ -610,50 +611,106 @@ export class LogProofUnavailable extends Error {
 }
 
 export interface FetchProofOptions {
-  /** Override the proof endpoint (e.g. a mirror of the same log). */
+  /** Override the proof endpoint (e.g. a mirror of the same log). Must be
+   *  https with no user name or password. */
   url?: string;
   fetcher?: typeof fetch;
+  /** Give up after this many milliseconds (default
+   *  DEFAULT_LOG_PROOF_TIMEOUT_MS). The fetcher gets an AbortSignal; one that
+   *  ignores it is raced, so the call still ends. */
+  timeoutMs?: number;
+}
+
+/** How long fetchInclusionProof waits for the proof endpoint. */
+export const DEFAULT_LOG_PROOF_TIMEOUT_MS = 10_000;
+/** The largest proof response read. A proof for a log of 2^64 leaves is
+ *  under 8 KiB, so this is generous. */
+export const MAX_LOG_PROOF_BYTES = 64 * 1024;
+
+// The endpoint's 404 and 400 texts (data-api api/routes/receipt-log.js
+// getInclusionProof and proveLeaf), matched whole. They only label a failure.
+const NOT_SEQUENCED_RE = /^receipt [A-Za-z0-9-]{1,64} is not yet sequenced into the log$/;
+const NO_RECEIPT_RE = /^no receipt [A-Za-z0-9-]{1,64}$/;
+const PAST_HEAD_RE = /^leaf_index \d+ is outside tree_size \d+$/;
+
+/** Read at most `max` bytes of a response body as UTF-8 text. */
+async function readCapped(r: Response, max: number): Promise<string> {
+  const len = Number(r.headers.get('content-length'));
+  if (Number.isFinite(len) && len > max) throw new Error(`body is over ${max} bytes`);
+  if (!r.body) return '';
+  const reader = r.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.byteLength;
+    if (n > max) { await reader.cancel().catch(() => {}); throw new Error(`body is over ${max} bytes`); }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) { all.set(c, o); o += c.byteLength; }
+  return new TextDecoder('utf-8', { fatal: true }).decode(all);
 }
 
 /** Fetch the inclusion proof for `receiptId` against the latest signed tree
- *  head (the response carries that head as `proof.sth`). Throws
- *  LogProofUnavailable on a bad id, a network or HTTP failure, or a body that
- *  is not `{ ok: true, data }`; a 404 is told apart by the endpoint's own
- *  error text (data-api receipt-log.js getInclusionProof): `pending` for
- *  "not yet sequenced", `absent` for "no receipt". That text only labels a
- *  failure, it never makes one pass. Nothing fetched is trusted:
- *  verifyReceiptInclusion recomputes the leaf from the receipt and checks
- *  the head under the caller's pinned log keys. */
+ *  head (the response carries that head as `proof.sth`). Never throws
+ *  anything but LogProofUnavailable: on a bad id or url, a network failure,
+ *  a timeout, an HTTP error, an oversized body or one that is not
+ *  `{ ok: true, data }`. The endpoint's own error text tells three cases
+ *  apart: `pending` for a receipt not sequenced yet (404) or sequenced past
+ *  the latest signed head (400), `absent` for "no receipt" (404). That text
+ *  only labels a failure, it never makes one pass. Nothing fetched is
+ *  trusted: verifyReceiptInclusion recomputes the leaf from the receipt and
+ *  checks the head under the caller's pinned log keys. */
 export async function fetchInclusionProof(receiptId: unknown, opts: FetchProofOptions = {}): Promise<InclusionProof> {
   if (typeof receiptId !== 'string' || !RECEIPT_ID_RE.test(receiptId)) {
     throw new LogProofUnavailable('receipt_id is not a log id ([A-Za-z0-9-]{1,64})', 'unavailable');
   }
-  const u = new URL(opts.url ?? DEFAULT_LOG_PROOF_URL);
-  u.searchParams.set('receipt_id', receiptId);
-  const f = opts.fetcher ?? fetch;
-  let r: Response;
+  let u: URL;
   try {
-    r = await f(u.toString());
+    u = new URL(opts.url ?? DEFAULT_LOG_PROOF_URL);
+  } catch {
+    throw new LogProofUnavailable('logProofUrl is not a URL', 'unavailable');
+  }
+  if (u.protocol !== 'https:' || u.username !== '' || u.password !== '') {
+    throw new LogProofUnavailable('logProofUrl must be https with no user name or password', 'unavailable');
+  }
+  u.searchParams.set('receipt_id', receiptId);
+  const where = `${u.origin}${u.pathname}`;
+  const f = opts.fetcher ?? fetch;
+  const ms = opts.timeoutMs ?? DEFAULT_LOG_PROOF_TIMEOUT_MS;
+  const ac = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => { ac.abort(); reject(new Error(`no answer from ${where} in ${ms} ms`)); }, ms);
+  });
+  let status: number;
+  let text: string;
+  try {
+    [status, text] = await Promise.race([
+      (async (): Promise<[number, string]> => {
+        const r = await f(u.toString(), { signal: ac.signal });
+        return [r.status, await readCapped(r, MAX_LOG_PROOF_BYTES)];
+      })(),
+      timeout,
+    ]);
   } catch (e) {
-    throw new LogProofUnavailable((e as Error).message, 'unavailable');
+    throw new LogProofUnavailable(e instanceof Error ? e.message : String(e), 'unavailable');
+  } finally {
+    clearTimeout(timer);
   }
-  if (r.status === 404) {
-    let why = '';
-    try {
-      const j: unknown = await r.json();
-      if (isObj(j) && typeof j.error === 'string') why = j.error;
-    } catch { /* no body: unavailable below */ }
-    if (/ is not yet sequenced into the log$/.test(why)) {
-      throw new LogProofUnavailable(`receipt ${receiptId} is not in a signed tree head yet (a new head is signed about hourly)`, 'pending');
-    }
-    if (/^no receipt /.test(why)) {
-      throw new LogProofUnavailable(`the log has no record of receipt ${receiptId}`, 'absent');
-    }
-    throw new LogProofUnavailable(`${u.origin}${u.pathname} returned 404`, 'unavailable');
-  }
-  if (!r.ok) throw new LogProofUnavailable(`${u.origin}${u.pathname} returned ${r.status}`, 'unavailable');
   let j: unknown;
-  try { j = await r.json(); } catch (e) { throw new LogProofUnavailable(`proof response: ${(e as Error).message}`, 'unavailable'); }
+  try { j = JSON.parse(text); } catch { j = undefined; }
+  const why = isObj(j) && typeof j.error === 'string' ? j.error : '';
+  if (status === 404 && NO_RECEIPT_RE.test(why)) {
+    throw new LogProofUnavailable(`the log has no record of receipt ${receiptId}`, 'absent');
+  }
+  if ((status === 404 && NOT_SEQUENCED_RE.test(why)) || (status === 400 && PAST_HEAD_RE.test(why))) {
+    throw new LogProofUnavailable(`receipt ${receiptId} is not in a signed tree head yet (a new head is signed about hourly)`, 'pending');
+  }
+  if (status < 200 || status > 299) throw new LogProofUnavailable(`${where} returned ${status}`, 'unavailable');
   if (!isObj(j) || j.ok !== true || !isObj(j.data)) throw new LogProofUnavailable('proof response is not { ok: true, data }', 'unavailable');
   return j.data as unknown as InclusionProof;
 }

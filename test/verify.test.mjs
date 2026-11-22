@@ -13,7 +13,8 @@ import {
   PINNED_KEYS_FETCHED_AT,
 } from '../dist/index.js';
 // These tests cover §4 steps 1-7. Log inclusion (step 8) is required by
-// default and is tested in log.test.mjs, so here it is switched off.
+// default and is tested in log.test.mjs and inclusion-default.test.mjs, so
+// here it is switched off.
 const verifyReceipt = (r, o = {}) => verifyAll(r, { requireInclusion: false, ...o });
 const verifyReceiptJson = (t, o = {}) => verifyAllJson(t, { requireInclusion: false, ...o });
 import {

@@ -15,8 +15,10 @@ src/log.ts          signed tree heads under pinned log keys (a key array, or the
 src/jcs.ts          RFC 8785 canonicalizer: the bytes signatures and payload_hash cover
 src/keys.ts         key bundle: fetch + per-URL cache, resolveKey, keyUsableAt (status + window)
 src/revocation.ts   revocation feed: fetch + cache, isKeyRevoked, isReceiptRevoked
-src/pinned-keys.ts  the published bundle, shipped so the default path needs no network; also the log's
-                    key document (PINNED_LOG_KEYS) and where it is served (LOG_KEYS_URL)
+src/pinned-keys.ts  the published bundle, shipped so key resolution needs no network; also the log's
+                    key document (PINNED_LOG_KEYS) and where it is served (LOG_KEYS_URL); both deep-frozen
+src/active-pins.ts  the pins verifyReceipt uses (the two above); internal, not in package "exports",
+                    the test suite points it at a test key
 scripts/verify-verdict.mjs   CLI: offline Reconciliation Verdict verifier (argv/IO only)
 scripts/verdict-lib/         its kernel: verify-receipt.js (5 checks) + reconcile/tier/log/jcs/hash,
                              vendored from the service (jcs re-exports the package canonicalizer);

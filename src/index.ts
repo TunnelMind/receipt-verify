@@ -23,7 +23,7 @@ import {
   keyUsableAt,
   type AttestationStrength,
 } from './keys.js';
-import { PINNED_KEY_BUNDLE, PINNED_LOG_KEYS } from './pinned-keys.js';
+import { ACTIVE_PINS } from './active-pins.js';
 import { b64ToBytes, signatureBytes, toAB } from './bytes.js';
 import {
   fetchRevocations,
@@ -264,9 +264,34 @@ export async function verifyReceiptJson(
   return verifyReceipt(parsed as unknown as Receipt, opts);
 }
 
+/** RFC 3339 date-time with a zone (Z or an offset), as epoch ms; undefined
+ *  for anything else. Date.parse alone also takes "2027", local-zone
+ *  times and engine-specific forms. */
+const RFC3339_RE = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2})$/;
+function parseRfc3339(v: unknown): number | undefined {
+  if (typeof v !== 'string' || !RFC3339_RE.test(v)) return undefined;
+  const ms = Date.parse(v);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+/** Verify one receipt (steps above). Never throws: anything that would
+ *  (a receipt nested too deep to walk, a hostile option value) is returned
+ *  as an error with valid false. */
 export async function verifyReceipt(
   receipt: Receipt,
   opts: VerifyOptions = {},
+): Promise<VerifyResult> {
+  try {
+    return await verifyReceiptUnguarded(receipt, opts);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { valid: false, errors: [`receipt could not be checked: ${msg}`], warnings: [], log: { status: 'not_checked' } };
+  }
+}
+
+async function verifyReceiptUnguarded(
+  receipt: Receipt,
+  opts: VerifyOptions,
 ): Promise<VerifyResult> {
   const errors: string[]   = [];
   const warnings: string[] = [];
@@ -327,7 +352,7 @@ export async function verifyReceipt(
       bundle = opts.keys
         ?? (opts.keysUrl && !opts.noFetchKeys
           ? await fetchKeyBundle({ url: opts.keysUrl, fetcher: opts.fetcher })
-          : PINNED_KEY_BUNDLE);
+          : ACTIVE_PINS.bundle);
       resolvedKey = resolveKey(bundle, keyId);
       // allowKeyMismatch never rescues an unresolved key_id.
       if (!resolvedKey) errors.push(`signature.key_id ${keyId} not present in key bundle`);
@@ -499,18 +524,24 @@ export async function verifyReceipt(
   // trusted than a supplied one.
   let deadline: number | undefined;
   if (opts.includedBy !== undefined) {
-    deadline = Date.parse(opts.includedBy);
-    if (!Number.isFinite(deadline)) errors.push(`includedBy: not a valid date: ${String(opts.includedBy)}`);
+    deadline = parseRfc3339(opts.includedBy);
+    if (deadline === undefined) errors.push('includedBy: not an RFC 3339 date-time with a zone (e.g. 2026-11-21T20:00:00Z)');
   }
-  const pastDeadline = deadline !== undefined && Number.isFinite(deadline) && Date.now() > deadline;
+  const pastDeadline = deadline !== undefined && Date.now() > deadline;
   let inc = opts.inclusion;
   if (!inc && opts.requireInclusion !== false) {
     // Fetch only for TunnelMind's own receipts: another issuer's receipt
-    // is not in this log, and its id would leak to it.
-    if (bundle === PINNED_KEY_BUNDLE) {
+    // is not in this log, and its id would leak to it. Fetch only once every
+    // other check has passed: a receipt that is already invalid gains
+    // nothing from a proof, and its id is not sent.
+    if (bundle !== ACTIVE_PINS.bundle) {
+      errors.push('log inclusion: required but no inclusion proof was supplied (pass inclusion, or requireInclusion: false)');
+    } else if (errors.length > 0) {
+      errors.push('log inclusion: not checked: the receipt already failed the checks above');
+    } else {
       try {
         const proof = await fetchInclusionProof(receipt.receipt_id, { url: opts.logProofUrl, fetcher: opts.fetcher });
-        inc = { proof, logKeys: PINNED_LOG_KEYS, logId: PINNED_LOG_KEYS.log_id };
+        inc = { proof, logKeys: ACTIVE_PINS.logKeys, logId: ACTIVE_PINS.logKeys.log_id };
       } catch (e) {
         const kind = e instanceof LogProofUnavailable ? e.kind : 'unavailable';
         const msg = (e as Error).message;
@@ -530,14 +561,12 @@ export async function verifyReceipt(
           errors.push(`log inclusion: proof fetch failed: ${msg}`);
         }
       }
-    } else {
-      errors.push('log inclusion: required but no inclusion proof was supplied (pass inclusion, or requireInclusion: false)');
     }
   }
   if (inc) {
     // Receipt keys = the bundle in use plus the pinned one, so a log key
     // that is also a receipt key is caught whichever bundle signed.
-    const receiptKeys = [...(Array.isArray(bundle?.keys) ? bundle.keys : []), ...PINNED_KEY_BUNDLE.keys];
+    const receiptKeys = [...(Array.isArray(bundle?.keys) ? bundle.keys : []), ...ACTIVE_PINS.bundle.keys];
     const r = await verifyReceiptInclusion(receipt, inc.proof, inc.sth, inc.logKeys, {
       requireKeyId: inc.requireKeyId,
       logId: inc.logId,
@@ -553,11 +582,11 @@ export async function verifyReceipt(
     const head = (inc.sth ?? (inc.proof as InclusionProof | undefined)?.sth) as SignedTreeHead | undefined;
     const headTs = typeof head?.timestamp === 'string' ? head.timestamp : undefined;
     if (r.status === 'included' && headTs !== undefined) out.log.sth_timestamp = headTs;
-    if (r.status === 'included' && deadline !== undefined && Number.isFinite(deadline)) {
-      const headMs = headTs === undefined ? NaN : Date.parse(headTs);
-      if (!Number.isFinite(headMs)) {
+    if (r.status === 'included' && deadline !== undefined) {
+      const headMs = parseRfc3339(headTs);
+      if (headMs === undefined) {
         out.log.status = 'failed';
-        errors.push('log inclusion: includedBy needs a tree head with a valid timestamp');
+        errors.push('log inclusion: includedBy needs a tree head with an RFC 3339 timestamp');
       } else if (headMs > deadline) {
         out.log.status = 'failed';
         errors.push(`log inclusion: the proving tree head is dated ${headTs}, after includedBy ${opts.includedBy}; pass a proof against a head signed by then`);
@@ -617,6 +646,8 @@ export {
   fetchInclusionProof,
   LogProofUnavailable,
   DEFAULT_LOG_PROOF_URL,
+  DEFAULT_LOG_PROOF_TIMEOUT_MS,
+  MAX_LOG_PROOF_BYTES,
   LogMonitor,
   MemorySthStore,
   checkLogKeyDoc,
