@@ -1,6 +1,29 @@
 # Changelog
 
-## 3.0.0 — unreleased (not published)
+## 4.0.0 — unreleased (not published)
+
+### Breaking
+
+Major bump 3.0.0 -> 4.0.0: log inclusion is on by default.
+
+- `verifyReceipt()` and `verifyReceiptJson()` now require transparency-log inclusion: `requireInclusion` defaults to `true`. With no `inclusion` given and the pinned key bundle in use, the proof is fetched from `DEFAULT_LOG_PROOF_URL` (`https://data.tunnelmind.ai/v1/receipts/log/proof?receipt_id=…`, override with `logProofUrl`, fetched with `fetcher`) and checked under `PINNED_LOG_KEYS`; the fetched proof, head and leaf hash are trusted no more than a supplied proof. A receipt that is not proven is invalid: `log.status` is `pending` when the log holds it but no signed head covers it yet (the log signs a new head about hourly), `absent` when the log has no record of it, and `not_checked` with `log inclusion: proof fetch failed: …` when the proof cannot be fetched. The receipt_id is sent only after every other check has passed, over https, with a 10 s timeout, a 64 KiB cap on the response and no redirects (a 3xx could carry the id to another host). With `keys` or `keysUrl` (another issuer) nothing is fetched and no `inclusion` is an error `log inclusion: required but no inclusion proof was supplied …`, so another issuer's receipt id never reaches TunnelMind's log. Before, a receipt that was never logged verified with `log.status` `not_checked`. Migration: pass `inclusion` when you hold the proof (offline), or `requireInclusion: false` to keep the 3.x behaviour (signature checked, log membership not). Old receipts: every receipt that went into data-api's ledger is in the log, so its proof is served; a receipt issued before the ledger, or one returned with `receipt_logged: false`, has no proof and now fails unless you opt out (2026-11-20).
+- `LogStatus` gains `pending` (the log holds the receipt, not in a signed tree head yet) and `absent` (the log has no record of it), told apart by the proof endpoint's own error text, matched whole (a 404 for "not yet sequenced" or "no receipt", a 400 for a leaf past the latest head). Neither is valid: pending is the log's word, and a key holder could leave a receipt pending forever. Migration: treat `pending` as "verify again after the next head"; code that switched on the three old statuses must handle the two new ones (2026-11-20).
+- The default call now makes a network request per receipt: the receipt_id goes to `data.tunnelmind.ai`. Fully offline verification needs `revocations` and `inclusion` (or the opt-out). Receipts from another issuer, tm-crawl's included (its own key, its own store log), never reach TunnelMind's log and need `inclusion` or `requireInclusion: false`; weather-agent receipts are not in this log yet (2026-11-22).
+- `PINNED_KEY_BUNDLE` and `PINNED_LOG_KEYS` are frozen, all the way down: code that edited them (to add a key) now throws a TypeError. Pass `keys` or `inclusion.logKeys` instead (2026-11-22).
+- `scripts/verdict-lib` passes `requireInclusion: false` to its envelope check: a verdict receipt's own inclusion check is the checkpoint proof, unchanged (2026-11-20).
+
+### Added
+
+- `logKeys` on `verifyReceipt`: the log's key document for the default fetch path, in place of `PINNED_LOG_KEYS`, so heads signed after a log-key change verify on an installed 4.0.0 without a new release. It is trusted only as far as it chains back to the pins (first key a pinned receipt key, each later key handed over by the one before, `log_id` the pinned log's), and it must be a key document: a bare key array is refused before anything is fetched, because array mode has no anchor (2026-11-22, array refusal 2026-11-28).
+- `result.log.sth_timestamp`: the proving head's own signed date. It is the issuer's claim (the log key is the receipt key today), so it does not prove a receipt was logged before a deadline; a draft `includedBy` option that implied it would was dropped before release (2026-11-22).
+- `fetchInclusionProof(receiptId, { url?, fetcher?, timeoutMs? })`, `LogProofUnavailable` (its `kind`: `pending`, `absent`, `unavailable`), `DEFAULT_LOG_PROOF_URL`, `DEFAULT_LOG_PROOF_TIMEOUT_MS`, `MAX_LOG_PROOF_BYTES` and the `FetchProofOptions` type. Only ids matching the endpoint's `[A-Za-z0-9-]{1,64}` are sent, only to an https URL with no user name or password; it throws nothing but `LogProofUnavailable` (2026-11-20, hardened 2026-11-22).
+
+### Fixed
+
+- `verifyReceipt` never throws: a receipt nested too deep to walk, or a hostile option value, is returned as an error with `valid: false` (it threw a RangeError or TypeError before) (2026-11-22).
+- Tests: review hardening (test/hardening.test.mjs: frozen pins, never throws, bad endpoint, timeout, size cap), a log-key change through `logKeys` (and three documents that do not chain to the pins, a bare key array, a document for another log), redirects refused, error texts only whole and on their own status, only `false` opts out, a 400 past the head, whole-text matching, no fetch for an already-invalid receipt; pending, absent; the default fetch path end to end, a forged head, a lying leaf hash, wrong index and another log's head from the fetched proof, every way a fetch can fail, the opt-out, the URL override and a refused receipt id (test/inclusion-default.test.mjs) (2026-11-20).
+
+## 3.0.0 — 2026-11-17 (published to npm)
 
 ### Breaking
 

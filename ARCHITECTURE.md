@@ -15,8 +15,10 @@ src/log.ts          signed tree heads under pinned log keys (a key array, or the
 src/jcs.ts          RFC 8785 canonicalizer: the bytes signatures and payload_hash cover
 src/keys.ts         key bundle: fetch + per-URL cache, resolveKey, keyUsableAt (status + window)
 src/revocation.ts   revocation feed: fetch + cache, isKeyRevoked, isReceiptRevoked
-src/pinned-keys.ts  the published bundle, shipped so the default path needs no network; also the log's
-                    key document (PINNED_LOG_KEYS) and where it is served (LOG_KEYS_URL)
+src/pinned-keys.ts  the published bundle, shipped so key resolution needs no network; also the log's
+                    key document (PINNED_LOG_KEYS) and where it is served (LOG_KEYS_URL); both deep-frozen
+src/active-pins.ts  the pins verifyReceipt uses (the two above); internal, not in package "exports",
+                    the test suite points it at a test key
 scripts/verify-verdict.mjs   CLI: offline Reconciliation Verdict verifier (argv/IO only)
 scripts/verdict-lib/         its kernel: verify-receipt.js (5 checks) + reconcile/tier/log/jcs/hash,
                              vendored from the service (jcs re-exports the package canonicalizer);
@@ -40,12 +42,15 @@ receipt (untrusted JSON)
    │ 5 attestation_strength ∈ four tiers and ≤ entry.attestation_strength
    │ 6 feed = opts.revocations > fetch(revocationsUrl); key + receipt lookups   ← revocation.ts
    │ 7 chain sanity (warning), or hard hash+sequence link when opts.previous is given
-   │ 8 opts.inclusion: STH verified under logKeys: a pinned key array (never the       ← log.ts
+   │ 8 inclusion, required by default: opts.inclusion, else (pinned bundle only)       ← log.ts
+   │   fetchInclusionProof(receipt_id) (https, no redirects, 10 s, 64 KiB; only after checks 1-7 pass)
+   │   checked under PINNED_LOG_KEYS or opts.logKeys (a key document only). STH verified under logKeys: a pinned key array (never the
    │   receipt bundle), or a key document, which is rooted in a receipt key;
    │   proof root/size must equal the STH's; leaf = SHA-256(0x00||JCS(receipt));
-   │   audit path → signed root (merkle.ts). opts.requireInclusion: no proof = error
+   │   audit path → signed root (merkle.ts). No proof = error unless requireInclusion: false
    ▼
-VerifyResult { valid: errors.length === 0, errors, warnings, receipt_id, key_id, attestation_strength }
+VerifyResult { valid: errors.length === 0, errors, warnings, receipt_id, key_id, attestation_strength,
+               log: { status, tree_size?, leaf_index?, log_key_id?, log_key?, sth_timestamp? } }
 ```
 
 A verdict receipt goes through `verdict-lib/verify-receipt.js`: check 1 is

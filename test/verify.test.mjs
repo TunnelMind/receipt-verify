@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
 import { canonicalizeBytes } from '../dist/jcs.js';
 import {
-  verifyReceipt,
-  verifyReceiptJson,
+  verifyReceipt as verifyAll,
+  verifyReceiptJson as verifyAllJson,
   fetchRevocations,
   clearKeyCache,
   clearRevocationCache,
@@ -12,6 +12,11 @@ import {
   PINNED_KEY_BUNDLE,
   PINNED_KEYS_FETCHED_AT,
 } from '../dist/index.js';
+// These tests cover §4 steps 1-7. Log inclusion (step 8) is required by
+// default and is tested in log.test.mjs and inclusion-default.test.mjs, so
+// here it is switched off.
+const verifyReceipt = (r, o = {}) => verifyAll(r, { requireInclusion: false, ...o });
+const verifyReceiptJson = (t, o = {}) => verifyAllJson(t, { requireInclusion: false, ...o });
 import {
   makeReceipt,
   makeEphemeralKey,

@@ -287,20 +287,26 @@ test('verifyReceipt: a receipt proven in a 7-leaf log is included', async () => 
   const s = await setup();
   const r = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, inclusion: { proof: s.proof, sth: s.sth, logKeys: s.logKeys } });
   assert.equal(r.valid, true, r.errors.join('; '));
-  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: 'log-1', log_key: 'separate' });
+  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: 'log-1', log_key: 'separate', sth_timestamp: s.sth.timestamp });
   // STH may ride inside the proof, as /v1/receipts/log/proof serves it.
   const r2 = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, inclusion: { proof: { ...s.proof, sth: s.sth }, logKeys: s.logKeys } });
   assert.equal(r2.log.status, 'included', r2.errors.join('; '));
 });
 
-test('verifyReceipt: without a proof the log is not_checked; requireInclusion makes that an error', async () => {
+test('verifyReceipt: inclusion is required by default; requireInclusion: false is the explicit opt-out', async () => {
   const s = await setup();
-  const r = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations });
-  assert.equal(r.valid, true);
-  assert.equal(r.log.status, 'not_checked');
-  const strict = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, requireInclusion: true });
-  assert.equal(strict.valid, false);
-  assert.match(strict.errors.join(';'), /required but no inclusion proof/);
+  let calls = 0;
+  const fetcher = async () => { calls++; throw new Error('must not fetch'); };
+  // Another issuer's bundle: no proof is fetched, and none given is an error.
+  const def = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, fetcher });
+  assert.equal(def.valid, false);
+  assert.equal(def.log.status, 'not_checked');
+  assert.match(def.errors.join(';'), /required but no inclusion proof/);
+  // Opt-out: signature checked, log membership not, nothing fetched.
+  const lax = await verifyReceipt(s.receipt, { keys: s.keys, revocations: s.revocations, fetcher, requireInclusion: false });
+  assert.equal(lax.valid, true, lax.errors.join('; '));
+  assert.equal(lax.log.status, 'not_checked');
+  assert.equal(calls, 0);
 });
 
 test('verifyReceipt: failed inclusion is an error (other receipt, lying root, wrong size, STH from the receipt key, no log keys)', async () => {
@@ -532,7 +538,7 @@ test('log key mode: log keys that are all receipt keys verify as today, log_key 
   const sth = await signSth(issuer, { tree_size: 7, root_hash: hex(root), timestamp: ts() }, { keyId });
   const r = await verifyReceipt(receipt, { keys, revocations: makeRevocations(), inclusion: { proof, sth, logKeys } });
   assert.equal(r.valid, true, r.errors.join('; '));
-  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: keyId, log_key: 'shared_with_receipts' });
+  assert.deepEqual(r.log, { status: 'included', tree_size: 7, leaf_index: 4, log_key_id: keyId, log_key: 'shared_with_receipts', sth_timestamp: sth.timestamp });
   const sr = await verifySth(sth, logKeys, { receiptKeys: keys.keys });
   assert.equal(sr.valid, true, sr.errors.join('; '));
   assert.equal(sr.log_key, 'shared_with_receipts');
@@ -1101,7 +1107,7 @@ test('verifyReceipt key document: a receipt under a log-key head is included, lo
 
   const r = await verifyReceipt(receipt, opts(doc));
   assert.equal(r.valid, true, r.errors.join('; '));
-  assert.deepEqual(r.log, { status: 'included', tree_size: 9, leaf_index: 6, log_key_id: KD_LOG_KID, log_key: 'separate' });
+  assert.deepEqual(r.log, { status: 'included', tree_size: 9, leaf_index: 6, log_key_id: KD_LOG_KID, log_key: 'separate', ...(sth.timestamp ? { sth_timestamp: sth.timestamp } : {}) });
 
   // The same document with a hand-over the receipt key never signed: refused.
   const forgedDoc = await kdTwoEntryDoc(signer, log, await kdHandover(log, log, { root_hash: root(KD_M) }));

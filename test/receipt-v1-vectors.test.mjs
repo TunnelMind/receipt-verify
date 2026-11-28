@@ -6,7 +6,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { verifyReceiptJson } from '../dist/index.js';
+import { verifyReceiptJson as verifyAllJson } from '../dist/index.js';
+// These tests cover §4 steps 1-7. Log inclusion (step 8) is required by
+// default and is tested in log.test.mjs and inclusion-default.test.mjs, so
+// here it is switched off.
+const verifyReceiptJson = (t, o = {}) => verifyAllJson(t, { requireInclusion: false, ...o });
 
 const DIR = new URL('./vectors/receipt-v1/', import.meta.url);
 const manifest = JSON.parse(readFileSync(new URL('cases.json', DIR), 'utf8'));
