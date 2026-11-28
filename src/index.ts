@@ -169,7 +169,8 @@ export interface VerifyOptions {
    *  Trusted only as far as it chains back to the pins: its first key must be
    *  a pinned receipt key, each later key needs a hand-over signed by the key
    *  before it (checkLogKeyDoc), and its log_id must be the pinned log's.
-   *  Anything else fails inclusion. */
+   *  Anything else fails inclusion; a bare key array (no anchor) is refused
+   *  before anything is fetched. */
   logKeys?: LogKeyDoc;
 }
 
@@ -262,6 +263,13 @@ export async function verifyReceiptJson(
     return { valid: false, errors: [error], warnings: [], log: { status: 'not_checked' } };
   }
   return verifyReceipt(parsed as unknown as Receipt, opts);
+}
+
+/** A log key document (`{ log_id, keys: [...] }`), the only form `logKeys`
+ *  takes: verifyReceiptInclusion anchors a document on the pinned receipt
+ *  keys, but trusts a bare key array as given. */
+function isKeyDocument(v: unknown): v is LogKeyDoc {
+  return v !== null && typeof v === 'object' && !Array.isArray(v) && Array.isArray((v as { keys?: unknown }).keys);
 }
 
 /** Verify one receipt (steps above). Never throws: anything that would
@@ -520,6 +528,10 @@ async function verifyReceiptUnguarded(
     // nothing from a proof, and its id is not sent.
     if (bundle !== ACTIVE_PINS.bundle) {
       errors.push('log inclusion: required but no inclusion proof was supplied (pass inclusion, or requireInclusion: false)');
+    } else if (opts.logKeys !== undefined && !isKeyDocument(opts.logKeys)) {
+      // A bare key array would be trusted as given, with no anchor on the
+      // pins (array mode is for keys the caller pinned, via inclusion.logKeys).
+      errors.push('log inclusion: logKeys must be a key document ({ log_id, keys })');
     } else if (errors.length > 0) {
       errors.push('log inclusion: not checked: the receipt already failed the checks above');
     } else {

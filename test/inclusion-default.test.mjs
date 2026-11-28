@@ -278,3 +278,90 @@ test('logProofUrl overrides the endpoint; a non-log receipt_id is never sent', a
   assert.match(r2.errors.join(';'), /receipt_id is not a log id/);
   assert.equal(spy.urls.length, 0);
 });
+
+// ── Fable round 3 ────────────────────────────────────────────────────────────
+
+test('logKeys must be a key document: a bare key array would skip the pin anchor (R3-1)', async () => {
+  const attacker = await makeEphemeralKey();
+  const forged = await logged(attacker); // a receipt in no log, head signed by a fresh key
+  const { urls, fetcher } = serve(() => json({ ok: true, data: forged.data }));
+  for (const logKeys of [
+    [{ key_id: 'evil-key', public_key: attacker.publicKeyB64 }],
+    [{ key_id: KEY_ID, public_key: attacker.publicKeyB64 }],
+    'tm-log', 42, null, { log_id: PINNED_LOG_KEYS.log_id },
+  ]) {
+    const r = await verifyReceipt(forged.receipt, { ...base(), fetcher, logKeys });
+    assert.equal(r.valid, false, JSON.stringify(logKeys));
+    assert.notEqual(r.log.status, 'included', JSON.stringify(logKeys));
+    assert.match(r.errors.join(';'), /logKeys must be a key document/, JSON.stringify(logKeys));
+  }
+  assert.equal(urls.length, 0); // refused before the receipt_id is sent
+});
+
+test('a document for another log, anchored on the pinned key, is refused (logId stays bound)', async () => {
+  const { receipt } = await logged();
+  const D = Array.from({ length: 7 }, (_, i) => refLeaf(Buffer.from(`leaf-${i}`)));
+  D[4] = Buffer.from(await receiptLeafHash(receipt));
+  const sth = await signSth(issuer, { log_id: 'other-log', tree_size: 7, root_hash: hex(MTH(D)), timestamp: new Date().toISOString() });
+  const data = { leaf_index: 4, tree_size: 7, leaf_hash: hex(D[4]), audit_path: PATH(4, D).map(hex), root_hash: hex(MTH(D)), sth };
+  const logKeys = { log_id: 'other-log', keys: [{ key_id: KEY_ID, public_key: issuer.publicKeyB64, from_tree_size: 0, until_tree_size: null }] };
+  const r = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data })).fetcher, logKeys });
+  assert.equal(r.valid, false);
+  assert.equal(r.log.status, 'failed');
+  assert.match(r.errors.join(';'), /log_id_mismatch/);
+});
+
+test('the proof fetch refuses redirects (R3-2)', async () => {
+  const { receipt, data } = await logged();
+  const inits = [];
+  const fetcher = async (_u, init) => { inits.push(init); return json({ ok: true, data }); };
+  const r = await verifyReceipt(receipt, { ...base(), fetcher });
+  assert.equal(r.log.status, 'included', r.errors.join('; '));
+  assert.equal(inits[0]?.redirect, 'error');
+  // A fetcher that hands back a 3xx anyway: not a proof.
+  const moved = serve(() => new Response('', { status: 302, headers: { location: 'http://elsewhere.example/' } }));
+  const r2 = await verifyReceipt(receipt, { ...base(), fetcher: moved.fetcher });
+  assert.equal(r2.log.status, 'not_checked');
+});
+
+test('error texts label a failure only whole, and only on their own status (R3-3)', async () => {
+  const { receipt } = await logged();
+  const id = receipt.receipt_id;
+  const err = (status, error) => () => json({ ok: false, error, code: status }, status);
+  const cases = [
+    [err(404, `x receipt ${id} is not yet sequenced into the log`), 'pending text with a prefix'],
+    [err(404, `receipt ${id} is not yet sequenced into the log x`), 'pending text with a suffix'],
+    [err(404, `x no receipt ${id}`), 'absent text with a prefix'],
+    [err(404, `no receipt ${id} x`), 'absent text with a suffix'],
+    [err(400, 'x leaf_index 9 is outside tree_size 7'), 'past-head text with a prefix'],
+    [err(400, 'leaf_index 9 is outside tree_size 7 x'), 'past-head text with a suffix'],
+    [err(500, `receipt ${id} is not yet sequenced into the log`), 'pending text on a 500'],
+    [err(503, `no receipt ${id}`), 'absent text on a 503'],
+    [err(404, 'leaf_index 9 is outside tree_size 7'), 'past-head text on a 404'],
+    [err(400, `no receipt ${id}`), 'absent text on a 400'],
+    [err(400, `receipt ${id} is not yet sequenced into the log`), 'pending text on a 400'],
+  ];
+  for (const [respond, why] of cases) {
+    const r = await verifyReceipt(receipt, { ...base(), fetcher: serve(respond).fetcher });
+    assert.equal(r.valid, false, why);
+    assert.equal(r.log.status, 'not_checked', why);
+  }
+});
+
+test('only requireInclusion: false opts out; other falsy values still require inclusion (R3-3)', async () => {
+  const { receipt } = await logged();
+  for (const v of [0, null, '', undefined, 'false']) {
+    const { urls, fetcher } = serve(noReceipt(receipt.receipt_id));
+    const r = await verifyReceipt(receipt, { ...base(), fetcher, requireInclusion: v });
+    assert.equal(r.valid, false, String(v));
+    assert.equal(r.log.status, 'absent', String(v));
+    assert.equal(urls.length, 1, String(v));
+  }
+});
+
+test('sth_timestamp is reported only for a proof that verified (R3-3)', async () => {
+  const { receipt, data } = await logged();
+  const r = await verifyReceipt(receipt, { ...base(), fetcher: serve(() => json({ ok: true, data: { ...data, leaf_index: 3 } })).fetcher });
+  assert.equal(r.log.status, 'failed');
+  assert.equal(r.log.sth_timestamp, undefined);
+});

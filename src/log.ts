@@ -636,7 +636,10 @@ const PAST_HEAD_RE = /^leaf_index \d+ is outside tree_size \d+$/;
 /** Read at most `max` bytes of a response body as UTF-8 text. */
 async function readCapped(r: Response, max: number): Promise<string> {
   const len = Number(r.headers.get('content-length'));
-  if (Number.isFinite(len) && len > max) throw new Error(`body is over ${max} bytes`);
+  if (Number.isFinite(len) && len > max) {
+    await r.body?.cancel().catch(() => {});
+    throw new Error(`body is over ${max} bytes`);
+  }
   if (!r.body) return '';
   const reader = r.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -691,7 +694,9 @@ export async function fetchInclusionProof(receiptId: unknown, opts: FetchProofOp
   try {
     [status, text] = await Promise.race([
       (async (): Promise<[number, string]> => {
-        const r = await f(u.toString(), { signal: ac.signal });
+        // No redirects: the https and no-userinfo checks cover this URL
+        // only, and a 3xx could carry the receipt id anywhere.
+        const r = await f(u.toString(), { signal: ac.signal, redirect: 'error' });
         return [r.status, await readCapped(r, MAX_LOG_PROOF_BYTES)];
       })(),
       timeout,
