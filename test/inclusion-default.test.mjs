@@ -317,11 +317,13 @@ test('the proof fetch refuses redirects (R3-2)', async () => {
   const fetcher = async (_u, init) => { inits.push(init); return json({ ok: true, data }); };
   const r = await verifyReceipt(receipt, { ...base(), fetcher });
   assert.equal(r.log.status, 'included', r.errors.join('; '));
-  assert.equal(inits[0]?.redirect, 'error');
+  // 'manual', not 'error': Workers throw on 'error' (R4-1).
+  assert.equal(inits[0]?.redirect, 'manual');
   // A fetcher that hands back a 3xx anyway: not a proof.
   const moved = serve(() => new Response('', { status: 302, headers: { location: 'http://elsewhere.example/' } }));
   const r2 = await verifyReceipt(receipt, { ...base(), fetcher: moved.fetcher });
   assert.equal(r2.log.status, 'not_checked');
+  assert.match(r2.errors.join(';'), /returned 302/);
 });
 
 test('error texts label a failure only whole, and only on their own status (R3-3)', async () => {

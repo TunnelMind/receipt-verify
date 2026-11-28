@@ -666,7 +666,9 @@ async function readCapped(r: Response, max: number): Promise<string> {
  *  the latest signed head (400), `absent` for "no receipt" (404). That text
  *  only labels a failure, it never makes one pass. Nothing fetched is
  *  trusted: verifyReceiptInclusion recomputes the leaf from the receipt and
- *  checks the head under the caller's pinned log keys. */
+ *  checks the head under the caller's pinned log keys. Redirects are not
+ *  followed (`redirect: 'manual'`; a 3xx is an error), so a custom fetcher
+ *  must honour `init.redirect`. */
 export async function fetchInclusionProof(receiptId: unknown, opts: FetchProofOptions = {}): Promise<InclusionProof> {
   if (typeof receiptId !== 'string' || !RECEIPT_ID_RE.test(receiptId)) {
     throw new LogProofUnavailable('receipt_id is not a log id ([A-Za-z0-9-]{1,64})', 'unavailable');
@@ -695,8 +697,12 @@ export async function fetchInclusionProof(receiptId: unknown, opts: FetchProofOp
     [status, text] = await Promise.race([
       (async (): Promise<[number, string]> => {
         // No redirects: the https and no-userinfo checks cover this URL
-        // only, and a 3xx could carry the receipt id anywhere.
-        const r = await f(u.toString(), { signal: ac.signal, redirect: 'error' });
+        // only, and a 3xx could carry the receipt id anywhere. 'manual', not
+        // 'error': Cloudflare Workers accept only 'follow' or 'manual' and
+        // throw on 'error' (round 4, R4-1). With 'manual' a 3xx comes back as
+        // its status (0 for an opaque redirect in a browser) and is refused
+        // by the 2xx check below. A custom fetcher must honour init.redirect.
+        const r = await f(u.toString(), { signal: ac.signal, redirect: 'manual' });
         return [r.status, await readCapped(r, MAX_LOG_PROOF_BYTES)];
       })(),
       timeout,
